@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -126,11 +127,32 @@ def cmd_run(args: list[str]) -> int:
         print(f"Replay log: {replay_log} (seed={seed})")
 
     if ci_mode:
+        print(
+            "Warning: --ci is a legacy point-estimate gate (pass_rate vs "
+            "threshold, no dimensions or uncertainty). Superseded by "
+            "`agenteval-bench decide`; see docs/DECISION-SYSTEM.md."
+        )
         ok = result.pass_rate >= threshold
         print(f"CI gate: pass_rate {result.pass_rate:.1%} vs threshold {threshold:.0%} -> {'PASS' if ok else 'FAIL'}")
         if not ok:
             return 2
     return 0
+
+
+def _policy_number(value: object, field_name: str, level_name: str) -> float:
+    """One threshold value from a policy file: finite number, never a bool."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(
+            f"Invalid {field_name} for risk level {level_name!r}: "
+            f"expected a number, got {value!r}"
+        )
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(
+            f"Invalid {field_name} for risk level {level_name!r}: "
+            f"expected a finite number, got {value!r}"
+        )
+    return number
 
 
 def load_policy(policy_path: str | None) -> tuple[DecisionPolicy, RiskLevel]:
@@ -144,7 +166,9 @@ def load_policy(policy_path: str | None) -> tuple[DecisionPolicy, RiskLevel]:
           high: {...}
           critical: {...}
     Returns (policy, default_risk). A missing file means the default
-    policy at medium risk.
+    policy at medium risk. Unknown keys and non-numeric values are
+    rejected: a typo'd threshold must fail loudly, not silently fall
+    back to a default the operator did not intend.
     """
     from agenteval_bench.decision import RiskThresholds, default_policy
 
@@ -154,10 +178,16 @@ def load_policy(policy_path: str | None) -> tuple[DecisionPolicy, RiskLevel]:
         return policy, risk
     import yaml
 
-    with open(policy_path) as f:
-        data = yaml.safe_load(f)
+    try:
+        with open(policy_path) as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid policy {policy_path}: malformed YAML ({exc})") from exc
     if not isinstance(data, dict):
         raise TypeError(f"Invalid policy {policy_path}: expected a mapping")
+    unknown = sorted(set(data) - {"risk", "thresholds"})
+    if unknown:
+        raise ValueError(f"Unknown top-level keys in {policy_path}: {unknown}")
     if "risk" in data:
         try:
             risk = RiskLevel(str(data["risk"]))
@@ -180,12 +210,24 @@ def load_policy(policy_path: str | None) -> tuple[DecisionPolicy, RiskLevel]:
             ) from None
         if not isinstance(values, dict):
             raise TypeError(f"Invalid thresholds for {level_name!r}: expected a mapping")
+        unknown_fields = sorted(
+            set(values) - {"quality", "safety", "reliability", "cost_budget"}
+        )
+        if unknown_fields:
+            raise ValueError(
+                f"Unknown threshold fields for {level_name!r} in {policy_path}: "
+                f"{unknown_fields}"
+            )
         base = thresholds[level]
         thresholds[level] = RiskThresholds(
-            quality=float(values.get("quality", base.quality)),
-            safety=float(values.get("safety", base.safety)),
-            reliability=float(values.get("reliability", base.reliability)),
-            cost_budget=float(values.get("cost_budget", base.cost_budget)),
+            quality=_policy_number(values.get("quality", base.quality), "quality", level_name),
+            safety=_policy_number(values.get("safety", base.safety), "safety", level_name),
+            reliability=_policy_number(
+                values.get("reliability", base.reliability), "reliability", level_name
+            ),
+            cost_budget=_policy_number(
+                values.get("cost_budget", base.cost_budget), "cost_budget", level_name
+            ),
         )
     return DecisionPolicy(thresholds=thresholds), risk
 
@@ -196,17 +238,27 @@ def cmd_decide(args: list[str]) -> int:
     Exit codes: 0 GATE, 1 ROLLBACK, 2 INVESTIGATE, 3 usage error.
     Scores a replay suite (recorded outputs + recorded per-case costs),
     so the decision is reproducible in CI without a live agent.
+
+    Reliability in this mode is replay-agreement: the recorded outputs
+    are re-scored across runs, so the runs cannot disagree the way a
+    live stochastic agent's runs can. The summary and the report label
+    it as such; it must not be read as live-agent reliability.
     """
     from agenteval_bench.decision import (
+        CostEvidence,
         DecisionAction,
+        Dimension,
+        ProportionEvidence,
         RiskLevel,
         UnmeasuredEvidence,
+        policy_fingerprint,
     )
 
     args, suite_path = _flag(args, "--suite")
     args, policy_path = _flag(args, "--policy")
     args, risk_s = _flag(args, "--risk")
     args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
+    args, reliability_runs_s = _flag(args, "--reliability-runs", "2")
     args, out = _flag(args, "--out")
     if not suite_path:
         print("Error: decide needs --suite <file>", file=sys.stderr)
@@ -215,6 +267,17 @@ def cmd_decide(args: list[str]) -> int:
         seed = int(seed_s or str(DEFAULT_SEED))
     except ValueError:
         print(f"Error: --seed must be an integer, got {seed_s}", file=sys.stderr)
+        return 3
+    try:
+        reliability_runs = int(reliability_runs_s or "2")
+    except ValueError:
+        print(
+            f"Error: --reliability-runs must be an integer, got {reliability_runs_s}",
+            file=sys.stderr,
+        )
+        return 3
+    if reliability_runs < 1:
+        print("Error: --reliability-runs must be >= 1", file=sys.stderr)
         return 3
     try:
         policy, file_risk = load_policy(policy_path)
@@ -232,7 +295,13 @@ def cmd_decide(args: list[str]) -> int:
             )
             return 3
 
-    suite, _recorded, missing, _digest = _load_suite_for_replay(suite_path)
+    import yaml
+
+    try:
+        suite, _recorded, missing, digest = _load_suite_for_replay(suite_path)
+    except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
+        print(f"Error: cannot load suite {suite_path}: {exc}", file=sys.stderr)
+        return 3
     if missing:
         print(f"Note: {len(missing)} case(s) had no recorded output and were skipped.")
     inputs = [c.input for c in suite.cases if not c.skip]
@@ -249,31 +318,88 @@ def cmd_decide(args: list[str]) -> int:
         return by_input[prompt]
 
     runner = EvalRunner()
-    decision = runner.run_decision(
-        suite,
-        replay_fn,
-        policy,
-        risk,
-        cost_fn=lambda case, _output: case.cost,
-        seed=seed,
-    )
+    try:
+        decision = runner.run_decision(
+            suite,
+            replay_fn,
+            policy,
+            risk,
+            cost_fn=lambda case, _output: case.cost,
+            reliability_runs=reliability_runs,
+            seed=seed,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 3
     print(decision.summary())
+    print(
+        "Note: reliability here is replay-agreement (recorded outputs "
+        "re-scored across runs); it cannot detect live-agent flakiness."
+    )
     if out:
-        report: dict[str, Any] = {"action": decision.action.value, "risk": decision.risk.value,
-                        "dimensions": {}}
+        report: dict[str, Any] = {
+            "action": decision.action.value,
+            "risk": decision.risk.value,
+            "suite": suite.name,
+            "suite_digest": digest,
+            "seed": seed,
+            "reliability_runs": reliability_runs,
+            "policy_fingerprint": policy_fingerprint(policy),
+            "dimensions": {},
+        }
         for dimension, verdict in decision.verdicts.items():
             evidence = verdict.evidence
             if isinstance(evidence, UnmeasuredEvidence):
-                entry = {"action": verdict.action.value, "point": None,
-                         "lower": None, "upper": None,
-                         "threshold": verdict.threshold, "reason": verdict.reason}
-            else:
-                entry = {"action": verdict.action.value, "point": evidence.point,
-                         "lower": evidence.lower, "upper": evidence.upper,
-                         "threshold": verdict.threshold, "reason": verdict.reason}
+                entry: dict[str, Any] = {
+                    "kind": "unmeasured",
+                    "action": verdict.action.value,
+                    "point": None,
+                    "lower": None,
+                    "upper": None,
+                    "threshold": verdict.threshold,
+                    "reason": verdict.reason,
+                }
+            elif isinstance(evidence, CostEvidence):
+                entry = {
+                    "kind": "measured",
+                    "action": verdict.action.value,
+                    "point": evidence.point,
+                    "lower": evidence.lower,
+                    "upper": evidence.upper,
+                    "n": evidence.n,
+                    "threshold": verdict.threshold,
+                    "reason": verdict.reason,
+                }
+            elif isinstance(evidence, ProportionEvidence):
+                entry = {
+                    "kind": (
+                        "replay-agreement"
+                        if dimension is Dimension.RELIABILITY
+                        else "measured"
+                    ),
+                    "action": verdict.action.value,
+                    "point": evidence.point,
+                    "lower": evidence.lower,
+                    "upper": evidence.upper,
+                    "successes": evidence.successes,
+                    "trials": evidence.trials,
+                    "threshold": verdict.threshold,
+                    "reason": verdict.reason,
+                }
+                if dimension is Dimension.RELIABILITY:
+                    entry["reason"] = (
+                        "replay-agreement: recorded outputs re-scored across "
+                        "runs; cannot detect live-agent flakiness"
+                    )
+            else:  # pragma: no cover - exhaustive union, kept for mypy
+                raise TypeError(f"unknown evidence type {type(evidence).__name__}")
             report["dimensions"][dimension.value] = entry
-        with open(out, "w") as f:
-            json.dump(report, f, indent=2)
+        try:
+            with open(out, "w") as f:
+                json.dump(report, f, indent=2)
+        except OSError as exc:
+            print(f"Error: cannot write report {out}: {exc}", file=sys.stderr)
+            return 3
         print(f"Decision report: {out}")
     if decision.action is DecisionAction.GATE:
         return 0
@@ -1257,7 +1383,8 @@ def main() -> None:
         print("                         [--seed 42] [--replay-log replay.json]")
         print("       agenteval-bench decide --suite <file> [--policy policy.yaml]")
         print("                                [--risk low|medium|high|critical]")
-        print("                                [--seed 42] [--out report.json]")
+        print("                                [--seed 42] [--reliability-runs 2]")
+        print("                                [--out report.json]")
         print("                                (exit 0 GATE, 1 ROLLBACK, 2 INVESTIGATE)")
         print("       agenteval-bench baseline --suite <file> --out baseline.json [--seed 42]")
         print("       agenteval-bench replay --log replay.json --suite <file> [--check]")

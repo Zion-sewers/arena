@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from agenteval_bench.decision import CASE_DIMENSIONS
+# Dimensions a single eval case can be tagged with. Reliability is a
+# cross-run property (agreement across repeated runs), and cost comes from
+# a per-case cost function, so neither is a case tag. Lives here, in the
+# model layer, so models never depend on the decision layer for it.
+CASE_DIMENSIONS: frozenset[str] = frozenset({"quality", "safety"})
 
 
 @dataclass
@@ -48,11 +52,22 @@ class EvalCase:
     output: str | None = None
     # Which decision dimension this case measures ("quality" or "safety").
     # Reliability is a cross-run property and cost comes from a per-case
-    # cost function, so neither is a case tag (see decision.CASE_DIMENSIONS).
+    # cost function, so neither is a case tag (see CASE_DIMENSIONS).
     dimension: str = "quality"
     # Recorded per-case cost in the policy's cost units (e.g. dollars).
     # None means the cost of this case was not measured.
     cost: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.dimension not in CASE_DIMENSIONS:
+            raise ValueError(
+                f"Invalid case dimension {self.dimension!r} for case {self.id!r}: "
+                f"expected one of {sorted(CASE_DIMENSIONS)}"
+            )
+        if self.cost is not None and self.cost < 0:
+            raise ValueError(
+                f"Invalid cost {self.cost!r} for case {self.id!r}: expected >= 0"
+            )
 
 
 def _parse_dimension(case_data: dict[str, Any]) -> str:

@@ -42,7 +42,7 @@ def _evidence(
         Dimension.RELIABILITY: ProportionEvidence(Dimension.RELIABILITY, *reliability),
         Dimension.COST: cost
         if cost is not None
-        else CostEvidence(mean=1.0, std=0.1, n=20, budget=100.0),
+        else CostEvidence(mean=1.0, std=0.1, n=20),
     }
 
 
@@ -149,13 +149,29 @@ def test_decide_refuses_a_missing_dimension():
         decide(evidence, default_policy(), RiskLevel.LOW)
 
 
-def test_decide_cost_uses_the_upper_bound_against_the_budget():
-    over_budget = CostEvidence(mean=150.0, std=1.0, n=20, budget=100.0)
-    decision = decide(_evidence(cost=over_budget), default_policy(), RiskLevel.LOW)
+def test_decide_cost_uses_the_upper_bound_against_the_policy_budget():
+    # The budget is the POLICY's, at the decision's risk level (MEDIUM:
+    # 100.0). Evidence carries no budget of its own, so the same cost
+    # evidence GATEs at LOW (budget 200.0) and ROLLBACKs at MEDIUM.
+    over_budget = CostEvidence(mean=150.0, std=1.0, n=20)
+    decision = decide(_evidence(cost=over_budget), default_policy(), RiskLevel.MEDIUM)
     assert decision.action is DecisionAction.ROLLBACK
     assert decision.verdicts[Dimension.COST].action is DecisionAction.ROLLBACK
-    straddling = CostEvidence(mean=99.0, std=10.0, n=20, budget=100.0)
-    decision = decide(_evidence(cost=straddling), default_policy(), RiskLevel.LOW)
+    assert decision.verdicts[Dimension.COST].threshold == 100.0
+    decision = decide(_evidence(cost=over_budget), default_policy(), RiskLevel.LOW)
+    assert decision.verdicts[Dimension.COST].action is DecisionAction.GATE
+    assert decision.verdicts[Dimension.COST].threshold == 200.0
+    straddling = CostEvidence(mean=99.0, std=10.0, n=20)
+    decision = decide(_evidence(cost=straddling), default_policy(), RiskLevel.MEDIUM)
+    assert decision.verdicts[Dimension.COST].action is DecisionAction.INVESTIGATE
+
+
+def test_decide_cost_with_one_observation_cannot_gate():
+    # n=1 collapses the interval to a point; a bare point estimate is
+    # not a measurement, so the dimension INVESTIGATEs.
+    single = CostEvidence(mean=1.0, std=0.0, n=1)
+    decision = decide(_evidence(cost=single), default_policy(), RiskLevel.LOW)
+    assert decision.action is DecisionAction.INVESTIGATE
     assert decision.verdicts[Dimension.COST].action is DecisionAction.INVESTIGATE
 
 
@@ -202,12 +218,12 @@ def test_proportion_evidence_rejects_the_cost_dimension():
 
 
 def test_cost_evidence_from_costs():
-    evidence = CostEvidence.from_costs([1.0, 2.0, 3.0], budget=100.0)
+    evidence = CostEvidence.from_costs([1.0, 2.0, 3.0])
     assert evidence.mean == pytest.approx(2.0)
     assert evidence.n == 3
     assert evidence.lower < evidence.point < evidence.upper
     with pytest.raises(ValueError):
-        CostEvidence.from_costs([], budget=100.0)
+        CostEvidence.from_costs([])
 
 
 # ------------------------------------------------------- suite loading
@@ -483,3 +499,206 @@ def test_cli_decide_rejects_bad_policy(tmp_path):
     suite = _write_replay_suite(tmp_path, 40, 20, wrong_safety=False)
     policy = _write_policy(tmp_path, "risk: extreme\n")
     assert cmd_decide(["--suite", suite, "--policy", policy]) == 3
+
+
+# ------------------------------------------- fix-forward: critique round 1
+
+
+def test_decide_rejects_evidence_filed_under_the_wrong_dimension():
+    evidence = _evidence()
+    evidence[Dimension.QUALITY] = CostEvidence(mean=1.0, std=0.1, n=20)
+    with pytest.raises(ValueError, match="filed under"):
+        decide(evidence, default_policy(), RiskLevel.LOW)
+    evidence = _evidence()
+    evidence[Dimension.SAFETY] = ProportionEvidence(Dimension.QUALITY, 20, 20)
+    with pytest.raises(ValueError, match="filed under"):
+        decide(evidence, default_policy(), RiskLevel.LOW)
+
+
+def test_dimension_verdict_rejects_mismatched_evidence():
+    from agenteval_bench.decision import DimensionVerdict
+
+    with pytest.raises(ValueError, match="filed under"):
+        DimensionVerdict(
+            dimension=Dimension.QUALITY,
+            action=DecisionAction.GATE,
+            evidence=CostEvidence(mean=1.0, std=0.1, n=20),
+            threshold=0.7,
+            reason="mismatched",
+        )
+
+
+def test_policy_thresholds_are_frozen_after_construction():
+    policy = default_policy()
+    with pytest.raises(TypeError):
+        policy.thresholds[RiskLevel.LOW] = RiskThresholds(0.1, 0.1, 0.1, 1.0)
+    raw = {
+        RiskLevel.LOW: RiskThresholds(0.70, 0.80, 0.70, 200.0),
+        RiskLevel.MEDIUM: RiskThresholds(0.80, 0.90, 0.80, 100.0),
+        RiskLevel.HIGH: RiskThresholds(0.90, 0.95, 0.90, 50.0),
+        RiskLevel.CRITICAL: RiskThresholds(0.95, 0.99, 0.95, 25.0),
+    }
+    policy = DecisionPolicy(thresholds=raw)
+    raw[RiskLevel.LOW] = RiskThresholds(0.01, 0.01, 0.01, 1.0)
+    assert policy.thresholds[RiskLevel.LOW].quality == 0.70
+
+
+def test_decision_verdicts_are_frozen_after_construction():
+    decision = decide(_evidence(), default_policy(), RiskLevel.LOW)
+    with pytest.raises(TypeError):
+        decision.verdicts[Dimension.QUALITY] = decision.verdicts[Dimension.SAFETY]
+
+
+def test_policy_fingerprint_is_stable_and_sensitive():
+    from agenteval_bench.decision import policy_fingerprint
+
+    assert policy_fingerprint(default_policy()) == policy_fingerprint(default_policy())
+    other = DecisionPolicy(
+        thresholds={
+            **dict(default_policy().thresholds),
+            RiskLevel.LOW: RiskThresholds(0.71, 0.80, 0.70, 200.0),
+        }
+    )
+    assert policy_fingerprint(other) != policy_fingerprint(default_policy())
+
+
+def test_thresholds_reject_non_finite_cost_budgets():
+    import math
+
+    for bad in (math.inf, float("nan")):
+        with pytest.raises(ValueError, match="cost_budget"):
+            RiskThresholds(0.7, 0.8, 0.7, bad)
+    with pytest.raises(ValueError):
+        CostEvidence(mean=float("nan"), std=0.1, n=20)
+
+
+def test_eval_case_rejects_bad_dimension_and_cost_at_construction():
+    with pytest.raises(ValueError, match="Invalid case dimension"):
+        EvalCase(id="x", input="i", dimension="cost")
+    with pytest.raises(ValueError, match="Invalid cost"):
+        EvalCase(id="x", input="i", cost=-1.0)
+
+
+def test_run_decision_rejects_duplicate_case_ids():
+    suite = _suite(2, 0)
+    suite.cases.append(_case("q0", "quality", "yes"))
+    with pytest.raises(ValueError, match="unique case ids"):
+        EvalRunner().run_decision(
+            suite, _stub_agent(_all_correct(suite)), default_policy(), RiskLevel.LOW
+        )
+
+
+def test_run_decision_needs_an_agent():
+    with pytest.raises(ValueError, match="needs agent_fn"):
+        EvalRunner().run_decision(_suite(2, 0), None, default_policy(), RiskLevel.LOW)
+
+
+def test_run_decision_seeded_agent_measures_real_variation():
+    # A seeded agent that flips one case on odd seeds: reliability must
+    # catch the disagreement instead of reporting perfect agreement.
+    suite = _suite(20, 20)
+    correct = _all_correct(suite)
+
+    def seeded(prompt: str, seed: int) -> str:
+        case_id = prompt.removeprefix("prompt-")
+        if case_id == "q0" and seed % 2 == 1:
+            return "wrong"
+        return correct[case_id]
+
+    decision = EvalRunner().run_decision(
+        suite,
+        None,
+        default_policy(),
+        RiskLevel.HIGH,
+        cost_fn=lambda case, _output: case.cost,
+        seeded_agent_fn=seeded,
+    )
+    assert decision.verdicts[Dimension.RELIABILITY].action is DecisionAction.INVESTIGATE
+
+
+def test_run_ci_is_deprecated():
+    with pytest.warns(DeprecationWarning, match="run_decision"):
+        EvalRunner().run_ci(_suite(2, 0), _stub_agent(_all_correct(_suite(2, 0))))
+
+
+def test_cli_decide_rejects_unknown_policy_keys(tmp_path):
+    suite = _write_replay_suite(tmp_path, 40, 20, wrong_safety=False)
+    typo = _write_policy(
+        tmp_path,
+        """\
+        risk: low
+        thresholds:
+          low: {qualty: 0.7, safety: 0.8, reliability: 0.7, cost_budget: 200.0}
+        """,
+    )
+    assert cmd_decide(["--suite", suite, "--policy", typo]) == 3
+    extra = _write_policy(tmp_path, "risk: low\nsurprise: 1\n")
+    assert cmd_decide(["--suite", suite, "--policy", extra]) == 3
+    boolean = _write_policy(
+        tmp_path,
+        """\
+        risk: low
+        thresholds:
+          low: {quality: true, safety: 0.8, reliability: 0.7, cost_budget: 200.0}
+        """,
+    )
+    assert cmd_decide(["--suite", suite, "--policy", boolean]) == 3
+
+
+def test_cli_decide_rejects_malformed_policy_yaml(tmp_path):
+    suite = _write_replay_suite(tmp_path, 40, 20, wrong_safety=False)
+    bad = tmp_path / "policy.yaml"
+    bad.write_text("risk: [unclosed\n")
+    assert cmd_decide(["--suite", suite, "--policy", str(bad)]) == 3
+
+
+def test_cli_decide_rejects_duplicate_case_ids(tmp_path):
+    policy = _write_policy(tmp_path, "risk: low\n")
+    path = tmp_path / "suite.yaml"
+    path.write_text(
+        textwrap.dedent(
+            """\
+            name: dup-id
+            cases:
+              - id: q1
+                input: one
+                expected: {exact: 'yes'}
+                output: 'yes'
+              - id: q1
+                input: two
+                expected: {exact: 'yes'}
+                output: 'yes'
+            """
+        )
+    )
+    assert cmd_decide(["--suite", str(path), "--policy", policy]) == 3
+
+
+def test_cli_decide_report_labels_replay_agreement(tmp_path):
+    import json
+
+    policy = _write_policy(tmp_path, "risk: low\n")
+    suite = _write_replay_suite(tmp_path, 40, 20, wrong_safety=False)
+    out = tmp_path / "report.json"
+    assert cmd_decide(["--suite", suite, "--policy", policy, "--out", str(out)]) == 0
+    report = json.loads(out.read_text())
+    reliability = report["dimensions"]["reliability"]
+    assert reliability["kind"] == "replay-agreement"
+    assert "recorded outputs" in reliability["reason"]
+    assert reliability["successes"] == 60 and reliability["trials"] == 60
+    assert report["suite"] == "cli-suite"
+    assert report["seed"] == 42
+    assert report["policy_fingerprint"]
+    assert report["suite_digest"]
+
+
+def test_cli_decide_reliability_runs_one_is_unmeasured(tmp_path):
+    policy = _write_policy(tmp_path, "risk: low\n")
+    suite = _write_replay_suite(tmp_path, 40, 20, wrong_safety=False)
+    assert cmd_decide(["--suite", suite, "--policy", policy, "--reliability-runs", "1"]) == 2
+
+
+def test_cli_decide_unwritable_report_is_usage_error(tmp_path):
+    policy = _write_policy(tmp_path, "risk: low\n")
+    suite = _write_replay_suite(tmp_path, 40, 20, wrong_safety=False)
+    assert cmd_decide(["--suite", suite, "--policy", policy, "--out", "/nonexistent/report.json"]) == 3

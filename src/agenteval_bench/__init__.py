@@ -13,6 +13,7 @@ from agenteval_bench.decision import (
     UnmeasuredEvidence,
     decide,
     default_policy,
+    policy_fingerprint,
 )
 from agenteval_bench.engine import EvalRunner
 from agenteval_bench.models import EvalCase, EvalResult, EvalSuite, RunResult
@@ -37,4 +38,5 @@ __all__ = [
     "UnmeasuredEvidence",
     "decide",
     "default_policy",
+    "policy_fingerprint",
 ]
