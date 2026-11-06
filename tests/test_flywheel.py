@@ -725,6 +725,13 @@ def test_demo_runs_end_to_end_with_stdin_closed() -> None:
             "PATH": os.pathsep.join(
                 [str(Path(sys.executable).parent), "/usr/bin", "/bin"]
             ),
+            # HOME must pass through: when the outer pytest runs under a
+            # python whose pytest lives in user site (~/.local), the
+            # demo's `python3 -m pytest` cannot see it without HOME, the
+            # dry-run baseline collects zero tests, and the demo fails
+            # closed. (arena#40 fix-forward: system-python run failed
+            # deterministically until HOME was passed through.)
+            **({"HOME": os.environ["HOME"]} if "HOME" in os.environ else {}),
         },
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
