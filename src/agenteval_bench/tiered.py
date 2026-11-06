@@ -86,7 +86,7 @@ PHASE_SPECS: dict[PhaseName, PhaseSpec] = {
     "gate": PhaseSpec(
         name="gate",
         description="Deterministic eval gate on the golden replay suite.",
-        entry_criterion="Clean tree; no earlier phase (gate is first).",
+        entry_criterion="No earlier phase (gate is first).",
         exit_criterion=(
             f"Golden suite pass_rate >= {GATE_THRESHOLD:.0%} via `run --ci` "
             "AND a fresh replay log verifies bit-exact via `replay --check`."
@@ -180,6 +180,7 @@ class MutantDetailDict(TypedDict):
     target_file: str
     site_description: str
     killed: bool
+    skipped: bool
     fail_to_pass: list[str]
 
 
@@ -205,6 +206,7 @@ class TieredReportDict(TypedDict):
     tool: str
     root: str
     verdict: str
+    phases_requested: list[str]
     coverage_percent: float | None
     mutation_score: float | None
     mutation_details: list[MutantDetailDict]
@@ -239,6 +241,7 @@ class PhaseOutcome:
                     "target_file": d.target_file,
                     "site_description": d.site_description,
                     "killed": d.killed,
+                    "skipped": d.skipped,
                     "fail_to_pass": list(d.fail_to_pass),
                 }
                 for d in self.mutation_details
@@ -248,6 +251,12 @@ class PhaseOutcome:
 
     @staticmethod
     def from_dict(doc: Mapping[str, object]) -> PhaseOutcome:
+        phase = str(doc["phase"])
+        if phase not in PHASE_ORDER:
+            raise TieredError(f"corrupt report: unknown phase {phase!r}")
+        status = str(doc["status"])
+        if status not in ("passed", "failed", "skipped", "error"):
+            raise TieredError(f"corrupt report: unknown status {status!r}")
         commands = tuple(
             CommandResult(
                 argv=tuple(str(a) for a in c["argv"]),  # type: ignore[index]
@@ -261,13 +270,14 @@ class PhaseOutcome:
                 target_file=str(d["target_file"]),  # type: ignore[index]
                 site_description=str(d["site_description"]),  # type: ignore[index]
                 killed=bool(d["killed"]),  # type: ignore[index]
+                skipped=bool(d.get("skipped", False)),  # type: ignore[attr-defined]
                 fail_to_pass=tuple(str(t) for t in d["fail_to_pass"]),  # type: ignore[index]
             )
             for d in doc.get("mutation_details", [])  # type: ignore[union-attr]
         )
         return PhaseOutcome(
-            phase=str(doc["phase"]),  # type: ignore[arg-type]
-            status=str(doc["status"]),  # type: ignore[arg-type]
+            phase=phase,  # type: ignore[arg-type]
+            status=status,  # type: ignore[arg-type]
             entry_met=bool(doc["entry_met"]),
             exit_met=bool(doc["exit_met"]),
             duration_s=float(doc["duration_s"]),
@@ -288,6 +298,7 @@ class TieredReport:
     root: str
     verdict: Literal["PASS", "FAIL"]
     phases: tuple[PhaseOutcome, ...]
+    phases_requested: tuple[PhaseName, ...] = ()
     coverage_percent: float | None = None
     mutation_score: float | None = None
     mutation_details: tuple[MutantDetail, ...] = ()
@@ -297,6 +308,7 @@ class TieredReport:
             "tool": "agenteval-bench",
             "root": self.root,
             "verdict": self.verdict,
+            "phases_requested": [p for p in self.phases_requested] or [p.phase for p in self.phases],
             "coverage_percent": self.coverage_percent,
             "mutation_score": self.mutation_score,
             "mutation_details": [
@@ -304,6 +316,7 @@ class TieredReport:
                     "target_file": d.target_file,
                     "site_description": d.site_description,
                     "killed": d.killed,
+                    "skipped": d.skipped,
                     "fail_to_pass": list(d.fail_to_pass),
                 }
                 for d in self.mutation_details
@@ -325,14 +338,25 @@ class TieredReport:
                 target_file=str(d["target_file"]),  # type: ignore[index]
                 site_description=str(d["site_description"]),  # type: ignore[index]
                 killed=bool(d["killed"]),  # type: ignore[index]
+                skipped=bool(d.get("skipped", False)),  # type: ignore[attr-defined]
                 fail_to_pass=tuple(str(t) for t in d["fail_to_pass"]),  # type: ignore[index]
             )
             for d in doc.get("mutation_details", [])  # type: ignore[union-attr]
         )
+        verdict = str(doc["verdict"])
+        if verdict not in ("PASS", "FAIL"):
+            raise TieredError(f"corrupt report: unknown verdict {verdict!r}")
+        requested = tuple(
+            str(p) for p in doc.get("phases_requested", [p.phase for p in phases])  # type: ignore[union-attr]
+        )
+        for p in requested:
+            if p not in PHASE_ORDER:
+                raise TieredError(f"corrupt report: unknown requested phase {p!r}")
         return TieredReport(
             root=str(doc["root"]),
-            verdict=str(doc["verdict"]),  # type: ignore[arg-type]
+            verdict=verdict,  # type: ignore[arg-type]
             phases=phases,
+            phases_requested=requested,  # type: ignore[arg-type]
             coverage_percent=(
                 None if doc["coverage_percent"] is None else float(doc["coverage_percent"])  # type: ignore[arg-type]
             ),
@@ -369,6 +393,7 @@ class MutantDetail:
     target_file: str
     site_description: str
     killed: bool
+    skipped: bool = False
     fail_to_pass: tuple[str, ...] = ()
 
 
@@ -401,6 +426,13 @@ def mutation_score(root: Path, *, mutants: int, seed: int, work_dir: Path) -> Mu
     baseline must be green or the measurement refuses to run (a red
     baseline would make every mutant look killed).
 
+    The scorer must not score itself: mutants are drawn from the evaluated
+    packages only, never from ``src/bugsmith`` — the generator and the
+    harness that compute the kill verdicts are excluded as targets, so a
+    mutant in the scoring path cannot fabricate the score (fail-open
+    toward 1.0) or void it. The exclusion is enforced by the generator
+    (``exclude``) and pinned by a test in tests/test_bugsmith.py.
+
     The mutant runs execute under this process's own interpreter: the
     harness invokes bare ``python3``, which on a developer machine may
     lack the repo's dev dependencies (hypothesis lives in ``.[dev]``),
@@ -417,16 +449,27 @@ def mutation_score(root: Path, *, mutants: int, seed: int, work_dir: Path) -> Mu
         raise TieredError(f"mutants must be >= 1, got {mutants}")
     work_dir.mkdir(parents=True, exist_ok=True)
     generator = ProceduralBugGenerator(seed)
-    candidates = generator.generate(root, mutants)
+    candidates = generator.generate(root, mutants, exclude=("src/bugsmith",))
     if not candidates:
         raise TieredError("bug generator produced zero candidates: nothing to score")
     runner = LocalRunner()
     path_before = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{path_before}"
+    # The suite contains a real end-to-end expanded test
+    # (tests/test_tiered.py::test_cli_tiered_expanded_runs_for_real) that
+    # spawns its own `tiered --phase expanded` subprocess: inside a mutant
+    # copy that would recurse and multiply nightly runtime, so mutant and
+    # baseline runs skip it (the env guard in that test).
+    e2e_before = os.environ.get("TIERED_E2E_ACTIVE")
+    os.environ["TIERED_E2E_ACTIVE"] = "1"
     try:
         passed = _mutation_measure(candidates, root, runner, work_dir)
     finally:
         os.environ["PATH"] = path_before
+        if e2e_before is None:
+            os.environ.pop("TIERED_E2E_ACTIVE", None)
+        else:
+            os.environ["TIERED_E2E_ACTIVE"] = e2e_before
     return passed
 
 
@@ -458,6 +501,7 @@ def _mutation_measure(
                     target_file=candidate.record.target_file,
                     site_description=(f"{candidate.record.site_description} (unvalidatable: {e})"),
                     killed=False,
+                    skipped=True,
                 )
             )
             continue
@@ -579,6 +623,11 @@ def _coverage_from_json(path: Path) -> float | None:
 def _run_expanded(root: Path, executor: Executor, tmp: Path, min_coverage: float) -> PhaseOutcome:
     coverage_json = tmp / "coverage.json"
     coverage_data = tmp / ".coverage"
+    # Invocation note (pinned deviation from the old CI Test step): the old
+    # step ran `pytest tests/ -v --tb=short`. This runs `-q` instead of `-v`
+    # (verbosity only; --tb=short is pytest's default) and adds
+    # `-p no:cacheprovider` so the run never writes into the repo tree.
+    # Same test selection, same failure semantics.
     results = [
         executor(
             [
@@ -650,6 +699,15 @@ def _run_nightly(
             duration_s=0.0,
             notes=(f"nightly exit criterion NOT met: mutation score unmeasurable: {e}",),
         )
+    except Exception as e:  # noqa: BLE001 — any scorer failure must land in the report, not a traceback
+        return PhaseOutcome(
+            phase="nightly",
+            status="error",
+            entry_met=True,
+            exit_met=False,
+            duration_s=0.0,
+            notes=(f"nightly exit criterion NOT met: mutation scorer crashed: {type(e).__name__}: {e}",),
+        )
     ok = result.score >= min_mutation_score
     notes.append(
         f"mutation score {result.killed}/{result.validated} = "
@@ -698,6 +756,8 @@ def run_pipeline(
         raise TieredError(f"min_mutation_score must be in [0, 1], got {min_mutation_score}")
     if not 0.0 <= min_coverage <= 100.0:
         raise TieredError(f"min_coverage must be in [0, 100], got {min_coverage}")
+    if mutants < 1:
+        raise TieredError(f"mutants must be >= 1, got {mutants}")
     run_executor = executor or subprocess_executor
     run_mutation = mutation_fn or mutation_score
     root = root.resolve()
@@ -747,6 +807,7 @@ def run_pipeline(
         root=str(root),
         verdict=verdict,
         phases=tuple(outcomes),
+        phases_requested=phases,
         coverage_percent=coverage,
         mutation_score=mutation,
         mutation_details=mutation_details,

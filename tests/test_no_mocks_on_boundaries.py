@@ -34,7 +34,8 @@ def find_mock_usage(source: str) -> list[str]:
                 ):
                     violations.append(f"imports mock module ({alias.name})")
         elif isinstance(node, ast.ImportFrom):
-            if (node.module or "").startswith("unittest.mock"):
+            module = node.module or ""
+            if module.startswith(("unittest.mock", "mock.")) or module == "mock":
                 violations.append(f"imports from {node.module}")
             elif node.module == "unittest":
                 for alias in node.names:
@@ -51,7 +52,7 @@ def find_mock_usage(source: str) -> list[str]:
                 and value.attr == "mock"
             ):
                 violations.append(f"uses unittest.mock.{node.attr}")
-        elif isinstance(node, ast.FunctionDef):
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for arg in node.args.args:
                 if arg.arg == "mocker":
                     violations.append(f"uses the mocker fixture in {node.name}()")
@@ -60,7 +61,9 @@ def find_mock_usage(source: str) -> list[str]:
 
 def test_no_mocks_in_test_suite() -> None:
     offenders: dict[str, list[str]] = {}
-    for path in sorted(TESTS_DIR.glob("test_*.py")):
+    # Every .py file under tests/, not just test_*.py: conftest.py and
+    # helper modules are where fixtures (and mocks) normally live.
+    for path in sorted(TESTS_DIR.glob("*.py")):
         violations = find_mock_usage(path.read_text(encoding="utf-8"))
         if violations:
             offenders[path.name] = violations
@@ -77,6 +80,8 @@ def test_no_mocks_in_test_suite() -> None:
 def test_detector_flags_mock_imports() -> None:
     assert find_mock_usage("from unittest.mock import patch\n") != []
     assert find_mock_usage("import mock\n") != []
+    assert find_mock_usage("from mock import patch\n") != []
+    assert find_mock_usage("from mock import MagicMock\n") != []
     assert find_mock_usage("from unittest import mock\n") != []
     assert find_mock_usage("import unittest.mock as m\n") != []
 
@@ -85,6 +90,7 @@ def test_detector_flags_mock_attribute_use_and_mocker_fixture() -> None:
     assert find_mock_usage("x = mock.patch('os.path.join')\n") != []
     assert find_mock_usage("x = unittest.mock.MagicMock()\n") != []
     assert find_mock_usage("def test_something(mocker):\n    pass\n") != []
+    assert find_mock_usage("async def test_something(mocker):\n    pass\n") != []
 
 
 def test_detector_allows_hand_written_stubs() -> None:

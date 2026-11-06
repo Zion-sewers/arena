@@ -23,6 +23,7 @@ jobs:
       - name: Tiered pipeline (gate -> smoke -> expanded -> nightly)
         run: agenteval-bench tiered --phase nightly --mutants 8 --out tiered-nightly-report.json
       - name: Upload nightly report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tiered-nightly-report

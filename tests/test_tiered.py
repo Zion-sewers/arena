@@ -2,13 +2,20 @@
 
 Orchestration tests use a fake executor that records argv and returns
 canned exit codes, plus a fake mutation function — no subprocess, no
-bugsmith. The real commands are proven by the CLI tests at the bottom
-(gate phase for real) and by CI (expanded phase) and the nightly workflow.
+bugsmith. The real commands are proven by the CLI tests at the bottom:
+gate runs for real, and expanded runs for real end to end
+(``test_cli_tiered_expanded_runs_for_real``, which executes the full
+suite through the CLI). Nightly runs for real in the nightly workflow
+and in the measured proof runs; the suite pins the mechanism with a
+real (tiny) mutation target below.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -277,12 +284,17 @@ def test_report_json_round_trip() -> None:
     assert restored.to_dict() == report.to_dict()
 
 
-# --- CLI surface (real commands, gate phase only: fast and deterministic) ---
+# --- CLI surface (real commands) ---
 
 
 def test_cli_tiered_unknown_phase_is_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.cmd_tiered(["--phase", "bogus", "--root", str(REPO_ROOT)]) == 1
     assert "unknown phase" in capsys.readouterr().err
+
+
+def test_cli_tiered_unknown_flag_is_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.cmd_tiered(["--phase", "gate", "--root", str(REPO_ROOT), "--bogus", "x"]) == 1
+    assert "unknown argument" in capsys.readouterr().err
 
 
 def test_cli_tiered_gate_runs_for_real(tmp_path: Path) -> None:
@@ -293,6 +305,91 @@ def test_cli_tiered_gate_runs_for_real(tmp_path: Path) -> None:
     report = TieredReport.from_json(out.read_text(encoding="utf-8"))
     assert report.verdict == "PASS"
     assert [p.phase for p in report.phases] == ["gate"]
+    assert report.phases_requested == ("gate",)
+
+
+def test_cli_tiered_expanded_runs_for_real(tmp_path: Path) -> None:
+    """End-to-end expanded phase for real, through the CLI subprocess.
+
+    Runs gate -> smoke -> expanded on this repo itself and asserts the
+    JSON report: all three phases passed, coverage at or above the floor.
+    This is the test that would catch a bug in the real expanded command
+    construction (the fake-executor orchestration tests cannot).
+
+    Recursion guard: the inner run executes the full suite, which
+    includes this test. The inner run sets TIERED_E2E_ACTIVE, and this
+    test skips when it is already set, so the nesting stops at depth 1.
+    The same guard is set by tiered.mutation_score for baseline/mutant
+    runs, so nightly does not pay for a nested expanded run per mutant.
+    """
+    if os.environ.get("TIERED_E2E_ACTIVE"):
+        pytest.skip("nested expanded run: recursion guard")
+    out = tmp_path / "tiered-expanded-report.json"
+    env = dict(os.environ)
+    env["TIERED_E2E_ACTIVE"] = "1"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agenteval_bench.cli",
+            "tiered",
+            "--phase",
+            "expanded",
+            "--root",
+            str(REPO_ROOT),
+            "--out",
+            str(out),
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
+    assert out.is_file()
+    report = TieredReport.from_json(out.read_text(encoding="utf-8"))
+    assert report.verdict == "PASS"
+    assert [p.phase for p in report.phases] == ["gate", "smoke", "expanded"]
+    assert report.phases_requested == ("gate", "smoke", "expanded")
+    assert report.coverage_percent is not None
+    assert report.coverage_percent >= 80
+    # A partial run is honest about what it measured: no mutation score.
+    assert report.mutation_score is None
+
+
+def test_report_rejects_corrupt_phase_and_verdict() -> None:
+    report = run_pipeline(
+        REPO_ROOT,
+        upto="gate",
+        executor=FakeExecutor(),
+    )
+    doc = report.to_dict()
+    doc["phases"][0]["phase"] = "bogus"
+    with pytest.raises(TieredError, match="unknown phase"):
+        TieredReport.from_json(json.dumps(doc))
+    doc = report.to_dict()
+    doc["verdict"] = "MAYBE"
+    with pytest.raises(TieredError, match="unknown verdict"):
+        TieredReport.from_json(json.dumps(doc))
+
+
+def test_run_pipeline_rejects_zero_mutants_up_front() -> None:
+    with pytest.raises(TieredError, match="mutants must be >= 1"):
+        run_pipeline(REPO_ROOT, upto="nightly", mutants=0, executor=FakeExecutor())
+
+
+def test_cli_tiered_unwritable_report_is_usage_error(tmp_path: Path) -> None:
+    """An unwritable --out path exits 1, not 0: the report is the evidence.
+
+    Kills the cli.py mutant that flips the OSError return from 1 to -1:
+    a failed report write must fail the command, never pass silently.
+    """
+    missing_dir = tmp_path / "no-such-dir"
+    rc = cli.cmd_tiered(
+        ["--phase", "gate", "--root", str(REPO_ROOT), "--out", str(missing_dir / "r.json")]
+    )
+    assert rc == 1
 
 
 def test_cli_tiered_bad_numbers_are_usage_error() -> None:

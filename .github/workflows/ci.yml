@@ -20,7 +20,13 @@ jobs:
       - name: Lint
         run: ruff check src/ tests/
       - name: Tiered pipeline (gate -> smoke -> expanded)
-        run: agenteval-bench tiered --phase expanded
+        run: agenteval-bench tiered --phase expanded --out tiered-expanded-report.json
+      - name: Upload expanded report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiered-expanded-report
+          path: tiered-expanded-report.json
       - name: Experiment-discipline demo (violations must fail)
         run: PYTHONPATH=src python -m experiment.demo
       - name: Simpson-safe aggregation demo (reversal must be refused)

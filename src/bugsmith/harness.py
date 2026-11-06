@@ -28,6 +28,12 @@ PYTEST_ARGS = ["-q", "--tb=no", "-p", "no:cacheprovider"]
 # then prints the tree format instead of one node ID per line, so
 # _parse_collected finds zero IDs and the baseline refuses with "zero
 # tests". -o addopts= neutralizes the target's addopts on every call.
+# Contract change (arena#39): this is harness-wide, not nightly-only —
+# every LocalRunner/DockerRunner invocation for every target runs with
+# the target's addopts neutralized and --rootdir pinned to the work
+# tree, so a target that relies on its own addopts (plugins, markers,
+# traceback style) silently loses them. That is the price of a stable
+# node-ID contract across copies.
 PYTEST_OVERRIDES = ["-o", "addopts="]
 RUN_TIMEOUT_S = 300
 

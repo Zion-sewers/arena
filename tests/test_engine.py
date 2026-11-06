@@ -243,3 +243,46 @@ cases:
             assert suite.cost_bound.max_output_tokens == 50
         finally:
             os.unlink(path)
+
+
+def test_skipped_case_scores_zero_not_one() -> None:
+    """A skipped case scores exactly 0.0: it contributes nothing.
+
+    Kills the engine.py mutant that flips the skipped-case score to 1:
+    a skipped case must never count as a pass, and the aggregate
+    pass_rate is computed over scored cases only.
+    """
+    path = _write_yaml("""
+name: skip-score-test
+cases:
+  - id: skipped
+    input: "hi"
+    expected:
+      exact: "hello"
+    skip: true
+""")
+    try:
+        suite = EvalSuite.from_yaml(path)
+        result = EvalRunner().run(suite, lambda _: "hello")
+        assert result.skipped == 1
+        assert len(result.results) == 1
+        skipped = result.results[0]
+        assert skipped.case_id == "skipped"
+        assert skipped.passed is False
+        assert skipped.score == 0.0
+        assert skipped.details.get("skipped") is True
+    finally:
+        os.unlink(path)
+
+
+def test_rubric_criterion_default_weight_is_one() -> None:
+    """The default rubric weight is 1.0: an unweighted criterion counts fully.
+
+    Kills the models.py mutant that negates the default to -1.0. The
+    default is API contract (snapshots serialize it); a negated default
+    would silently invert every unweighted criterion's contribution.
+    """
+    from agenteval_bench.models import RubricCriterion
+
+    assert RubricCriterion(criterion="clarity").weight == 1.0
+    assert RubricCriterion(criterion="clarity", weight=2.0).weight == 2.0

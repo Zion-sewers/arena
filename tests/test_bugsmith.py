@@ -119,6 +119,21 @@ def test_procedural_never_mutates_test_files() -> None:
             assert candidate.record.target_file.startswith("src/mcalc/")
 
 
+def test_procedural_exclude_never_mutates_excluded_paths() -> None:
+    """The tiered pipeline excludes its own scoring path (src/bugsmith)
+    so a mutant there cannot fabricate the score: the generator must
+    never return a candidate from an excluded directory, and the
+    exclusion must be a no-op for other callers (default: empty)."""
+    for seed in range(10):
+        for candidate in ProceduralBugGenerator(seed).generate(
+            FIXTURE, 5, exclude=("src/mcalc/arithmetic.py",)
+        ):
+            assert candidate.record.target_file != "src/mcalc/arithmetic.py"
+    # Excluding everything still in the pool raises, never silently empty.
+    with pytest.raises(Exception, match="no source files"):
+        ProceduralBugGenerator(7).generate(FIXTURE, 1, exclude=("src/",))
+
+
 def test_llm_generator_refuses_without_backend() -> None:
     with pytest.raises(BugsmithError):
         LLMGeneratedBugGenerator()

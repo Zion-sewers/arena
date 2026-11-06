@@ -560,3 +560,61 @@ def test_cli_alt_test_refuses_bad_epsilon(monkeypatch, capsys):
         assert code == 1
     finally:
         os.unlink(data)
+
+
+def test_alt_test_config_default_seed_is_42() -> None:
+    """The default config seed is 42 (recorded for reproducibility).
+
+    Kills the types.py mutant that negates the default seed to -42.
+    The seed is a documented default; a negated default would silently
+    change every run that relies on the default.
+    """
+    assert AltTestConfig(epsilon=0.1, q=0.05).seed == 42
+
+
+def test_make_dataset_default_seed_is_seven() -> None:
+    """make_dataset() defaults to seed 7: explicit seed 7 reproduces it.
+
+    Kills the demo.py mutant that negates the default seed to -7. The
+    pin is on the signature default itself, not on behavior: CPython's
+    ``random.Random(-7)`` draws the identical stream to ``Random(7)``
+    (int seeds are taken by absolute value), so the two datasets are
+    behaviorally identical and only the declared default distinguishes
+    them. The default seed is part of the demo's determinism contract.
+    """
+    import inspect
+
+    from alt_test.demo import make_dataset
+
+    assert inspect.signature(make_dataset).parameters["seed"].default == 7
+    assert make_dataset(n_items=5) == make_dataset(seed=7, n_items=5)
+
+
+def test_make_dataset_first_items_are_golden() -> None:
+    """Seeded dataset items are pinned exactly (golden values, seed 7).
+
+    Kills the demo.py compare-flip mutant (`rng.random() < noise` ->
+    `>`): under the mutant the low-noise annotators take the wrong
+    label most of the time, so the first items differ from the golden
+    values below.
+    """
+    from alt_test.demo import make_dataset
+
+    items = make_dataset(seed=7, n_items=3)
+    assert items[0].annotator_labels == {
+        "ann0": "neutral",
+        "ann1": "neutral",
+        "ann2": "entailment",
+        "ann3": "neutral",
+        "ann4": "entailment",
+    }
+    assert items[0].judge_labels["majority-oracle"] == "neutral"
+    assert items[1].annotator_labels["ann0"] == "entailment"
+    assert items[1].judge_labels["sharp-judge"] == "contradiction"
+    assert items[2].annotator_labels == {
+        "ann0": "entailment",
+        "ann1": "entailment",
+        "ann2": "entailment",
+        "ann3": "entailment",
+        "ann4": "entailment",
+    }

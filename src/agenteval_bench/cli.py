@@ -944,6 +944,10 @@ def cmd_tiered(args: list[str]) -> int:
     args, out = _flag(args, "--out")
     args, root_s = _flag(args, "--root", ".")
 
+    if args:
+        print(f"Error: unknown argument(s): {' '.join(args)}", file=sys.stderr)
+        return 1
+
     try:
         mutants = int(mutants_s or str(DEFAULT_MUTANTS))
         seed = int(seed_s or str(TIERED_SEED))
@@ -1009,7 +1013,8 @@ def main() -> None:
         print("       agenteval-bench snapshot verify --store <dir> --suite <name> --version <id>")
         print("       agenteval-bench tiered --phase <gate|smoke|expanded|nightly|all>")
         print("                                [--mutants 8] [--min-mutation-score 0.5]")
-        print("                                [--min-coverage 80] [--out report.json]")
+        print("                                [--min-coverage 80] [--seed 42] [--root .]")
+        print("                                [--out report.json]")
         print("       (--seed is recorded for provenance; the test itself is deterministic)")
         return
 
