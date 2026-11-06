@@ -15,7 +15,7 @@ from bugsmith.harness import Runner
 from flywheel.detect import GitHubTransport, sample_commits
 from flywheel.propose import append_ledger, render_pr_payload
 from flywheel.reflect import reflect
-from flywheel.types import LoopResult
+from flywheel.types import FlywheelError, LoopResult
 from flywheel.validate import dry_run, promote
 
 
@@ -53,9 +53,16 @@ def run_loop(
             seed=seed,
         )
         reports.append(report)
-        append_ledger(ledger_path, report)
         if report.promotable:
-            payloads.append(render_pr_payload(promote(draft, report), target_root))
+            try:
+                payloads.append(render_pr_payload(promote(draft, report), target_root))
+            except FlywheelError as e:
+                # A wiring failure on one draft must not kill the loop or
+                # discard the other drafts' payloads: record the skip and
+                # keep going. The ledger still records the dry-run (the
+                # measurement happened); the skip records that no PR came
+                # out of it.
+                skipped.append(f"{draft.kind}: wiring refused ({e})")
         else:
             skipped.append(
                 f"{draft.kind}: dry-run not promotable "
@@ -63,6 +70,10 @@ def run_loop(
                 f"catch_rate={report.catch_rate:.2f}, "
                 f"false_positives={report.false_positives})"
             )
+        # Ledger after the draft's disposition is known, exactly once per
+        # draft: a crashed loop must never record a promotable run that
+        # produced no payload.
+        append_ledger(ledger_path, report)
     return LoopResult(
         payloads=tuple(payloads),
         skipped=tuple(skipped),

@@ -5,11 +5,14 @@ dry-run gate. The payload carries the wiring file contents for a live
 consumer plus the dry-run evidence in the body, so a reviewer can see
 exactly what was measured (injected faults, gate-catch rate, false
 positives) and on what corpus. The flywheel never writes the payload
-into the target tree; the fleet runner posts it via the GitHub API.
+into the target tree; the CLI writes payload files out for the fleet
+runner, which posts them via the GitHub API (the poster itself is a
+follow-up, not shipped here).
 
 Every dry-run, promotable or not, is appended to the gate-catch ledger
-(JSONL, caller-chosen path). The gate-catch rate in the ledger is the
-loop's leading metric: a loop that proposes rules nobody measures is
+(JSONL, caller-chosen path; the CLI defaults it to a durable path under
+the target repo). The gate-catch rate in the ledger is the loop's
+leading metric: a loop that proposes rules nobody measures is
 not a loop.
 """
 
@@ -18,6 +21,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from flywheel.rules import wiring
 from flywheel.types import DryRunReport, FlywheelError, PrPayload, ValidatedRule
@@ -46,6 +50,7 @@ def render_pr_payload(rule: ValidatedRule, target_root: Path) -> PrPayload:
     case_lines = "\n".join(
         f"- {c.name} ({c.file}): flagged={c.flagged}, "
         f"fail_to_pass={list(c.fail_to_pass) or 'none'}"
+        + (f", enforcer_failed={c.enforcer_failed}" if report.requires_enforcer_check else "")
         for c in report.cases
     )
     body = (
@@ -53,6 +58,10 @@ def render_pr_payload(rule: ValidatedRule, target_root: Path) -> PrPayload:
         f"Evidence: {rule.draft.support} sampled fix-commits "
         f"({', '.join(sorted({s[:7] for s in rule.draft.evidence_shas}))}); "
         f"{rule.draft.rationale}\n\n"
+        "Fix-commit evidence is message-keyword signal only (no file or "
+        "diff evidence — the list endpoint carries no files). The dry-run "
+        "below is the evidence that the rule catches its class, not the "
+        "cited commits.\n\n"
         "Dry-run (this rule was validated before it could become blocking):\n"
         f"- injected faults of the class: {report.injected}\n"
         f"- caught by the rule: {report.caught} "
@@ -95,9 +104,55 @@ def append_ledger(ledger_path: Path, report: DryRunReport) -> None:
         handle.write(json.dumps(entry, sort_keys=True) + "\n")
 
 
+def _is_count(value: object) -> bool:
+    """A ledger count: a real int, never a bool (bool is an int subclass)
+    and never negative."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _validate_ledger_entry(entry: dict[str, object], line_no: int) -> None:
+    injected = entry.get("injected")
+    caught = entry.get("caught")
+    false_positives = entry.get("false_positives")
+    catch_rate = entry.get("catch_rate")
+    for name, value in (
+        ("injected", injected),
+        ("caught", caught),
+        ("false_positives", false_positives),
+    ):
+        if not _is_count(value):
+            raise FlywheelError(
+                f"ledger line {line_no} has an invalid {name}: {value!r}"
+            )
+    assert isinstance(injected, int) and isinstance(caught, int)
+    assert isinstance(false_positives, int)
+    if caught > injected:
+        raise FlywheelError(
+            f"ledger line {line_no} is inconsistent: caught={caught} "
+            f"exceeds injected={injected}"
+        )
+    if isinstance(catch_rate, bool) or not isinstance(catch_rate, (int, float)):
+        raise FlywheelError(
+            f"ledger line {line_no} has a non-numeric catch_rate: {catch_rate!r}"
+        )
+    if not 0.0 <= float(catch_rate) <= 1.0:
+        raise FlywheelError(
+            f"ledger line {line_no} has catch_rate outside [0, 1]: {catch_rate!r}"
+        )
+    expected = (caught / injected) if injected else 0.0
+    if abs(float(catch_rate) - expected) > 1e-9:
+        raise FlywheelError(
+            f"ledger line {line_no} is inconsistent: catch_rate={catch_rate} "
+            f"but caught/injected = {expected}"
+        )
+
+
 def read_ledger(ledger_path: Path) -> list[dict[str, object]]:
     """Read and schema-validate the ledger. A corrupt line fails loudly:
-    the leading metric must never be computed from half-parsed data."""
+    the leading metric must never be computed from half-parsed data.
+    Validation covers value ranges and internal consistency, not just
+    key presence: a ledger line claiming catches it does not carry is
+    refused here, the same way DryRunReport refuses it at construction."""
     if not ledger_path.is_file():
         return []
     entries: list[dict[str, object]] = []
@@ -119,19 +174,21 @@ def read_ledger(ledger_path: Path) -> list[dict[str, object]]:
                 f"ledger line {line_no} has unsupported schema_version "
                 f"{entry.get('schema_version')}"
             )
+        _validate_ledger_entry(entry, line_no)
         entries.append(entry)
     return entries
 
 
 def leading_gate_catch_rate(ledger_path: Path) -> float | None:
-    """The loop's leading metric: mean gate-catch rate across ledgered
-    dry-runs. None when the ledger is empty (no measurement yet, not
-    zero)."""
+    """The loop's leading metric: pooled gate-catch rate across ledgered
+    dry-runs (total caught / total injected), so a 1-case run does not
+    count the same as a 2-case run. None when the ledger is empty (no
+    measurement yet, not zero)."""
     entries = read_ledger(ledger_path)
     if not entries:
         return None
-    rates = [entry["catch_rate"] for entry in entries]
-    numeric = [r for r in rates if isinstance(r, (int, float))]
-    if len(numeric) != len(rates):
-        raise FlywheelError("ledger holds a non-numeric catch_rate: refusing the metric")
-    return sum(numeric) / len(numeric)
+    injected = sum(cast(int, e["injected"]) for e in entries)
+    caught = sum(cast(int, e["caught"]) for e in entries)
+    if injected == 0:
+        return None
+    return caught / injected

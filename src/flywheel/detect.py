@@ -77,9 +77,20 @@ def parse_commits_payload(
 
 class GhCliTransport:
     """Live transport: the fleet's ``gh`` CLI. Two lines of subprocess;
-    everything else is the pure parse function above."""
+    everything else is the pure parse function above.
+
+    Single page, newest 100 commits: Detect silently sees only that
+    window (the ``gh`` wrapper returns one JSON page; pagination is a
+    named follow-up, not silently fixed here). ``repo`` and ``since``
+    are validated before interpolation: they travel inside a URL, so
+    query characters in them would alter the request.
+    """
 
     def list_fix_commits(self, repo: str, since: str | None = None) -> list[FixCommit]:
+        if not repo or any(ch in repo for ch in ("?", "&", "#", " ", "\t", "\n")):
+            raise FlywheelError(f"refusing unparseable repo value: {repo!r}")
+        if since is not None and any(ch in since for ch in ("?", "&", "#", " ", "\t", "\n")):
+            raise FlywheelError(f"refusing unparseable since value: {since!r}")
         url = f"/repos/{repo}/commits?per_page=100"
         if since:
             url += f"&since={since}"
@@ -91,6 +102,8 @@ class GhCliTransport:
                 check=False,
                 text=True,
             )
+        except subprocess.TimeoutExpired as e:
+            raise FlywheelError(f"gh GET {url} timed out: {e}") from e
         except OSError as e:
             raise FlywheelError(f"gh CLI unavailable for Detect: {e}") from e
         if proc.returncode != 0:

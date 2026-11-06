@@ -67,6 +67,15 @@ class InjectionCase:
     flagged: bool  # the rule predicate fired on the injected tree
     fail_to_pass: tuple[str, ...]  # suite tests the injection broke
     suite_broke: bool  # fail_to_pass non-empty: the injection is a real bug
+    # The installed enforcer test fails on the injected tree. For kinds
+    # whose faults are stylistic (no behavioral break to measure), this is
+    # the independent evidence leg: the thing validated is the thing the
+    # PR installs. False (default) when the kind has no enforcer check.
+    enforcer_failed: bool = False
+    # The installed enforcer test fails on the injected tree. For kinds
+    # whose faults are stylistic (no behavioral break to measure), this is
+    # the independent evidence leg: the thing validated is the thing the
+    # PR installs. False (default) when the kind has no enforcer check.
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,29 @@ class DryRunReport:
     clean_flagged: tuple[Finding, ...]
     cases: tuple[InjectionCase, ...]
     requires_behavioral_break: bool
+    requires_enforcer_check: bool = False
+
+    def __post_init__(self) -> None:
+        # The gate's numbers must be derived from the listed evidence, not
+        # free integers: a report claiming catches it does not list is
+        # refused at construction, so no hand-built report can authorize
+        # a PR payload with evidence it does not carry.
+        if self.injected != len(self.cases):
+            raise FlywheelError(
+                f"dry-run report is inconsistent: injected={self.injected} "
+                f"but {len(self.cases)} cases listed"
+            )
+        if self.caught != sum(1 for c in self.cases if c.flagged):
+            raise FlywheelError(
+                f"dry-run report is inconsistent: caught={self.caught} but "
+                f"{sum(1 for c in self.cases if c.flagged)} cases flagged"
+            )
+        if self.false_positives != len(self.clean_flagged):
+            raise FlywheelError(
+                f"dry-run report is inconsistent: false_positives="
+                f"{self.false_positives} but {len(self.clean_flagged)} "
+                "clean findings listed"
+            )
 
     @property
     def catch_rate(self) -> float:
@@ -96,16 +128,22 @@ class DryRunReport:
         """A rule becomes blocking only when: at least one fault of its
         class was injected (no vacuous promotion), every injected fault
         was caught, the clean tree is unflagged, and — for kinds whose
-        faults must be behavioral — every injected fault broke a test."""
+        faults must be behavioral — every injected fault broke a test,
+        and — for kinds with an enforcer check — the installed enforcer
+        failed on every injected tree."""
         if self.injected == 0:
             return False
         if self.catch_rate < MIN_CATCH_RATE:
             return False
         if self.false_positives != 0:
             return False
-        if self.requires_behavioral_break:
-            return all(c.suite_broke for c in self.cases)
-        return True
+        behavioral_ok = not self.requires_behavioral_break or all(
+            c.suite_broke for c in self.cases
+        )
+        enforcer_ok = not self.requires_enforcer_check or all(
+            c.enforcer_failed for c in self.cases
+        )
+        return behavioral_ok and enforcer_ok
 
 
 @dataclass(frozen=True)

@@ -15,7 +15,7 @@ adaptation (arena is the dogfood target; other repos are a follow-up).
 from __future__ import annotations
 
 from flywheel.detect import GhCliTransport, GitHubTransport, is_fix_commit, sample_commits
-from flywheel.loop import LoopResult, run_loop
+from flywheel.loop import run_loop
 from flywheel.propose import append_ledger, leading_gate_catch_rate, read_ledger, render_pr_payload
 from flywheel.reflect import Reflection, reflect
 from flywheel.types import (
@@ -25,6 +25,7 @@ from flywheel.types import (
     FixCommit,
     FlywheelError,
     InjectionCase,
+    LoopResult,
     PrPayload,
     RuleKind,
     ValidatedRule,

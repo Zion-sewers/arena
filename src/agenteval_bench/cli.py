@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 from agenteval_bench.engine import DEFAULT_SEED, EvalRunner
@@ -991,6 +992,110 @@ def cmd_tiered(args: list[str]) -> int:
     return 0 if report.verdict == "PASS" else 2
 
 
+def cmd_flywheel(args: list[str]) -> int:
+    """Run the fix-commit flywheel against a live repo (arena#40).
+
+    Detect -> Sample -> Reflect -> Propose -> Validate -> PR, with the
+    live ``gh`` transport and the local runner. Payloads are RENDERED to
+    files under ``--out`` (default ``<target>/.flywheel/payloads``), never
+    written into the target tree and never posted: posting them via the
+    GitHub API is the fleet runner's job (a follow-up, not shipped here).
+    The gate-catch ledger defaults to a durable path under the target
+    (``<target>/.flywheel/gate-catch-ledger.jsonl``), so the leading
+    metric persists across runs instead of evaporating in a temp dir.
+    Exit 0 = the loop completed (even with zero payloads); exit 1 =
+    usage error or a FlywheelError from any stage.
+    """
+    from bugsmith.harness import LocalRunner
+    from flywheel.detect import GhCliTransport
+    from flywheel.loop import run_loop
+    from flywheel.propose import leading_gate_catch_rate
+    from flywheel.types import FlywheelError
+
+    args, repo = _flag(args, "--repo")
+    args, target_s = _flag(args, "--target-root", ".")
+    args, corpus_s = _flag(args, "--corpus-root")
+    args, ledger_s = _flag(args, "--ledger")
+    args, out_s = _flag(args, "--out")
+    args, sample_s = _flag(args, "--sample-size", "10")
+    args, seed_s = _flag(args, "--seed", "42")
+
+    if args or not repo:
+        print(
+            "Error: agenteval-bench flywheel --repo owner/name "
+            "[--target-root .] [--corpus-root <dir>] [--ledger <path>] "
+            "[--out <dir>] [--sample-size 10] [--seed 42]",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        sample_size = int(sample_s or "10")
+        seed = int(seed_s or "42")
+    except ValueError:
+        print("Error: --sample-size/--seed must be integers", file=sys.stderr)
+        return 1
+
+    target_root = Path(target_s or ".")
+    if corpus_s:
+        corpus_root = Path(corpus_s)
+    else:
+        corpus_root = (
+            Path(__file__).resolve().parents[1]
+            / "bugsmith"
+            / "fixtures"
+            / "target"
+        )
+    ledger_path = (
+        Path(ledger_s)
+        if ledger_s
+        else target_root / ".flywheel" / "gate-catch-ledger.jsonl"
+    )
+    out_dir = Path(out_s) if out_s else target_root / ".flywheel" / "payloads"
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="flywheel-") as tmp:
+            result = run_loop(
+                transport=GhCliTransport(),
+                target_repo=repo,
+                corpus_root=corpus_root,
+                target_root=target_root,
+                work_dir=Path(tmp),
+                runner=LocalRunner(),
+                ledger_path=ledger_path,
+                sample_size=sample_size,
+                seed=seed,
+            )
+    except FlywheelError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    for payload in result.payloads:
+        dest = out_dir / payload.rule_kind
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "PR.md").write_text(
+            f"# {payload.title}\n\n{payload.body}", encoding="utf-8"
+        )
+        for rel, content in payload.files.items():
+            path = dest / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+    print(
+        f"detected={result.detected} sampled={result.sampled} "
+        f"payloads={len(result.payloads)}"
+    )
+    for line in result.skipped:
+        print(f"skipped: {line}")
+    rate = leading_gate_catch_rate(ledger_path)
+    if rate is None:
+        print(f"ledger: {ledger_path} (no runs yet)")
+    else:
+        print(f"ledger: {ledger_path} (leading gate-catch rate: {rate:.0%})")
+    print(f"payloads: {out_dir}")
+    print("NOTE: payloads are rendered, not posted — the fleet runner "
+          "posts them via the GitHub API.")
+    return 0
+
+
 def main() -> None:
     """Minimal CLI — full argparse/typer in v0.2."""
     args = sys.argv[1:]
@@ -1015,6 +1120,9 @@ def main() -> None:
         print("                                [--mutants 8] [--min-mutation-score 0.5]")
         print("                                [--min-coverage 80] [--seed 42] [--root .]")
         print("                                [--out report.json]")
+        print("       agenteval-bench flywheel --repo owner/name [--target-root .]")
+        print("                                [--corpus-root <dir>] [--ledger <path>]")
+        print("                                [--out <dir>] [--sample-size 10] [--seed 42]")
         print("       (--seed is recorded for provenance; the test itself is deterministic)")
         return
 
@@ -1023,6 +1131,8 @@ def main() -> None:
         sys.exit(cmd_run(rest))
     elif cmd == "tiered":
         sys.exit(cmd_tiered(rest))
+    elif cmd == "flywheel":
+        sys.exit(cmd_flywheel(rest))
     elif cmd == "baseline":
         sys.exit(cmd_baseline(rest))
     elif cmd == "replay":
