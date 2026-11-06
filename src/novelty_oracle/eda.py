@@ -107,6 +107,26 @@ def experiment_2_frontier() -> None:
     print()
 
 
+def _dusted_mechanism(sp: Mechanism, amount: float, tag: str) -> Mechanism:
+    """Second-price with a deterministic payment dust added to the winner.
+
+    Module-level (not nested in experiment_3) so the dust amounts are
+    directly testable: mechanism A is the zero-dust control and its amount
+    must be exactly 0.0 — a wrong dust here silently moves the epsilon-band
+    experiment's baseline, which is exactly what the nightly mutation
+    score caught (arena#39).
+    """
+
+    def allocate(values: tuple[float, ...]) -> tuple[int, ...]:
+        return sp.allocate(values)
+
+    def pay(values: tuple[float, ...], allocation: tuple[int, ...]) -> tuple[float, ...]:
+        _, payments = run_mechanism(sp, "eda", values)
+        return tuple(p + (amount if a == 1 else 0.0) for p, a in zip(payments, allocation))
+
+    return Mechanism(name=tag, allocate=allocate, pay=pay, source=None)
+
+
 def experiment_3_epsilon_band() -> None:
     print("=" * 70)
     print("EXPERIMENT 3 — epsilon-band attack (Theorem 1's counterexample, live)")
@@ -114,19 +134,9 @@ def experiment_3_epsilon_band() -> None:
     eps = 1e-9
     sp = second_price()
 
-    def dusted(amount: float, tag: str) -> Mechanism:
-        def allocate(values: tuple[float, ...]) -> tuple[int, ...]:
-            return sp.allocate(values)
-
-        def pay(values: tuple[float, ...], allocation: tuple[int, ...]) -> tuple[float, ...]:
-            _, payments = run_mechanism(sp, "eda", values)
-            return tuple(p + (amount if a == 1 else 0.0) for p, a in zip(payments, allocation))
-
-        return Mechanism(name=tag, allocate=allocate, pay=pay, source=None)
-
-    a = dusted(0.0, "A")
-    b = dusted(0.6 * eps, "B")
-    c = dusted(1.2 * eps, "C")
+    a = _dusted_mechanism(sp, 0.0, "A")
+    b = _dusted_mechanism(sp, 0.6 * eps, "B")
+    c = _dusted_mechanism(sp, 1.2 * eps, "C")
     _, battery = build_battery()
     dab, _ = behavioral_distance(a, b, battery, eps)
     dbc, _ = behavioral_distance(b, c, battery, eps)

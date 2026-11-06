@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 
 from agenteval_bench.engine import DEFAULT_SEED, EvalRunner
 from agenteval_bench.models import EvalSuite
@@ -917,6 +918,75 @@ def _snapshot_compare(args: list[str]) -> int:
     return 0 if report.verdict == "GATE_PASS" else 2
 
 
+def cmd_tiered(args: list[str]) -> int:
+    """Run the tiered eval pipeline (arena#39): gate -> smoke -> expanded -> nightly.
+
+    ``--phase <name>`` runs that phase and every earlier one (each phase's
+    entry criterion is that all earlier phases passed); ``all`` runs
+    everything. Exit 0 = all run phases passed; exit 2 = a phase failed;
+    exit 1 = usage error.
+    """
+    from agenteval_bench.tiered import (
+        DEFAULT_MIN_COVERAGE,
+        DEFAULT_MIN_MUTATION_SCORE,
+        DEFAULT_MUTANTS,
+        TieredError,
+        run_pipeline,
+    )
+    from agenteval_bench.tiered import DEFAULT_SEED as TIERED_SEED
+
+    args, phase = _flag(args, "--phase", "all")
+    args, mutants_s = _flag(args, "--mutants", str(DEFAULT_MUTANTS))
+    args, seed_s = _flag(args, "--seed", str(TIERED_SEED))
+    args, min_mut_s = _flag(args, "--min-mutation-score",
+                            str(DEFAULT_MIN_MUTATION_SCORE))
+    args, min_cov_s = _flag(args, "--min-coverage", str(DEFAULT_MIN_COVERAGE))
+    args, out = _flag(args, "--out")
+    args, root_s = _flag(args, "--root", ".")
+
+    try:
+        mutants = int(mutants_s or str(DEFAULT_MUTANTS))
+        seed = int(seed_s or str(TIERED_SEED))
+        min_mut = float(min_mut_s or str(DEFAULT_MIN_MUTATION_SCORE))
+        min_cov = float(min_cov_s or str(DEFAULT_MIN_COVERAGE))
+    except ValueError:
+        print("Error: --mutants/--seed must be integers, "
+              "--min-mutation-score/--min-coverage numbers", file=sys.stderr)
+        return 1
+
+    try:
+        report = run_pipeline(
+            Path(root_s or "."),
+            upto=phase or "all",
+            mutants=mutants,
+            seed=seed,
+            min_mutation_score=min_mut,
+            min_coverage=min_cov,
+        )
+    except TieredError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    for p in report.phases:
+        print(f"phase {p.phase}: {p.status.upper()} ({p.duration_s:.1f}s)")
+        for note in p.notes:
+            print(f"  note: {note}")
+    if report.coverage_percent is not None:
+        print(f"coverage: {report.coverage_percent:.1f}%")
+    if report.mutation_score is not None:
+        print(f"mutation score: {report.mutation_score:.0%}")
+    print(f"verdict: {report.verdict}")
+    if out:
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(report.to_json())
+        except OSError as e:
+            print(f"Error: cannot write report: {e}", file=sys.stderr)
+            return 1
+        print(f"Report: {out}")
+    return 0 if report.verdict == "PASS" else 2
+
+
 def main() -> None:
     """Minimal CLI — full argparse/typer in v0.2."""
     args = sys.argv[1:]
@@ -937,12 +1007,17 @@ def main() -> None:
         print("       agenteval-bench snapshot publish --suite <file> --store <dir>")
         print("                                --version <id> --owner <name> --why <text>")
         print("       agenteval-bench snapshot verify --store <dir> --suite <name> --version <id>")
+        print("       agenteval-bench tiered --phase <gate|smoke|expanded|nightly|all>")
+        print("                                [--mutants 8] [--min-mutation-score 0.5]")
+        print("                                [--min-coverage 80] [--out report.json]")
         print("       (--seed is recorded for provenance; the test itself is deterministic)")
         return
 
     cmd, rest = args[0], args[1:]
     if cmd == "run":
         sys.exit(cmd_run(rest))
+    elif cmd == "tiered":
+        sys.exit(cmd_tiered(rest))
     elif cmd == "baseline":
         sys.exit(cmd_baseline(rest))
     elif cmd == "replay":

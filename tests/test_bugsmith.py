@@ -284,6 +284,106 @@ def test_spaced_node_ids_survive_live_run(tmp_path: Path) -> None:
     assert plain not in outcome.failed
 
 
+def test_validate_survives_target_addopts(tmp_path: Path) -> None:
+    # Regression (arena#39 nightly): a target whose own pyproject sets
+    # addopts="-v" used to break collection — the target's -v plus the
+    # harness's -q cancel to default verbosity, and --collect-only then
+    # prints the tree format instead of one node ID per line, so the
+    # baseline refuses with "collected zero tests". The harness pins
+    # -o addopts=, so its invocation is hermetic to target addopts.
+    target = tmp_path / "target"
+    (target / "src" / "pkg").mkdir(parents=True)
+    (target / "src" / "pkg" / "__init__.py").write_text(
+        'def val(label):\n    return "ok"\n', encoding="utf-8"
+    )
+    (target / "tests").mkdir(parents=True)
+    (target / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (target / "tests" / "test_sp.py").write_text(
+        "import pytest\n"
+        "from pkg import val\n\n"
+        "@pytest.mark.parametrize('label', ['a - b', 'plain'])\n"
+        "def test_lab(label):\n"
+        "    assert val(label) == 'ok', label\n",
+        encoding="utf-8",
+    )
+    (target / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\naddopts = \"-v --tb=short\"\n",
+        encoding="utf-8",
+    )
+    work = tmp_path / "w"
+    runner = LocalRunner()
+    passed = baseline(target, runner, work)
+    spaced = "tests/test_sp.py::test_lab[a - b]"
+    assert spaced in passed
+    patch = ("--- a/src/pkg/__init__.py\n"
+             "+++ b/src/pkg/__init__.py\n"
+             "@@ -1,2 +1,2 @@\n"
+             '-def val(label):\n'
+             '-    return "ok"\n'
+             '+def val(label):\n'
+             '+    return "ok" if label == "plain" else "bad"\n')
+    candidate = BugCandidate(
+        record=_record(strategy=BugStrategy.PROCEDURAL_AST,
+                       target_file="src/pkg/__init__.py",
+                       site_description="target-addopts regression"),
+        patch=patch,
+    )
+    report = validate(candidate, target, runner, work, passed)
+    assert report.is_valid_instance
+    assert spaced in report.fail_to_pass
+
+
+def test_validate_survives_ancestor_config_file(tmp_path: Path) -> None:
+    # Regression (arena#39 nightly): a config file in an ancestor of the
+    # work tree (e.g. a stray /tmp/pyproject.toml, where pytest's tmp_path
+    # lives) used to make pytest resolve rootdir to that ancestor, so node
+    # IDs embedded the work-tree path — and the clean-tree and patched-tree
+    # IDs for the SAME test differed, so fail_to_pass matching reported
+    # every mutant as surviving. The harness pins --rootdir to the work
+    # tree, so node IDs stay work-tree-relative whatever the ancestors hold.
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "not-this-repo"\nversion = "0.0.1"\n',
+        encoding="utf-8",
+    )
+    target = tmp_path / "target"
+    (target / "src" / "pkg").mkdir(parents=True)
+    (target / "src" / "pkg" / "__init__.py").write_text(
+        'def val(label):\n    return "ok"\n', encoding="utf-8"
+    )
+    (target / "tests").mkdir(parents=True)
+    (target / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (target / "tests" / "test_sp.py").write_text(
+        "import pytest\n"
+        "from pkg import val\n\n"
+        "@pytest.mark.parametrize('label', ['a - b', 'plain'])\n"
+        "def test_lab(label):\n"
+        "    assert val(label) == 'ok', label\n",
+        encoding="utf-8",
+    )
+    work = tmp_path / "w"
+    runner = LocalRunner()
+    passed = baseline(target, runner, work)
+    spaced = "tests/test_sp.py::test_lab[a - b]"
+    assert spaced in passed
+    patch = ("--- a/src/pkg/__init__.py\n"
+             "+++ b/src/pkg/__init__.py\n"
+             "@@ -1,2 +1,2 @@\n"
+             '-def val(label):\n'
+             '-    return "ok"\n'
+             '+def val(label):\n'
+             '+    return "ok" if label == "plain" else "bad"\n')
+    candidate = BugCandidate(
+        record=_record(strategy=BugStrategy.PROCEDURAL_AST,
+                       target_file="src/pkg/__init__.py",
+                       site_description="ancestor-config regression"),
+        patch=patch,
+    )
+    report = validate(candidate, target, runner, work, passed)
+    assert report.is_valid_instance
+    assert spaced in report.fail_to_pass
+    assert "tests/test_sp.py::test_lab[plain]" in report.pass_to_pass
+
+
 def test_validate_threads_known_ids_for_spaced_tests(tmp_path: Path) -> None:
     # Pins the validate() -> run(known_ids=...) wiring that the B1 fix
     # depends on: a candidate breaking a spaced-ID test must land the FULL

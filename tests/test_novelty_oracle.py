@@ -183,3 +183,119 @@ def test_myerson_reserve_beats_plain_second_price_on_iid() -> None:
             total += sum(payments)
         revenues[mech.name] = total / len(iid)
     assert revenues["myerson-uniform"] >= revenues["second-price"], revenues
+
+
+# --- mutation-survivor pins (arena#39 nightly: these mutants survived) ---
+
+
+def test_battery_category_counts_are_canonical() -> None:
+    """The canonical battery is 200 profiles with pinned category counts.
+
+    A negated count (120 -> -120) survived the suite before this test:
+    nothing asserted the battery's composition, so the construction
+    silently changed shape.
+    """
+    from novelty_oracle.battery import CATEGORY_COUNTS, build_battery
+
+    assert CATEGORY_COUNTS == {
+        "iid-uniform": 120,
+        "asymmetric": 30,
+        "tie": 10,
+        "dominant": 10,
+        "zero": 5,
+        "skewed-beta": 25,
+    }
+    assert sum(CATEGORY_COUNTS.values()) == 200
+    _, profiles = build_battery()
+    assert len(profiles) == 200
+
+
+def test_empty_evidence_placeholder_is_all_zeros() -> None:
+    """The placeholder is the zero baseline: every field must read zero.
+
+    A negated n_seeds (0 -> 1) survived before this test: nothing
+    asserted the placeholder's values, so a verdict built on it would
+    silently carry one seed's worth of fake evidence.
+    """
+    from novelty_oracle.types import empty_evidence_placeholder
+
+    ev = empty_evidence_placeholder()
+    assert ev.quality.candidate.n_seeds == 0
+    assert ev.quality.candidate.draws_per_seed == 0
+    assert ev.quality.candidate.mean_payoff == 0.0
+    assert ev.quality.quality_delta == 0.0
+    assert ev.novelty.novelty_score == 0.0
+    assert ev.novelty.n_profiles == 0
+
+
+def test_dusted_mechanism_zero_dust_pays_second_price() -> None:
+    """Mechanism A is the zero-dust control: it must pay exactly
+    second-price, and a dusted mechanism must add exactly its dust to
+    the winner only.
+
+    A negated zero dust (0.0 -> 1) survived before this test: the dust
+    amounts lived in a nested closure nothing asserted, so the
+    epsilon-band experiment's baseline silently moved by 1.0.
+    """
+    from novelty_oracle.behavior import run_mechanism
+    from novelty_oracle.eda import _dusted_mechanism
+
+    sp = second_price()
+    values = (1.0, 0.5, 0.25)
+    allocation = sp.allocate(values)
+    _, base_payments = run_mechanism(sp, "eda", values)
+    winner = allocation.index(1)
+
+    zero = _dusted_mechanism(sp, 0.0, "A")
+    assert zero.pay(values, allocation) == base_payments
+
+    dust = 0.6e-9
+    dusted = _dusted_mechanism(sp, dust, "B")
+    paid = dusted.pay(values, allocation)
+    assert paid[winner] == pytest.approx(base_payments[winner] + dust)
+    for i, p in enumerate(base_payments):
+        if i != winner:
+            assert paid[i] == p
+
+
+def test_noisy_copy_zero_noise_pays_second_price() -> None:
+    """A zero-noise copy must pay exactly second-price: non-winners pay
+    the base payment, nothing added.
+
+    The else-branch 0.0 in _noisy_copy's pay (losers add 0.0) survived
+    the nightly mutation score before this test: experiment_5's helper
+    ran only as a demo, never under pytest, so a negated 0.0 (losers pay
+    +1.0) changed the experiment's mechanisms silently.
+    """
+    from novelty_oracle.behavior import run_mechanism
+    from novelty_oracle.eda import _noisy_copy
+
+    sp = second_price()
+    values = (1.0, 0.5, 0.25)
+    allocation = sp.allocate(values)
+    _, base_payments = run_mechanism(sp, "eda", values)
+    quiet = _noisy_copy(0.0, 0)
+    assert quiet.pay(values, allocation) == base_payments
+
+
+def test_noisy_copy_nonzero_noise_lands_on_winner() -> None:
+    """Nonzero noise must actually land on the winner's payment.
+
+    The zero-noise test above cannot kill the ``a == 1`` -> ``a == -1``
+    mutant: with noise 0 the winner pays base either way, so the mutant
+    survived the nightly measurement (7/8). With noise_std 0.1 and
+    values (1.0, 0.5, 0.25) the dust is exactly +0.05 on the winner
+    (bump 2.75 -> 0.75 -> (0.75 - 0.5) * 2 * 0.1), so a mutant that
+    never adds noise pays base 0.5 and fails here.
+    """
+    from novelty_oracle.behavior import run_mechanism
+    from novelty_oracle.eda import _noisy_copy
+
+    sp = second_price()
+    values = (1.0, 0.5, 0.25)
+    allocation = sp.allocate(values)
+    _, base_payments = run_mechanism(sp, "eda", values)
+    noisy = _noisy_copy(0.1, 0)
+    paid = noisy.pay(values, allocation)
+    assert paid[0] == pytest.approx(base_payments[0] + 0.05)
+    assert paid[1:] == base_payments[1:]

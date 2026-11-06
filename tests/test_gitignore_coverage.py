@@ -13,6 +13,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Representative paths for every artifact class enumerated in issue #18.
@@ -114,13 +116,36 @@ def _check_ignore(paths: list[str]) -> set[str]:
     return {line for line in proc.stdout.splitlines() if line}
 
 
+def _in_git_work_tree() -> bool:
+    """True only when REPO_ROOT is inside a git work tree.
+
+    These checks enforce ``git check-ignore`` / ``git ls-files`` against the
+    live repo. Throwaway copies (bugsmith's mutation baseline, the tiered
+    pipeline's nightly phase) deliberately carry no ``.git`` directory, so
+    the git commands fail and the assertions would fail vacuously — or pass
+    vacuously for the tree-observation test. Skipping there is honest:
+    there is no repo to check. In any real checkout the tests run in full.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
 def test_all_issue18_artifact_classes_are_ignored() -> None:
+    if not _in_git_work_tree():
+        pytest.skip("not inside a git work tree: .gitignore checks need git")
     ignored = _check_ignore(MUST_BE_IGNORED)
     missing = [p for p in MUST_BE_IGNORED if p not in ignored]
     assert not missing, f"paths NOT ignored by .gitignore: {missing}"
 
 
 def test_no_overbroad_pattern_swallows_sources() -> None:
+    if not _in_git_work_tree():
+        pytest.skip("not inside a git work tree: .gitignore checks need git")
     ignored = _check_ignore(MUST_NOT_BE_IGNORED)
     assert not ignored, f"source files wrongly ignored: {sorted(ignored)}"
 
@@ -199,6 +224,8 @@ def _untracked_unignored() -> list[str]:
 
 
 def test_no_stray_unignored_artifacts_in_tree() -> None:
+    if not _in_git_work_tree():
+        pytest.skip("not inside a git work tree: tree observation needs git")
     import fnmatch
 
     def _looks_like_artifact(path: str) -> bool:

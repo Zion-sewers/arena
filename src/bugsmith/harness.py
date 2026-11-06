@@ -22,6 +22,13 @@ from bugsmith.patch import PatchError, apply_patch
 from bugsmith.types import BugCandidate, BugsmithError, ValidationReport
 
 PYTEST_ARGS = ["-q", "--tb=no", "-p", "no:cacheprovider"]
+# The harness owns its pytest invocation: a target's own addopts (this
+# repo ships ``-v``) would otherwise perturb it — ``-v`` plus the
+# harness's ``-q`` cancel to default verbosity, and ``--collect-only``
+# then prints the tree format instead of one node ID per line, so
+# _parse_collected finds zero IDs and the baseline refuses with "zero
+# tests". -o addopts= neutralizes the target's addopts on every call.
+PYTEST_OVERRIDES = ["-o", "addopts="]
 RUN_TIMEOUT_S = 300
 
 _FAILED_RE = re.compile(r"^(FAILED|ERROR) (.*)$")
@@ -164,13 +171,25 @@ class LocalRunner:
     """Subprocess runner. Used by unit tests and as an explicit opt-in.
 
     Not a silent fallback: callers choose it deliberately (e.g. --local).
+
+    ``--rootdir`` is pinned to the work tree on every invocation: without
+    it pytest resolves rootdir upward from the work tree, so any config
+    file in an ancestor (e.g. a stray pyproject.toml under /tmp, where
+    pytest's tmp_path lives) makes node IDs embed the work-tree path —
+    and the clean-tree and patched-tree IDs for the SAME test then differ,
+    so fail_to_pass matching silently reports every mutant as surviving.
+    ``-o addopts=`` is pinned for the same reason: a target's own addopts
+    (this repo ships ``-v``) cancel the harness's ``-q`` to default
+    verbosity, and ``--collect-only`` then prints the tree format instead
+    of one node ID per line, so collection finds zero IDs.
     """
 
     def run(
         self, work_tree: Path, known_ids: frozenset[str] = frozenset()
     ) -> TestOutcome:
         proc = subprocess.run(
-            ["python3", "-m", "pytest", *PYTEST_ARGS],
+            ["python3", "-m", "pytest", *PYTEST_ARGS, *PYTEST_OVERRIDES,
+             f"--rootdir={work_tree}"],
             cwd=str(work_tree),
             env=_local_env(work_tree),
             stdout=subprocess.PIPE,
@@ -183,7 +202,9 @@ class LocalRunner:
 
     def collect(self, work_tree: Path) -> frozenset[str]:
         proc = subprocess.run(
-            ["python3", "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
+            ["python3", "-m", "pytest", "--collect-only", "-q",
+             "-p", "no:cacheprovider", *PYTEST_OVERRIDES,
+             f"--rootdir={work_tree}"],
             cwd=str(work_tree),
             env=_local_env(work_tree),
             stdout=subprocess.PIPE,
@@ -210,7 +231,8 @@ class DockerRunner:
     ) -> TestOutcome:
         proc = subprocess.run(
             _docker_base(self._image, work_tree)
-            + ["sh", "-c", _container_pytest_script(PYTEST_ARGS)],
+            + ["sh", "-c", _container_pytest_script(
+                [*PYTEST_ARGS, *PYTEST_OVERRIDES, "--rootdir=/work"])],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=RUN_TIMEOUT_S,
@@ -223,7 +245,8 @@ class DockerRunner:
         proc = subprocess.run(
             _docker_base(self._image, work_tree)
             + ["sh", "-c", _container_pytest_script(
-                ["--collect-only", "-q", "-p", "no:cacheprovider"])],
+                ["--collect-only", "-q", "-p", "no:cacheprovider",
+                 *PYTEST_OVERRIDES, "--rootdir=/work"])],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=RUN_TIMEOUT_S,
