@@ -678,8 +678,10 @@ def test_loop_is_pr_only_and_needs_no_human(tmp_path: Path) -> None:
     }
     bare = next(p for p in result.payloads if p.rule_kind == "no-bare-except")
     assert "E722" in bare.files["pyproject.toml"]
-    mock = next(p for p in result.payloads if p.rule_kind == "no-mock-on-boundary")
-    assert "find_mock_usage" in mock.files["tests/test_no_mocks_on_boundaries.py"]
+    boundary_payload = next(
+        p for p in result.payloads if p.rule_kind == "no-mock-on-boundary"
+    )
+    assert "find_mock_usage" in boundary_payload.files["tests/test_no_mocks_on_boundaries.py"]
     assert result.skipped == ()
     assert len(read_ledger(tmp_path / "ledger.jsonl")) == 2
 
