@@ -200,7 +200,9 @@ class ProceduralBugGenerator:
     def strategy(self) -> BugStrategy:
         return BugStrategy.PROCEDURAL_AST
 
-    def _source_files(self, repo_root: Path) -> list[Path]:
+    def _source_files(
+        self, repo_root: Path, exclude: tuple[str, ...] = ()
+    ) -> list[Path]:
         def is_test_path(p: Path) -> bool:
             rel_parts = p.relative_to(repo_root).parts
             return any(
@@ -208,11 +210,16 @@ class ProceduralBugGenerator:
                 for part in rel_parts
             )
 
+        def is_excluded(p: Path) -> bool:
+            rel = p.relative_to(repo_root).as_posix()
+            return any(rel == e or rel.startswith(e.rstrip("/") + "/") for e in exclude)
+
         # docs/ and examples/ are not library code: mutating them is noise,
         # not a benchmark instance.
         files = sorted(
             p for p in repo_root.rglob("*.py")
             if not is_test_path(p)
+            and not is_excluded(p)
             and ".git" not in p.relative_to(repo_root).parts
             and "docs" not in p.relative_to(repo_root).parts
             and "examples" not in p.relative_to(repo_root).parts
@@ -221,14 +228,22 @@ class ProceduralBugGenerator:
             raise BugsmithError(f"no source files under {repo_root}")
         return files
 
-    def generate(self, repo_root: Path | str, count: int) -> list[BugCandidate]:
-        """Yield up to ``count`` candidates, each from a distinct (file, site)."""
+    def generate(
+        self, repo_root: Path | str, count: int, *, exclude: tuple[str, ...] = ()
+    ) -> list[BugCandidate]:
+        """Yield up to ``count`` candidates, each from a distinct (file, site).
+
+        ``exclude`` lists repo-relative paths (files or directories) that
+        are never mutated. The tiered pipeline excludes its own scoring
+        path (``src/bugsmith``) so a mutant there cannot fabricate the
+        score it is being measured by.
+        """
         if count < 1:
             raise BugsmithError("count must be >= 1")
         repo_root = Path(repo_root).resolve()
         candidates: list[BugCandidate] = []
         seen: set[tuple[str, str]] = set()
-        files = self._source_files(repo_root)
+        files = self._source_files(repo_root, exclude)
         attempts = 0
         # Bounded: every attempt consumes RNG state deterministically.
         while len(candidates) < count and attempts < count * 25:

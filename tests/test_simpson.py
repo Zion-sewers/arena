@@ -118,3 +118,14 @@ def test_pooled_rates_are_descriptive_only() -> None:
     assert pt < pc  # the reversal, as description — quoting it as a win is refused
     with pytest.raises(AggregationViolation):
         assert_aggregation((friday, saturday))
+
+
+def test_demo_stable_runs() -> None:
+    """The Simpson demo is executable specification: its internal asserts
+    (two strata, win claim accepted) must hold. A flipped comparison
+    inside demo_stable survived the suite before this test because the
+    demo ran only as a CI step, never under pytest (arena#39 nightly).
+    """
+    from experiment.demo_simpson import demo_stable
+
+    demo_stable()
