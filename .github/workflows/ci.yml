@@ -33,3 +33,5 @@ jobs:
         run: PYTHONPATH=src python -m experiment.demo_simpson
       - name: SWE-smith bug-injection demo (bug-gen -> Docker validation -> curation)
         run: PYTHONPATH=src python -m bugsmith.demo
+      - name: Fix-commit flywheel demo (Detect -> Sample -> Reflect -> Propose -> Validate -> PR)
+        run: PYTHONPATH=src python -m flywheel.demo < /dev/null
