@@ -35,3 +35,5 @@ jobs:
         run: PYTHONPATH=src python -m bugsmith.demo
       - name: Fix-commit flywheel demo (Detect -> Sample -> Reflect -> Propose -> Validate -> PR)
         run: PYTHONPATH=src python -m flywheel.demo < /dev/null
+      - name: Decision-system demo (evidence -> uncertainty -> threshold -> action)
+        run: PYTHONPATH=src python -m agenteval_bench.decision_demo

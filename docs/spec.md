@@ -51,7 +51,10 @@ src/agenteval_bench/
                   #   ExpectedOutput, RubricCriterion, CostBound
   scoring.py      # DeterministicScorer (exact, contains, regex, json_schema)
   engine.py       # EvalRunner — orchestrates suite execution
-  cli.py          # CLI entry point (run --suite --ci --threshold)
+  decision.py     # Decision system: evidence -> uncertainty -> threshold -> action
+                  #   (Dimension/RiskLevel/DecisionAction, Wilson intervals, decide)
+  decision_demo.py # Seeded end-to-end demo of the decision system
+  cli.py          # CLI entry point (run --suite --ci --threshold; decide --suite --policy)
 tests/            # pytest suite (engine + CLI gateway)
 examples/         # Golden replay suites (YAML)
 docs/             # Specifications, archive, roadmap references
@@ -124,6 +127,12 @@ Matcher rules:
 - `run_ci(suite, agent_fn, threshold=1.0)`: currently delegates to `run` and returns
   the `RunResult`; the CLI performs the threshold comparison and `sys.exit(2)` on
   failure. (Future: move gate logic into `run_ci`.)
+- `run_decision(suite, agent_fn, policy, risk, cost_fn=None, reliability_runs=2)`:
+  maps a suite to a typed GATE / ROLLBACK / INVESTIGATE `Decision` over the
+  four dimensions (quality, safety, cost, reliability) with 95% intervals
+  compared against per-risk thresholds; an unmeasured dimension forces
+  INVESTIGATE. Full contract in `docs/DECISION-SYSTEM.md`. This supersedes
+  the `run_ci` threshold path for new gates.
 
 ## 6. API contract
 
@@ -144,6 +153,15 @@ Behavior:
 - Cases without a recorded `output` are **skipped** in CLI mode (the CLI cannot call
   a live agent) and reported with a "Note".
 - Exit codes: `0` clean / gate passed, `1` bad input, `2` gate failed.
+
+```
+agenteval-bench decide --suite <FILE> [--policy <FILE>] [--risk <LEVEL>]
+                       [--seed 42] [--out report.json]
+```
+
+Maps a replay suite to a decision (evidence -> uncertainty -> threshold ->
+action) over the four dimensions; see `docs/DECISION-SYSTEM.md`. Exit
+codes: `0` GATE, `1` ROLLBACK, `2` INVESTIGATE, `3` usage error.
 
 > The `compare` and `report` subcommands described in earlier drafts are **`planned`**
 > (see §9) and are **not** implemented in v0.1.0; invoking an unknown command exits `1`.
