@@ -123,6 +123,41 @@ def test_last_bin_range_is_closed() -> None:
     assert "[0.9, 1.0)" not in record.reasons[0]
 
 
+def test_bin_range_label_keeps_non_decile_edges_honest() -> None:
+    from agenteval_bench.calibration import bin_range_label
+
+    assert bin_range_label(1 / 3, 2 / 3) == "[0.3333, 0.6667)"
+    assert bin_range_label(0.9, 1.0) == "[0.9, 1.0]"
+    assert bin_range_label(0.0, 0.1) == "[0, 0.1)"
+
+
+def test_record_field_validation() -> None:
+    good = calibrate(JUDGE, _mixed(confidence=0.5, n_agree=100, n_disagree=100))
+    with pytest.raises(ValueError, match="non-empty"):
+        JudgeCalibration(
+            judge="",
+            status="calibrated",
+            n_total=200,
+            ece=0.0,
+            bins=good.bins,
+        )
+    with pytest.raises(ValueError, match="n_total must be >= 0"):
+        JudgeCalibration(
+            judge=JUDGE,
+            status="uncalibrated",
+            n_total=-1,
+            ece=None,
+        )
+    with pytest.raises(ValueError, match="ece must be in \\[0, 1\\]"):
+        JudgeCalibration(
+            judge=JUDGE,
+            status="calibrated",
+            n_total=200,
+            ece=1.5,
+            bins=good.bins,
+        )
+
+
 # --- The grade ------------------------------------------------------------
 
 
@@ -245,6 +280,60 @@ def test_policy_is_recorded_on_the_grade() -> None:
     assert record.policy.tolerance == 0.5
 
 
+def test_empty_and_negative_bins_are_refused() -> None:
+    # The arch re-review FAIL: an empty bin let a zero-observation
+    # CALIBRATED record through (0 == 0 on the n_total check).
+    with pytest.raises(ValueError, match="n >= 1"):
+        CalibrationBin(9, 0.9, 1.0, 0, 0.0, 0, True)
+    with pytest.raises(ValueError, match="n >= 1"):
+        CalibrationBin(9, 0.9, 1.0, -5, 0.0, -5, True)
+    with pytest.raises(ValueError, match="out of range"):
+        CalibrationBin(9, 0.9, 1.0, 50, 50.0, 51, True)
+    with pytest.raises(ValueError, match="out of range"):
+        CalibrationBin(9, 0.9, 1.0, 50, 51.0, 50, True)
+
+
+def test_bin_derives_its_interval_from_the_counts() -> None:
+    # A forged interval has nowhere to live: the interval is recomputed
+    # from (agreed, n) on every read.
+    from agenteval_bench.decision import wilson_interval
+
+    b = CalibrationBin(9, 0.9, 1.0, 50, 45.0, 25, True)
+    assert b.mean_confidence == pytest.approx(0.9)
+    assert b.agreement_rate == pytest.approx(0.5)
+    assert b.agreement_interval == wilson_interval(25, 50)
+    assert b.gap == pytest.approx(0.9 - wilson_interval(25, 50)[0])
+    assert b.to_dict()["agreed"] == 25
+
+
+def test_ece_mismatch_is_refused() -> None:
+    good = calibrate(JUDGE, _mixed(confidence=0.5, n_agree=100, n_disagree=100))
+    with pytest.raises(ValueError, match="does not match the bins"):
+        JudgeCalibration(
+            judge=JUDGE,
+            status="calibrated",
+            n_total=200,
+            ece=0.999,
+            bins=good.bins,
+        )
+
+
+def test_hand_built_record_below_policy_floors_is_refused() -> None:
+    small_policy = CalibrationPolicy(min_total=10, bins=5, min_bin_n=1, tolerance=0.5)
+    small = calibrate(
+        JUDGE, _mixed(confidence=0.5, n_agree=10, n_disagree=10), small_policy
+    )
+    assert small.status == "calibrated"
+    with pytest.raises(ValueError, match="below the record policy's min_total"):
+        JudgeCalibration(
+            judge=JUDGE,
+            status="calibrated",
+            n_total=small.n_total,
+            ece=small.ece,
+            bins=small.bins,
+        )
+
+
 def test_forged_calibrated_record_is_refused_at_construction() -> None:
     # The arch FAIL: a hand-built CALIBRATED record with no measurement
     # behind it must not reach the gate.
@@ -256,10 +345,8 @@ def test_forged_calibrated_record_is_refused_at_construction() -> None:
         lower_edge=0.9,
         upper_edge=1.0,
         n=50,
-        mean_confidence=1.0,
-        agreement_rate=0.5,
-        agreement_interval=(0.4, 0.6),
-        gap=0.6,
+        confidence_sum=50.0,
+        agreed=25,
         passed=False,
     )
     with pytest.raises(ValueError, match="failed bin"):
@@ -395,6 +482,27 @@ def test_bridge_refuses_items_with_fewer_than_three_annotators() -> None:
     ]
     with pytest.raises(ValueError, match="need at least 3"):
         observations_from_alt_test(items, {"thin": 0.9}, JUDGE)
+
+
+def test_bridge_ignores_thin_items_the_judge_never_labelled() -> None:
+    # A thin item the judge never labelled is never scored, so it blocks
+    # nothing; only labelled items need a usable majority reference.
+    items = [
+        AltTestItem(
+            id="thin-unlabelled",
+            task="discrete",
+            annotator_labels={"h1": "yes"},
+            judge_labels={},
+        ),
+        AltTestItem(
+            id="good",
+            task="discrete",
+            annotator_labels={"h1": "yes", "h2": "yes", "h3": "no"},
+            judge_labels={JUDGE: "yes"},
+        ),
+    ]
+    bridged = observations_from_alt_test(items, {"good": 0.9}, JUDGE)
+    assert [o.item_id for o in bridged.observations] == ["good"]
 
 
 def test_bridge_refuses_wrong_typed_labels() -> None:
@@ -585,6 +693,7 @@ def test_cli_policy_flags_change_the_grade(
     assert cmd_calibrate(["--observations", str(path), "--tolerance", "1.0"]) == 0
     out = capsys.readouterr().out
     assert "calibrated" in out
+    assert "policy (non-default)" in out
 
 
 def test_cli_bad_policy_exits_one(tmp_path: Path) -> None:

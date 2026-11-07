@@ -48,7 +48,12 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from agenteval_bench.decision import wilson_interval
-from alt_test.types import AltTestItem
+from alt_test.types import AltTestConfig, AltTestItem
+
+#: The annotator floor the bridge enforces, read from the alt-test
+#: config default rather than restated: if the runner default ever
+#: changes, the bridge follows it instead of drifting apart.
+MIN_ANNOTATORS = AltTestConfig().min_annotators
 
 #: The closed set of calibration statuses. UNCALIBRATED means "no usable
 #: measurement" — it is never trusted, and it is distinct from
@@ -147,21 +152,75 @@ def default_calibration_policy() -> CalibrationPolicy:
 class CalibrationBin:
     """One confidence bin: stated confidence vs measured agreement.
 
-    ``gap`` is ``mean_confidence - agreement_lower``: positive means the
-    judge claimed more than the measurement supports. ``passed`` is True
-    when the gap is within the policy tolerance. Empty bins are never
-    constructed — a bin with no observations carries no claim.
+    The bin stores only counts: ``n`` observations, ``agreed`` of them
+    agreeing, and the sum of the stated confidences. Everything else is
+    derived — ``agreement_rate`` from the counts, ``agreement_interval``
+    recomputed from the counts with :func:`wilson_interval` (never a
+    stored claim), ``mean_confidence`` from the sum, ``gap`` from those
+    two — so a forged interval or rate has nowhere to live. A bin with
+    no observations carries no claim, so ``n >= 1`` is enforced at
+    construction. ``passed`` is the one stored verdict, and the record
+    checks it against the derived gap under its own policy.
     """
 
     bin_index: int
     lower_edge: float
     upper_edge: float
     n: int
-    mean_confidence: float
-    agreement_rate: float
-    agreement_interval: tuple[float, float]
-    gap: float
+    confidence_sum: float
+    agreed: int
     passed: bool
+
+    def __post_init__(self) -> None:
+        if isinstance(self.n, bool) or not isinstance(self.n, int):
+            raise TypeError(f"bin n must be an int, got {self.n!r}")
+        if self.n < 1:
+            raise ValueError(
+                f"bin {self.bin_index} needs n >= 1, got {self.n}: "
+                "a bin with no observations carries no claim"
+            )
+        if isinstance(self.agreed, bool) or not isinstance(self.agreed, int):
+            raise TypeError(f"bin agreed must be an int, got {self.agreed!r}")
+        if not 0 <= self.agreed <= self.n:
+            raise ValueError(
+                f"bin {self.bin_index} agreed {self.agreed} out of range "
+                f"for n={self.n}"
+            )
+        if not math.isfinite(self.confidence_sum):
+            raise ValueError(
+                f"bin {self.bin_index} confidence_sum must be finite, "
+                f"got {self.confidence_sum!r}"
+            )
+        if not 0.0 <= self.confidence_sum <= self.n:
+            raise ValueError(
+                f"bin {self.bin_index} confidence_sum {self.confidence_sum} "
+                f"out of range for n={self.n}"
+            )
+        if not 0.0 <= self.lower_edge < self.upper_edge <= 1.0:
+            raise ValueError(
+                f"bin {self.bin_index} range "
+                f"[{self.lower_edge}, {self.upper_edge}] out of [0, 1]"
+            )
+
+    @property
+    def mean_confidence(self) -> float:
+        """Mean stated confidence in the bin, derived from the sum."""
+        return self.confidence_sum / self.n
+
+    @property
+    def agreement_rate(self) -> float:
+        """Measured agreement rate in the bin, derived from the counts."""
+        return self.agreed / self.n
+
+    @property
+    def agreement_interval(self) -> tuple[float, float]:
+        """Wilson 95% interval on agreement, recomputed from the counts."""
+        return wilson_interval(self.agreed, self.n)
+
+    @property
+    def gap(self) -> float:
+        """Mean confidence minus the interval lower bound (derived)."""
+        return self.mean_confidence - self.agreement_interval[0]
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form of the bin."""
@@ -169,6 +228,8 @@ class CalibrationBin:
             "bin": self.bin_index,
             "range": [self.lower_edge, self.upper_edge],
             "n": self.n,
+            "agreed": self.agreed,
+            "confidence_sum": self.confidence_sum,
             "mean_confidence": self.mean_confidence,
             "agreement_rate": self.agreement_rate,
             "agreement_interval": list(self.agreement_interval),
@@ -206,6 +267,12 @@ class JudgeCalibration:
     policy: CalibrationPolicy = field(default_factory=default_calibration_policy)
 
     def __post_init__(self) -> None:
+        if not self.judge:
+            raise ValueError("calibration judge must be non-empty")
+        if self.n_total < 0:
+            raise ValueError(f"n_total must be >= 0, got {self.n_total}")
+        if self.ece is not None and not 0.0 <= self.ece <= 1.0:
+            raise ValueError(f"ece must be in [0, 1], got {self.ece}")
         if not isinstance(self.policy, CalibrationPolicy):
             raise TypeError(
                 f"calibration policy must be a CalibrationPolicy, "
@@ -251,10 +318,33 @@ class JudgeCalibration:
         else:  # pragma: no cover - Literal type, unreachable in typed code
             raise ValueError(f"unknown calibration status {self.status!r}")
         if self.status in ("calibrated", "miscalibrated"):
+            if self.n_total < self.policy.min_total:
+                raise ValueError(
+                    f"n_total {self.n_total} is below the record policy's "
+                    f"min_total {self.policy.min_total}"
+                )
+            for b in self.bins:
+                if b.n < self.policy.min_bin_n:
+                    raise ValueError(
+                        f"bin {b.bin_index} holds {b.n} observations, "
+                        "below the record policy's "
+                        f"min_bin_n {self.policy.min_bin_n}"
+                    )
             if self.n_total != sum(b.n for b in self.bins):
                 raise ValueError(
                     f"n_total {self.n_total} does not match the bins' "
                     f"total {sum(b.n for b in self.bins)}"
+                )
+            expected_ece = sum(
+                (b.n / self.n_total) * abs(b.agreement_rate - b.mean_confidence)
+                for b in self.bins
+            )
+            if self.ece is None or not math.isclose(
+                self.ece, expected_ece, rel_tol=1e-9, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    f"ece {self.ece} does not match the bins' measurements "
+                    f"(recomputed {expected_ece})"
                 )
             for b in self.bins:
                 if b.passed != (
@@ -291,11 +381,13 @@ def bin_range_label(lower_edge: float, upper_edge: float) -> str:
 
     Bin 9 of a 10-bin grid covers [0.9, 1.0] — confidence 1.0 lands in
     it — so it prints with a closed bracket, not the half-open ``)``
-    the other bins use.
+    the other bins use. Edges print to 4 significant digits so a
+    non-10 bin count (e.g. bins=3, true edges 1/3 and 2/3) is not
+    misstated as a rounded decimal.
     """
     if upper_edge >= 1.0:
-        return f"[{lower_edge:.1f}, {upper_edge:.1f}]"
-    return f"[{lower_edge:.1f}, {upper_edge:.1f})"
+        return f"[{lower_edge:.4g}, 1.0]"
+    return f"[{lower_edge:.4g}, {upper_edge:.4g})"
 
 
 def calibrate(
@@ -414,10 +506,8 @@ def calibrate(
                 lower_edge=index / policy.bins,
                 upper_edge=(index + 1) / policy.bins,
                 n=n,
-                mean_confidence=mean_confidence,
-                agreement_rate=agreement_rate,
-                agreement_interval=interval,
-                gap=gap,
+                confidence_sum=sum(o.stated_confidence for o in group),
+                agreed=agreed,
                 passed=passed,
             )
         )
@@ -503,17 +593,23 @@ def _check_bridge_items(items: Sequence[AltTestItem], judge: str) -> None:
     Mirrors ``alt_test.runner._validate`` / ``_check_label_types`` for the
     items the bridge reads, scoped to the target judge and the annotators
     (labels of other judges are not the bridge's business): every item
-    needs at least 3 annotator labels — a 1- or 2-annotator "majority" is
-    not a majority — and every label the bridge compares must be a string
-    (discrete tasks only; a bool or a float label is refused at the
-    boundary instead of silently counting as disagreement).
+    needs at least ``MIN_ANNOTATORS`` annotator labels — a 1- or
+    2-annotator "majority" is not a majority — and every label the bridge
+    compares must be a string (discrete tasks only; a bool or a float
+    label is refused at the boundary instead of silently counting as
+    disagreement).
     """
     for item in items:
+        # Only items the target judge labelled are ever scored, so only
+        # they need a usable majority reference; a thin item the judge
+        # never labelled blocks nothing.
+        if judge not in item.judge_labels:
+            continue
         n_ann = len(item.annotator_labels)
-        if n_ann < 3:
+        if n_ann < MIN_ANNOTATORS:
             raise ValueError(
                 f"item {item.id!r} has {n_ann} annotators, "
-                "need at least 3 for a majority reference"
+                f"need at least {MIN_ANNOTATORS} for a majority reference"
             )
         labels = list(item.annotator_labels.items())
         judge_label = item.judge_labels.get(judge)

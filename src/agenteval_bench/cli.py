@@ -776,6 +776,7 @@ def cmd_calibrate(args: list[str]) -> int:
         CalibrationPolicy,
         bin_range_label,
         calibrate,
+        default_calibration_policy,
         observations_from_json,
     )
 
@@ -818,6 +819,14 @@ def cmd_calibrate(args: list[str]) -> int:
             f"judge {record.judge}: {record.status} "
             f"({record.n_total} observations, ECE {ece})"
         )
+        if record.policy != default_calibration_policy():
+            print(
+                "  policy (non-default): "
+                f"min_total={record.policy.min_total} "
+                f"bins={record.policy.bins} "
+                f"min_bin_n={record.policy.min_bin_n} "
+                f"tolerance={record.policy.tolerance}"
+            )
         for b in record.bins:
             print(
                 f"  bin {bin_range_label(b.lower_edge, b.upper_edge)}: n={b.n} "
