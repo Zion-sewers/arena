@@ -47,6 +47,8 @@ jobs:
         run: PYTHONPATH=src python -m agenteval_bench.calibration_demo
       - name: Coverage-gated ranking demo (sparse cells masked; thin leaderboard refused)
         run: PYTHONPATH=src python -m agenteval_bench.coverage_demo
+      - name: Code-length selection demo (compressible version wins; capacity meter stops)
+        run: PYTHONPATH=src python -m agenteval_bench.code_length_demo
       - name: OEC ship-gate demo (OEC + guardrails + trust gates; surprising wins need replication)
         run: PYTHONPATH=src python -m experiment.demo_oec
       - name: Analysis pre-specification demo (10-question gate; post-hoc refused)
