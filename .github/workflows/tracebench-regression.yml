@@ -1,0 +1,231 @@
+name: Tracebench regression
+
+# Scheduled regression runner for trace-mined benchmarks (arena#41).
+# Mines a trace corpus on a weekly cadence and gates a candidate against
+# the frozen version it publishes. The loop is closed across runs: the
+# snapshot store and the run state (previous version + consecutive-
+# failure streak) are restored from the actions cache, so versions chain,
+# changed oracles publish as updates, vanished patterns retire, and the
+# rollback arm is reachable on the 3rd consecutive failure with no
+# operator hand-feeding.
+#
+# The drift gate is what makes this a regression, not a smoke test: the
+# newly mined oracle is scored against the previous frozen version
+# before publishing, so a corpus change fails the run (gate +
+# investigation, counting toward the rollback streak) even when the
+# candidate passes the new version. A static corpus passes, correctly —
+# nothing changed — but the run can now fail on its own.
+#
+# Canary: the demo runs in this job (not only in CI) and asserts the
+# GATE_FAIL, rollback, and drift paths end to end. If the gate logic
+# regresses so a degraded candidate passes, the demo fails and the
+# schedule goes red — the job exercises the red path every week instead
+# of only ever passing the oracle against itself.
+#
+# Staleness: a previous version already past its cadence when the run
+# starts dispatches an investigation action (the run itself is the
+# refresh, so staleness is flagged, not failed) and is surfaced in the
+# job summary. A corrupt corpus fails the run before anything is mined:
+# malformed lines are refused, and corpus totals (this run vs the
+# previous run) are surfaced so a shrink is visible.
+#
+# The corpus: by default the checked-in SAMPLE corpus (recorded-format
+# fixtures, not real incidents — the artifacts carry corpus_kind=sample,
+# so no consumer mistakes inc-101..inc-114 for real incidents). A real
+# regression supplies a corpus: dispatch with `corpus-artifact` set to
+# an uploaded artifact holding traces.jsonl, and the run mines that
+# instead (corpus_kind=production). The candidate: by default the oracle
+# outputs mined in the same run; dispatch with `candidate-artifact` set
+# to an artifact holding candidate-outputs.json (case_id -> output) and
+# the run gates THAT candidate instead.
+#
+# Effectors: the action ledger is not left in an artifact nobody reads.
+# Every run writes the verdict + actions to the job summary; a rollback
+# action opens (or refreshes) a tracking issue labeled
+# tracebench-rollback. A gate failure already fails the job (CLI exit 2).
+#
+# Restart alarm: if a previous completed run of this workflow exists but
+# no run state was restored from cache, the run fails loudly instead of
+# silently re-publishing version 1 and restarting the failure streak.
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # weekly, Mondays 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      candidate-artifact:
+        description: "Artifact holding candidate-outputs.json (case_id -> output). Empty runs the oracle candidate."
+        required: false
+        default: ""
+        type: string
+      corpus-artifact:
+        description: "Artifact holding traces.jsonl (production trace export). Empty mines the sample corpus."
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  regress:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies
+        run: uv pip install -e ".[dev]" --system
+      - name: Canary — prove the gate can go red
+        run: PYTHONPATH=src python -m agenteval_bench.tracebench_demo
+      - name: Restore tracebench store + run state
+        uses: actions/cache@v4
+        with:
+          path: |
+            tracebench-store
+            tracebench-state
+          key: tracebench-${{ github.ref_name }}-${{ github.run_number }}
+          restore-keys: |
+            tracebench-${{ github.ref_name }}-
+      - name: Alarm on lost run state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f tracebench-state/state.json ]; then
+            echo "run state restored from cache"
+            exit 0
+          fi
+          if ! prev=$(gh run list --workflow tracebench-regression.yml --branch "${{ github.ref_name }}" --status completed --limit 1 --json databaseId --jq '.[0].databaseId // empty' 2>/tmp/tb-gh-err.txt); then
+            echo "warning: could not list previous runs, restart alarm degraded: $(cat /tmp/tb-gh-err.txt)"
+            exit 0
+          fi
+          if [ -n "$prev" ]; then
+            echo "ERROR: a previous completed run ($prev) exists but no run state was restored from cache — refusing to silently restart the version chain / failure streak" >&2
+            exit 1
+          fi
+          echo "no previous completed run: first run, starting at version 1"
+      - name: Download corpus (when supplied)
+        if: inputs.corpus-artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ inputs.corpus-artifact }}
+          path: corpus-in
+      - name: Download candidate outputs (when supplied)
+        if: inputs.candidate-artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ inputs.candidate-artifact }}
+          path: candidate-out
+      - name: Select corpus + candidate
+        id: inputs
+        run: |
+          if [ -n "${{ inputs.corpus-artifact }}" ]; then
+            echo "corpus=corpus-in/traces.jsonl" >> "$GITHUB_OUTPUT"
+            echo "corpus-kind=production" >> "$GITHUB_OUTPUT"
+          else
+            echo "corpus=examples/traces/production-traces.sample.jsonl" >> "$GITHUB_OUTPUT"
+            echo "corpus-kind=sample" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "${{ inputs.candidate-artifact }}" ]; then
+            echo "candidate=candidate-out/candidate-outputs.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "candidate=tracebench-out/oracle-outputs.json" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Mine corpus + regress candidate
+        run: |
+          agenteval-bench tracebench mine --corpus ${{ steps.inputs.outputs.corpus }} --owner arena-maintainers --cadence weekly --corpus-kind ${{ steps.inputs.outputs.corpus-kind }} --out tracebench-out
+          agenteval-bench tracebench regress --corpus ${{ steps.inputs.outputs.corpus }} --store tracebench-store --suite tracebench-sample --candidate-outputs ${{ steps.inputs.outputs.candidate }} --owner arena-maintainers --cadence weekly --corpus-kind ${{ steps.inputs.outputs.corpus-kind }} --state-dir tracebench-state --out tracebench-out/regress
+      - name: Surface regression actions
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json
+          import os
+          from pathlib import Path
+
+          summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          report_path = Path("tracebench-out/regress/report.json")
+          ledger_path = Path("tracebench-out/regress/actions.jsonl")
+          lines = ["## Tracebench regression", ""]
+          rollback = False
+          if report_path.exists():
+              report = json.loads(report_path.read_text(encoding="utf-8"))
+              lines.append(f"- verdict: **{report['verdict']}**")
+              lines.append(f"- version: {report['version_id']} "
+                           f"(published new: {report['published_new_version']})")
+              lines.append(f"- mined {report['mined_cases']} cases: "
+                           f"{report['new_cases']} new, "
+                           f"{report['updated_cases']} updated, "
+                           f"{report['retired_cases']} retired")
+              if report.get("drift_detected"):
+                  lines.append("- benchmark drift: "
+                               + ", ".join(report["drifted_case_ids"]))
+              lines.append(f"- consecutive failures: {report['consecutive_failures']}")
+              lines.append(f"- corpus kind: {report['manifest']['corpus_kind']}")
+              lines.append(f"- corpus: {report['corpus_total_lines']} trace(s)"
+                           + (f" (previous run: "
+                              f"{report['previous_corpus_total_lines']})"
+                              if report.get('previous_corpus_total_lines')
+                              is not None else ""))
+              if report.get("previous_stale") is not None:
+                  lines.append(f"- previous version stale: {report['previous_stale']}")
+              lines.append("")
+          else:
+              lines.append("No regression report was produced.")
+              lines.append("")
+          if ledger_path.exists():
+              actions = [json.loads(line) for line in
+                         ledger_path.read_text(encoding="utf-8").splitlines()
+                         if line.strip()]
+              if actions:
+                  lines.append("### Actions dispatched")
+                  lines.append("")
+                  for action in actions:
+                      lines.append(f"- **{action['action']}**: {action['reason']}")
+                      rollback = rollback or action["action"] == "rollback"
+                  lines.append("")
+              else:
+                  lines.append("No actions dispatched (gate passed).")
+                  lines.append("")
+          else:
+              lines.append("No action ledger was produced.")
+              lines.append("")
+          summary_path.write_text("\n".join(lines), encoding="utf-8")
+          if rollback:
+              print("ROLLBACK DEMANDED by the tracebench schedule: 3rd consecutive "
+                    "failure. Roll back the release; see the run summary and the "
+                    "tracebench-regression artifact (report.json / actions.jsonl).")
+              raise SystemExit(1)
+          EOF
+      - name: Open or refresh rollback issue
+        if: failure()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ledger=tracebench-out/regress/actions.jsonl
+          if [ ! -f "$ledger" ]; then
+            echo "no action ledger: nothing to file"
+            exit 0
+          fi
+          if ! grep -q '"action": "rollback"' "$ledger"; then
+            echo "no rollback action: nothing to file"
+            exit 0
+          fi
+          title="tracebench rollback demanded: tracebench-sample"
+          body="Rollback demanded by the tracebench schedule (3rd consecutive gate failure). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. Verdict and actions are in the run summary; the full report is in the tracebench-regression artifact (report.json / actions.jsonl)."
+          existing=$(gh issue list --state open --search "tracebench rollback demanded in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body" || echo "warning: could not comment on rollback issue $existing"
+          else
+            gh issue create --title "$title" --label tracebench-rollback --body "$body" || echo "warning: could not create rollback issue (label or permissions?)"
+          fi
+      - name: Upload tracebench run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracebench-regression
+          path: tracebench-out/

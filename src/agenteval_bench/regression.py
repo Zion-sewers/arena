@@ -71,7 +71,13 @@ class ProductionFailure:
 
 @dataclass(frozen=True)
 class PromotionRecord:
-    """Audit record of one promoted failure, stored in the new version's manifest."""
+    """Audit record of one promoted failure, stored in the new version's manifest.
+
+    ``provenance`` is the trace-mining link (arena#41): trace id, incident
+    id, detected pattern, evidence, owner, cadence. It is optional and
+    omitted from :meth:`to_dict` when absent, so existing records are
+    byte-identical to before.
+    """
 
     failure_id: str
     kind: FailureKind
@@ -79,15 +85,21 @@ class PromotionRecord:
     prior_score: float
     evaluator_notes: str
     promoted_at: str
+    provenance: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in _FAILURE_KINDS:
             raise ValueError(
                 f"kind must be one of {_FAILURE_KINDS}, got {self.kind!r}"
             )
+        if self.provenance is not None and not all(
+            isinstance(k, str) and isinstance(v, str)
+            for k, v in self.provenance.items()
+        ):
+            raise ValueError("provenance must map strings to strings")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        doc: dict[str, Any] = {
             "failure_id": self.failure_id,
             "kind": self.kind,
             "promoted_case_id": self.promoted_case_id,
@@ -95,6 +107,9 @@ class PromotionRecord:
             "evaluator_notes": self.evaluator_notes,
             "promoted_at": self.promoted_at,
         }
+        if self.provenance is not None:
+            doc["provenance"] = dict(self.provenance)
+        return doc
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PromotionRecord:
@@ -111,6 +126,15 @@ class PromotionRecord:
             raise ValueError(
                 f"promotion record kind must be one of {_FAILURE_KINDS}, got {kind!r}"
             )
+        provenance_raw = d.get("provenance")
+        provenance: dict[str, str] | None = None
+        if provenance_raw is not None:
+            if not isinstance(provenance_raw, dict) or not all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in provenance_raw.items()
+            ):
+                raise ValueError("promotion record provenance must map strings to strings")
+            provenance = dict(provenance_raw)
         return cls(
             failure_id=str(req("failure_id")),
             kind=cast(FailureKind, kind),
@@ -118,6 +142,7 @@ class PromotionRecord:
             prior_score=float(req("prior_score")),
             evaluator_notes=str(d.get("evaluator_notes", "")),
             promoted_at=str(d.get("promoted_at", "")),
+            provenance=provenance,
         )
 
 
