@@ -858,6 +858,81 @@ def cmd_calibrate(args: list[str]) -> int:
     return 0 if record.status == "calibrated" else 2
 
 
+def cmd_ship(args: list[str]) -> int:
+    """Rule SHIP / NO_SHIP / NEEDS_REPLICATION for one agent change (arena#46).
+
+    Reads a pre-registered design (--design design.json: plan digest,
+    OEC + guardrail declarations, expected allocation, surprise
+    threshold) and reported evidence (--evidence evidence.json: plan
+    digest, OEC metric, run id, experiment looks, SRM counts, A/A
+    split, guardrail observations, optional replication), replays the
+    experiment through the hash-chained plan registry (--registry,
+    default plans/experiments.jsonl), and rules. Exit 0 = SHIP;
+    exit 1 = NO_SHIP or NEEDS_REPLICATION (reasons printed);
+    exit 2 = unusable design/evidence/registry.
+    """
+    from experiment.oec import design_from_json, evidence_from_json, ship_decision
+
+    args, design_path = _flag(args, "--design")
+    args, evidence_path = _flag(args, "--evidence")
+    args, registry_path = _flag(args, "--registry", "plans/experiments.jsonl")
+    args, out = _flag(args, "--out")
+    args, as_json = _has(args, "--json")
+    if not design_path or not evidence_path:
+        print(
+            "Error: ship needs --design <file.json> --evidence <file.json>",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        design = design_from_json(Path(design_path).read_text(encoding="utf-8"))
+    except (ValueError, TypeError, OSError) as e:
+        print(f"Error: unusable design: {e}", file=sys.stderr)
+        return 2
+    try:
+        evidence = evidence_from_json(Path(evidence_path).read_text(encoding="utf-8"))
+    except (ValueError, TypeError, OSError) as e:
+        print(f"Error: unusable evidence: {e}", file=sys.stderr)
+        return 2
+    assert registry_path is not None
+    try:
+        verdict = ship_decision(design, evidence, registry_path)
+    except (ValueError, TypeError, KeyError) as e:
+        print(f"Error: unusable registry or design: {e}", file=sys.stderr)
+        return 2
+    if as_json:
+        print(json.dumps(verdict.to_dict(), indent=2))
+    else:
+        print(f"verdict: {verdict.status.upper().replace('_', ' ')}")
+        if verdict.oec_z is not None:
+            print(f"  OEC final z={verdict.oec_z:.2f} (surprising: {verdict.surprising})")
+        if verdict.srm is not None:
+            print(f"  SRM: {verdict.srm.status} (chi2={verdict.srm.chi2}, p={verdict.srm.p_value})")
+        if verdict.aa is not None:
+            print(f"  A/A: {verdict.aa.status} (z={verdict.aa.z}, p={verdict.aa.p_value})")
+        for guardrail in verdict.guardrails:
+            print(
+                f"  guardrail {guardrail.name}: "
+                f"{'pass' if guardrail.passed else 'FAIL'} "
+                f"(delta {guardrail.delta_good:+.3f}, lower bound "
+                f"{guardrail.lower_bound:+.3f}, budget "
+                f"-{guardrail.max_regression:.3f})"
+            )
+        for reason in verdict.reasons:
+            print(f"  ! {reason}")
+        for note in verdict.notes:
+            print(f"  ~ {note}")
+    if out:
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(json.dumps(verdict.to_dict(), indent=2) + "\n")
+        except OSError as e:
+            print(f"Error: cannot write report: {e}", file=sys.stderr)
+            return 2
+        print(f"Report: {out}", file=sys.stderr if as_json else sys.stdout)
+    return 0 if verdict.status == "ship" else 1
+
+
 def cmd_replay(args: list[str]) -> int:
     """Verify a replay log is bit-exact: re-run and byte-compare."""
     args, log_path = _flag(args, "--log")
@@ -1828,6 +1903,10 @@ def main() -> None:
         print("                                [--min-bin-n 5] [--tolerance 0.10]")
         print("                                [--json] [--out report.json]")
         print("                                (exit 0 calibrated, 2 mis/uncalibrated, 1 bad input)")
+        print("       agenteval-bench ship --design <file.json> --evidence <file.json>")
+        print("                                [--registry plans/experiments.jsonl]")
+        print("                                [--json] [--out report.json]")
+        print("                                (exit 0 SHIP, 1 NO_SHIP/NEEDS_REPLICATION, 2 bad input)")
         print("       agenteval-bench bugsmith --repo <dir> --out <dir> [--procedural 8]")
         print("                                [--seed 42] [--local] [--config curation.json]")
         print("                                [--pr-mirror patch:pr-ref]")
@@ -1873,6 +1952,8 @@ def main() -> None:
         sys.exit(cmd_judges(rest))
     elif cmd == "calibrate":
         sys.exit(cmd_calibrate(rest))
+    elif cmd == "ship":
+        sys.exit(cmd_ship(rest))
     elif cmd == "bugsmith":
         sys.exit(cmd_bugsmith(rest))
     elif cmd == "snapshot":

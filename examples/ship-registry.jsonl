@@ -1,0 +1,1 @@
+{"digest":"0432ff8dd7a059de6dec30c861fbfeefc582308fa135a48d27acb6c9c25835e9","plan":{"alpha":0.05,"covariate":null,"looks":[0.5,1.0],"min_n":30,"n_planned":800,"n_tolerance":0.02,"name":"reranker-v2-vs-v1","sides":"two"},"registered_at":"2026-11-07T12:17:19.544751+00:00"}

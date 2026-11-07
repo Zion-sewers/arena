@@ -1,0 +1,1 @@
+{"alpha":0.05,"expected_allocation":[0.5,0.5],"metrics":[{"direction":"higher_better","max_regression":null,"name":"task_success","role":"oec"},{"direction":"lower_better","max_regression":0.02,"name":"safety_violations","role":"guardrail"}],"min_aa_n":100,"min_replication_n":30,"plan_digest":"0432ff8dd7a059de6dec30c861fbfeefc582308fa135a48d27acb6c9c25835e9","surprise_z":3.0}
