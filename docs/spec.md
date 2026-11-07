@@ -110,6 +110,7 @@ docs/             # Specifications, archive, roadmap references
 | `ValidityReport`     | Validity assessment per metric; a metric without a note is UNASSESSED and untrusted. |
 | `AllocationReport`   | Family-decorrelated judge allocation; unreachable judges are holes, never dropped. |
 | `JudgeCalibration`   | Per-bin stated confidence vs measured agreement; only CALIBRATED may gate. |
+| `ShipVerdict`        | OEC + guardrails + trust gates (SRM, A/A, replication); SHIP only when all pass. |
 | `cli.main`           | Parse argv, load suite, build replay `agent_fn`, print summary + gate. |
 
 ### 4.3 Data-flow diagram
@@ -213,6 +214,8 @@ table:
 | `run` | clean / gate passed | bad input | gate failed | — |
 | `decide` | GATE | ROLLBACK | INVESTIGATE | usage error |
 | `calibrate` | calibrated | bad input | mis/uncalibrated | — |
+| `ship` | SHIP | NO_SHIP / NEEDS_REPLICATION | bad input | — |
+| `register-design` | registered | — | bad input | — |
 
 > The `compare` and `report` subcommands described in earlier drafts are **`planned`**
 > (see §9) and are **not** implemented in v0.1.0; invoking an unknown command exits `1`.
@@ -271,6 +274,7 @@ print(result.summary())
 | Measurement-validity column (decide + scorer) | ✅ shipped | v0.1.0  |
 | Judge decorrelation (HOST != FAMILY) | ✅ shipped | v0.1.0  |
 | Judge calibration (confidence is not evidence) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
+| OEC ship gate (OEC + guardrails + trust gates) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |

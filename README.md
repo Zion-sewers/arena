@@ -43,6 +43,7 @@ Each eval suite rises to its pass rate against the dashed gate line. One suite b
 - Python API: `EvalSuite.from_yaml` + `EvalRunner.run(suite, agent_fn)` for live agents.
 - Judge decorrelation: `agenteval-bench judges --registry examples/judges-registry.json` allocates judges from distinct model families (HOST != FAMILY) and reports unreachable judges as holes, never dropped.
 - Judge calibration: `agenteval-bench calibrate --observations examples/calibration-observations.json` grades a judge's stated confidence against measured agreement; only a CALIBRATED judge's scores may gate, once a live judge transport exists (see docs/CALIBRATION.md).
+- OEC ship gate: `agenteval-bench register-design --design examples/ship-design.json --registry examples/ship-registry.jsonl` registers the design in the hash chain, then `agenteval-bench ship --design examples/ship-design.json --evidence examples/ship-evidence.json --registry examples/ship-registry.jsonl` rules SHIP / NO_SHIP / NEEDS_REPLICATION for an agent change: OEC + guardrails pre-registered, SRM / A/A trust tests before results are read, surprising wins need replication (see docs/OEC.md).
 
 ## Honest limits
 
