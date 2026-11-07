@@ -41,3 +41,5 @@ jobs:
         run: PYTHONPATH=src python -m agenteval_bench.decision_demo
       - name: Measurement-validity demo (every metric carries a reliability column)
         run: PYTHONPATH=src python -m agenteval_bench.validity_demo
+      - name: Judge-decorrelation demo (HOST != FAMILY; holes reported, never dropped)
+        run: PYTHONPATH=src python -m agenteval_bench.judges_demo

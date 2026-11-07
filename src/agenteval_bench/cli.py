@@ -63,21 +63,24 @@ def _run_suite(suite: EvalSuite, recorded: dict[str, str], seed: int):
     return runner.run(suite, replay_fn, seed=seed), outputs
 
 
-def _build_log(suite: EvalSuite, suite_path: str, digest: str,
-               result, outputs: dict[str, str], seed: int) -> ReplayLog:
+def _build_log(
+    suite: EvalSuite, suite_path: str, digest: str, result, outputs: dict[str, str], seed: int
+) -> ReplayLog:
     by_id = {r.case_id: r for r in result.results}
     cases = []
     for c in suite.cases:
         r = by_id[c.id]
-        cases.append(ReplayCase(
-            case_id=c.id,
-            input=c.input,
-            output=outputs.get(c.id, "") if not r.details.get("skipped") else "",
-            score=r.score,
-            passed=r.passed,
-            skipped=bool(r.details.get("skipped")),
-            rng_draw=r.details.get("rng_draw"),
-        ))
+        cases.append(
+            ReplayCase(
+                case_id=c.id,
+                input=c.input,
+                output=outputs.get(c.id, "") if not r.details.get("skipped") else "",
+                score=r.score,
+                passed=r.passed,
+                skipped=bool(r.details.get("skipped")),
+                rng_draw=r.details.get("rng_draw"),
+            )
+        )
     return ReplayLog(
         seed=seed,
         suite_name=suite.name,
@@ -155,7 +158,9 @@ def cmd_run(args: list[str]) -> int:
             "`agenteval-bench decide`; see docs/DECISION-SYSTEM.md."
         )
         ok = result.pass_rate >= threshold
-        print(f"CI gate: pass_rate {result.pass_rate:.1%} vs threshold {threshold:.0%} -> {'PASS' if ok else 'FAIL'}")
+        print(
+            f"CI gate: pass_rate {result.pass_rate:.1%} vs threshold {threshold:.0%} -> {'PASS' if ok else 'FAIL'}"
+        )
         if not ok:
             return 2
     return 0
@@ -165,8 +170,7 @@ def _policy_number(value: object, field_name: str, level_name: str) -> float:
     """One threshold value from a policy file: finite number, never a bool."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(
-            f"Invalid {field_name} for risk level {level_name!r}: "
-            f"expected a number, got {value!r}"
+            f"Invalid {field_name} for risk level {level_name!r}: expected a number, got {value!r}"
         )
     number = float(value)
     if not math.isfinite(number):
@@ -232,13 +236,10 @@ def load_policy(policy_path: str | None) -> tuple[DecisionPolicy, RiskLevel]:
             ) from None
         if not isinstance(values, dict):
             raise TypeError(f"Invalid thresholds for {level_name!r}: expected a mapping")
-        unknown_fields = sorted(
-            set(values) - {"quality", "safety", "reliability", "cost_budget"}
-        )
+        unknown_fields = sorted(set(values) - {"quality", "safety", "reliability", "cost_budget"})
         if unknown_fields:
             raise ValueError(
-                f"Unknown threshold fields for {level_name!r} in {policy_path}: "
-                f"{unknown_fields}"
+                f"Unknown threshold fields for {level_name!r} in {policy_path}: {unknown_fields}"
             )
         base = thresholds[level]
         thresholds[level] = RiskThresholds(
@@ -431,9 +432,7 @@ def cmd_decide(args: list[str]) -> int:
             elif isinstance(evidence, ProportionEvidence):
                 entry = {
                     "kind": (
-                        "replay-agreement"
-                        if dimension is Dimension.RELIABILITY
-                        else "measured"
+                        "replay-agreement" if dimension is Dimension.RELIABILITY else "measured"
                     ),
                     "action": verdict.action.value,
                     "point": evidence.point,
@@ -484,7 +483,8 @@ def cmd_baseline(args: list[str]) -> int:
     result, _ = _run_suite(suite, recorded, seed)
     scores = [
         {"case_id": r.case_id, "score": r.score, "passed": r.passed}
-        for r in result.results if not r.details.get("skipped")
+        for r in result.results
+        if not r.details.get("skipped")
     ]
     doc = {
         "tool": "agenteval-bench",
@@ -605,13 +605,12 @@ def cmd_simpson(args: list[str]) -> int:
             for s in doc["strata"]
         )
         tolerance = (
-            float(tol_s) if tol_s is not None
+            float(tol_s)
+            if tol_s is not None
             else float(doc.get("allocation_tolerance", DEFAULT_ALLOCATION_TOLERANCE))
         )
         if not 0.0 <= tolerance <= 1.0:
-            raise ValueError(
-                f"allocation_tolerance must be in [0, 1], got {tolerance}"
-            )
+            raise ValueError(f"allocation_tolerance must be in [0, 1], got {tolerance}")
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
         print(f"Error: invalid slices doc: {e}", file=sys.stderr)
         return 2
@@ -688,6 +687,68 @@ def cmd_simpson(args: list[str]) -> int:
     return 0 if verdict.accepted else 1
 
 
+def cmd_judges(args: list[str]) -> int:
+    """Allocate decorrelated judges from a registry file (arena#44).
+
+    Reads a judge registry (JSON: a mapping with a ``judges`` list, or a
+    bare list; each entry carries ``id``, ``host``, ``model_family``,
+    optional ``model`` and ``reachable``), allocates up to ``--want``
+    judges with pairwise-distinct model families, and prints the picks
+    with the unreachable judges as explicit holes. Exit 0 = the
+    allocation satisfied the request; exit 2 = thin allocation (the
+    registry does not supply ``--want`` distinct reachable families);
+    exit 1 = unusable registry.
+    """
+    from agenteval_bench.judges import allocate, registry_from_json
+
+    args, registry_path = _flag(args, "--registry")
+    args, want_s = _flag(args, "--want", "2")
+    args, out = _flag(args, "--out")
+    args, as_json = _has(args, "--json")
+    if not registry_path:
+        print("Error: judges needs --registry <file.json>", file=sys.stderr)
+        return 1
+    try:
+        want = int(want_s) if want_s is not None else 2
+    except ValueError:
+        print(f"Error: --want must be an integer, got {want_s!r}", file=sys.stderr)
+        return 1
+    try:
+        text = Path(registry_path).read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"Error: cannot read registry: {e}", file=sys.stderr)
+        return 1
+    try:
+        judges = registry_from_json(text)
+    except ValueError as e:
+        print(f"Error: unusable registry: {e}", file=sys.stderr)
+        return 1
+    report = allocate(judges, want=want)
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        picked = ", ".join(f"{j.id} [{j.model_family}]" for j in report.picked)
+        print(f"picked ({len(report.picked)}/{want}): {picked or '(nobody)'}")
+        if report.holes:
+            print("HOLES — unreachable, reported never dropped:")
+            for hole in report.holes:
+                print(f"  ! {hole.judge} [{hole.model_family}] ({hole.host}): {hole.reason}")
+        for rejected in report.rejected:
+            print(f"  ! rejected {rejected.judge}: {rejected.reason}")
+        for note in report.notes:
+            print(f"  ! {note}")
+        print("Decorrelation is on model_family, never on host.")
+    if out:
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(json.dumps(report.to_dict(), indent=2) + "\n")
+        except OSError as e:
+            print(f"Error: cannot write report: {e}", file=sys.stderr)
+            return 1
+        print(f"Report: {out}")
+    return 0 if report.satisfied else 2
+
+
 def cmd_replay(args: list[str]) -> int:
     """Verify a replay log is bit-exact: re-run and byte-compare."""
     args, log_path = _flag(args, "--log")
@@ -706,8 +767,10 @@ def cmd_replay(args: list[str]) -> int:
 
     suite, recorded, _missing, digest = _load_suite_for_replay(suite_path)
     if digest != expected.digest:
-        print(f"Error: suite digest mismatch: suite is {digest}, log was {expected.digest}",
-              file=sys.stderr)
+        print(
+            f"Error: suite digest mismatch: suite is {digest}, log was {expected.digest}",
+            file=sys.stderr,
+        )
         return 1
     result, outputs = _run_suite(suite, recorded, expected.seed)
     actual = _build_log(suite, suite_path, digest, result, outputs, expected.seed)
@@ -726,8 +789,10 @@ def cmd_replay(args: list[str]) -> int:
     if actual.to_json() != original_bytes:
         print("Replay NOT bit-exact: canonical bytes differ.")
         return 1
-    print(f"Replay bit-exact: {len(actual.cases)} cases, seed={expected.seed}, "
-          f"digest={expected.digest[:19]}...")
+    print(
+        f"Replay bit-exact: {len(actual.cases)} cases, seed={expected.seed}, "
+        f"digest={expected.digest[:19]}..."
+    )
     return 0
 
 
@@ -826,18 +891,18 @@ def cmd_bugsmith(args: list[str]) -> int:
             for spec in pr_mirrors:
                 patch_path, _, pr_ref = spec.partition(":")
                 if not patch_path or not pr_ref:
-                    print(f"Error: --pr-mirror needs <patch>:<pr-ref>, got {spec!r}",
-                          file=sys.stderr)
+                    print(
+                        f"Error: --pr-mirror needs <patch>:<pr-ref>, got {spec!r}", file=sys.stderr
+                    )
                     return 1
                 try:
                     patch = Path(patch_path).read_text(encoding="utf-8")
                 except OSError as e:
-                    print(f"Error: cannot read --pr-mirror patch {patch_path!r}: {e}",
-                          file=sys.stderr)
+                    print(
+                        f"Error: cannot read --pr-mirror patch {patch_path!r}: {e}", file=sys.stderr
+                    )
                     return 1
-                candidates.extend(
-                    PRMirrorGenerator(pr_ref=pr_ref).generate(patch, ["mirrored"])
-                )
+                candidates.extend(PRMirrorGenerator(pr_ref=pr_ref).generate(patch, ["mirrored"]))
             reports = []
             for c in candidates:
                 try:
@@ -845,8 +910,11 @@ def cmd_bugsmith(args: list[str]) -> int:
                 except BugsmithError as e:
                     # One bad candidate (e.g. a stale --pr-mirror patch) must
                     # not discard the good ones.
-                    print(f"Warning: skipping unvalidatable candidate "
-                          f"({c.record.site_description}): {e}", file=sys.stderr)
+                    print(
+                        f"Warning: skipping unvalidatable candidate "
+                        f"({c.record.site_description}): {e}",
+                        file=sys.stderr,
+                    )
             valid = [r for r in reports if r.is_valid_instance]
             print(f"validated: {len(valid)}/{len(reports)} instances break >= 1 test")
             subset = select_subset(config, reports, digest)
@@ -865,8 +933,7 @@ def cmd_bugsmith(args: list[str]) -> int:
             # bugsmith.curate.instance_id (same one from_dict enforces).
             with (out / "all_validated.jsonl").open("w", encoding="utf-8") as f:
                 for r in valid:
-                    f.write(json.dumps(_validated_record(r, digest),
-                                       sort_keys=True) + "\n")
+                    f.write(json.dumps(_validated_record(r, digest), sort_keys=True) + "\n")
             manifest = {
                 "tool": "agenteval-bench",
                 "command": "bugsmith",
@@ -913,7 +980,9 @@ def cmd_snapshot(args: list[str]) -> int:
         print("                                --version <id> --owner <name> --why <text>")
         print("                                [--prev <id>] [--changed <text>] [--cadence <text>]")
         print("                                [--regression-set <text>] [--feedback-loop <text>]")
-        print("                                [--promotions <file.json>] [--agent <name>] [--seed 42]")
+        print(
+            "                                [--promotions <file.json>] [--agent <name>] [--seed 42]"
+        )
         print("         (baseline is pinned from the suite's recorded `output` fields, like `run`)")
         print("       agenteval-bench snapshot show --store <dir> --suite <name> --version <id>")
         print("       agenteval-bench snapshot verify --store <dir> --suite <name> --version <id>")
@@ -937,8 +1006,7 @@ def cmd_snapshot(args: list[str]) -> int:
         rest, suite_name = _flag(rest, "--suite")
         rest, version_id = _flag(rest, "--version")
         if not store_s or not suite_name or not version_id:
-            print("Error: show needs --store <dir> --suite <name> --version <id>",
-                  file=sys.stderr)
+            print("Error: show needs --store <dir> --suite <name> --version <id>", file=sys.stderr)
             return 2
         try:
             version, suite = SnapshotStore(store_s).load(suite_name, version_id)
@@ -961,14 +1029,18 @@ def cmd_snapshot(args: list[str]) -> int:
             print(f"regression set: {meta.regression_set}")
         if meta.feedback_loop:
             print(f"feedback loop: {meta.feedback_loop}")
-        print(f"cases: {len(suite.cases)}  "
-              f"baseline: pass_rate {base.pass_rate:.1%} (agent={base.agent}, seed={base.seed})")
+        print(
+            f"cases: {len(suite.cases)}  "
+            f"baseline: pass_rate {base.pass_rate:.1%} (agent={base.agent}, seed={base.seed})"
+        )
         if version.promotions:
             print(f"promotions ({len(version.promotions)}):")
             for p in version.promotions:
-                print(f"  - {p.get('promoted_case_id')} "
-                      f"<- {p.get('kind')}:{p.get('failure_id')} "
-                      f"(prior_score={p.get('prior_score')})")
+                print(
+                    f"  - {p.get('promoted_case_id')} "
+                    f"<- {p.get('kind')}:{p.get('failure_id')} "
+                    f"(prior_score={p.get('prior_score')})"
+                )
         return 0
     if sub == "compare":
         return _snapshot_compare(rest)
@@ -977,8 +1049,9 @@ def cmd_snapshot(args: list[str]) -> int:
         rest, suite_name = _flag(rest, "--suite")
         rest, version_id = _flag(rest, "--version")
         if not store_s or not suite_name or not version_id:
-            print("Error: verify needs --store <dir> --suite <name> --version <id>",
-                  file=sys.stderr)
+            print(
+                "Error: verify needs --store <dir> --suite <name> --version <id>", file=sys.stderr
+            )
             return 2
         try:
             SnapshotStore(store_s).verify(suite_name, version_id)
@@ -1000,8 +1073,9 @@ def cmd_snapshot(args: list[str]) -> int:
         else:
             root = store.root
             if root.is_dir():
-                for sdir in sorted(p for p in root.iterdir()
-                                   if p.is_dir() and not p.name.startswith(".")):
+                for sdir in sorted(
+                    p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")
+                ):
                     for v in store.list_versions(sdir.name):
                         print(f"{sdir.name}/{v}")
         return 0
@@ -1063,9 +1137,17 @@ def _snapshot_publish(args: list[str]) -> int:
     args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
     args, promotions_path = _flag(args, "--promotions")
 
-    missing = [n for n, v in (("--suite", suite_path), ("--store", store_s),
-                              ("--version", version_id), ("--owner", owner),
-                              ("--why", why)) if not v]
+    missing = [
+        n
+        for n, v in (
+            ("--suite", suite_path),
+            ("--store", store_s),
+            ("--version", version_id),
+            ("--owner", owner),
+            ("--why", why),
+        )
+        if not v
+    ]
     if missing:
         print(f"Error: snapshot publish needs {' '.join(missing)}", file=sys.stderr)
         return 2
@@ -1085,12 +1167,13 @@ def _snapshot_publish(args: list[str]) -> int:
                 print(f"Error: cannot read --promotions file: {e}", file=sys.stderr)
                 return 2
             if not isinstance(raw_promotions, list):
-                print("Error: --promotions file must be a JSON list of promotion records",
-                      file=sys.stderr)
+                print(
+                    "Error: --promotions file must be a JSON list of promotion records",
+                    file=sys.stderr,
+                )
                 return 2
             try:
-                promotions = [PromotionRecord.from_dict(p).to_dict()
-                              for p in raw_promotions]
+                promotions = [PromotionRecord.from_dict(p).to_dict() for p in raw_promotions]
             except (ValueError, TypeError, KeyError) as e:
                 print(f"Error: invalid promotion record: {e}", file=sys.stderr)
                 return 2
@@ -1100,9 +1183,12 @@ def _snapshot_publish(args: list[str]) -> int:
             print(f"Note: {len(missing)} case(s) had no recorded output and were skipped.")
         scored = result.passed + result.failed
         if scored == 0:
-            print("Error: no cases scored — the suite has no recorded `output` fields, "
-                  "so no baseline can be pinned. Publish needs a replayable suite "
-                  "(see `run --replay-log`).", file=sys.stderr)
+            print(
+                "Error: no cases scored — the suite has no recorded `output` fields, "
+                "so no baseline can be pinned. Publish needs a replayable suite "
+                "(see `run --replay-log`).",
+                file=sys.stderr,
+            )
             return 2
         baseline = baseline_from_run(result, seed=seed, agent=agent or "recorded")
         version = SnapshotStore(store_s).publish(
@@ -1127,8 +1213,10 @@ def _snapshot_publish(args: list[str]) -> int:
         print(f"Error: storage failure during publish: {e}", file=sys.stderr)
         return 1
     print(f"Published {suite.name}/{version.version_id} digest={version.digest}")
-    print(f"Baseline: pass_rate {version.baseline.pass_rate:.1%} "
-          f"(agent={version.baseline.agent}, seed={seed})")
+    print(
+        f"Baseline: pass_rate {version.baseline.pass_rate:.1%} "
+        f"(agent={version.baseline.agent}, seed={seed})"
+    )
     if promotions:
         print(f"Promotions recorded: {len(promotions)}")
     return 0
@@ -1151,9 +1239,16 @@ def _snapshot_compare(args: list[str]) -> int:
     args, threshold_s = _flag(args, "--min-pass-rate")
     args, seed_s = _flag(args, "--seed")  # None -> version's pinned baseline seed
 
-    missing = [n for n, v in (("--store", store_s), ("--suite", suite_name),
-                              ("--version", version_id),
-                              ("--candidate-outputs", cand_path)) if not v]
+    missing = [
+        n
+        for n, v in (
+            ("--store", store_s),
+            ("--suite", suite_name),
+            ("--version", version_id),
+            ("--candidate-outputs", cand_path),
+        )
+        if not v
+    ]
     if missing:
         print(f"Error: snapshot compare needs {' '.join(missing)}", file=sys.stderr)
         return 2
@@ -1164,19 +1259,22 @@ def _snapshot_compare(args: list[str]) -> int:
         print(f"Error: cannot read --candidate-outputs file: {e}", file=sys.stderr)
         return 2
     if not isinstance(candidate_outputs, dict) or not all(
-        isinstance(k, str) and isinstance(v, str)
-        for k, v in candidate_outputs.items()
+        isinstance(k, str) and isinstance(v, str) for k, v in candidate_outputs.items()
     ):
-        print("Error: --candidate-outputs must be a JSON object mapping "
-              "case_id -> output string", file=sys.stderr)
+        print(
+            "Error: --candidate-outputs must be a JSON object mapping case_id -> output string",
+            file=sys.stderr,
+        )
         return 2
     try:
         threshold = float(threshold_s) if threshold_s is not None else None
         if threshold is not None and not 0.0 <= threshold <= 1.0:
             raise ValueError("out of range")
     except ValueError:
-        print(f"Error: --min-pass-rate must be between 0.0 and 1.0, got {threshold_s}",
-              file=sys.stderr)
+        print(
+            f"Error: --min-pass-rate must be between 0.0 and 1.0, got {threshold_s}",
+            file=sys.stderr,
+        )
         return 2
     try:
         seed = int(seed_s) if seed_s is not None else None
@@ -1185,8 +1283,7 @@ def _snapshot_compare(args: list[str]) -> int:
         return 2
 
     try:
-        _version, suite = SnapshotStore(store_s or "").load(
-            suite_name or "", version_id or "")
+        _version, suite = SnapshotStore(store_s or "").load(suite_name or "", version_id or "")
     except SnapshotError as e:
         print(f"CORRUPTED: {e}", file=sys.stderr)
         return 1
@@ -1231,19 +1328,27 @@ def _snapshot_compare(args: list[str]) -> int:
         return 1
 
     if called_ids != ordered_ids:
-        print("Error: candidate output attribution mismatch — the engine's agent_fn "
-              "call order diverged from frozen case order; refusing to score.",
-              file=sys.stderr)
+        print(
+            "Error: candidate output attribution mismatch — the engine's agent_fn "
+            "call order diverged from frozen case order; refusing to score.",
+            file=sys.stderr,
+        )
         return 1
 
-    print(f"Regression gate: {suite_name}/{version_id} "
-          f"(digest={report.digest[:19]}...) vs candidate '{report.candidate_agent}' "
-          f"(seed={report.seed})")
-    print(f"baseline pass_rate {report.baseline_pass_rate:.1%} -> "
-          f"candidate {report.candidate_pass_rate:.1%}")
+    print(
+        f"Regression gate: {suite_name}/{version_id} "
+        f"(digest={report.digest[:19]}...) vs candidate '{report.candidate_agent}' "
+        f"(seed={report.seed})"
+    )
+    print(
+        f"baseline pass_rate {report.baseline_pass_rate:.1%} -> "
+        f"candidate {report.candidate_pass_rate:.1%}"
+    )
     if missing_ids:
-        print(f"Note: {len(missing_ids)} case(s) had no candidate output and scored 0 "
-              f"({', '.join(missing_ids[:5])}{'...' if len(missing_ids) > 5 else ''}).")
+        print(
+            f"Note: {len(missing_ids)} case(s) had no candidate output and scored 0 "
+            f"({', '.join(missing_ids[:5])}{'...' if len(missing_ids) > 5 else ''})."
+        )
     for d in report.case_deltas:
         mark = "REGRESSED" if d.case_id in report.regressed_cases else "ok"
         if d.candidate_score != d.baseline_score:
@@ -1274,8 +1379,7 @@ def cmd_tiered(args: list[str]) -> int:
     args, phase = _flag(args, "--phase", "all")
     args, mutants_s = _flag(args, "--mutants", str(DEFAULT_MUTANTS))
     args, seed_s = _flag(args, "--seed", str(TIERED_SEED))
-    args, min_mut_s = _flag(args, "--min-mutation-score",
-                            str(DEFAULT_MIN_MUTATION_SCORE))
+    args, min_mut_s = _flag(args, "--min-mutation-score", str(DEFAULT_MIN_MUTATION_SCORE))
     args, min_cov_s = _flag(args, "--min-coverage", str(DEFAULT_MIN_COVERAGE))
     args, out = _flag(args, "--out")
     args, root_s = _flag(args, "--root", ".")
@@ -1290,8 +1394,10 @@ def cmd_tiered(args: list[str]) -> int:
         min_mut = float(min_mut_s or str(DEFAULT_MIN_MUTATION_SCORE))
         min_cov = float(min_cov_s or str(DEFAULT_MIN_COVERAGE))
     except ValueError:
-        print("Error: --mutants/--seed must be integers, "
-              "--min-mutation-score/--min-coverage numbers", file=sys.stderr)
+        print(
+            "Error: --mutants/--seed must be integers, --min-mutation-score/--min-coverage numbers",
+            file=sys.stderr,
+        )
         return 1
 
     try:
@@ -1377,8 +1483,7 @@ def _tracebench_mine(args: list[str]) -> int:
     if args:
         print(f"Error: unknown argument(s): {' '.join(args)}", file=sys.stderr)
         return 1
-    missing = [n for n, v in (("--corpus", corpus), ("--owner", owner),
-                               ("--out", out)) if not v]
+    missing = [n for n, v in (("--corpus", corpus), ("--owner", owner), ("--out", out)) if not v]
     if missing:
         print(f"Error: tracebench mine needs {' '.join(missing)}", file=sys.stderr)
         return 1
@@ -1417,8 +1522,10 @@ def _tracebench_mine(args: list[str]) -> int:
     except OSError as e:
         print(f"Error: cannot write mine outputs: {e}", file=sys.stderr)
         return 1
-    print(f"Mined {len(report.cases)} case(s) from {load.total_lines} trace(s) "
-          f"({load.skipped} skipped, corpus {load.digest[:19]}...)")
+    print(
+        f"Mined {len(report.cases)} case(s) from {load.total_lines} trace(s) "
+        f"({load.skipped} skipped, corpus {load.digest[:19]}...)"
+    )
     for case in report.cases:
         print(f"  {case.case.id} [{case.pattern}] incident {case.incident_id}")
     print(f"Manifest: {out_path / 'manifest.json'}")
@@ -1447,10 +1554,18 @@ def _tracebench_regress(args: list[str]) -> int:
     if args:
         print(f"Error: unknown argument(s): {' '.join(args)}", file=sys.stderr)
         return 1
-    missing = [n for n, v in (("--corpus", corpus), ("--store", store),
-                               ("--suite", suite),
-                               ("--candidate-outputs", cand_path),
-                               ("--owner", owner), ("--out", out)) if not v]
+    missing = [
+        n
+        for n, v in (
+            ("--corpus", corpus),
+            ("--store", store),
+            ("--suite", suite),
+            ("--candidate-outputs", cand_path),
+            ("--owner", owner),
+            ("--out", out),
+        )
+        if not v
+    ]
     if not version and not state_dir:
         missing.append("--version (or --state-dir to auto-derive it)")
     if missing:
@@ -1465,8 +1580,7 @@ def _tracebench_regress(args: list[str]) -> int:
         if prior_failures is not None and prior_failures < 0:
             raise ValueError("negative")
     except ValueError:
-        print("Error: --seed/--prior-failures must be integers (>= 0 for prior)",
-              file=sys.stderr)
+        print("Error: --seed/--prior-failures must be integers (>= 0 for prior)", file=sys.stderr)
         return 1
     try:
         with open(cand_path or "", encoding="utf-8") as f:
@@ -1475,11 +1589,12 @@ def _tracebench_regress(args: list[str]) -> int:
         print(f"Error: cannot read --candidate-outputs file: {e}", file=sys.stderr)
         return 1
     if not isinstance(candidate_outputs, dict) or not all(
-        isinstance(k, str) and isinstance(v, str)
-        for k, v in candidate_outputs.items()
+        isinstance(k, str) and isinstance(v, str) for k, v in candidate_outputs.items()
     ):
-        print("Error: --candidate-outputs must be a JSON object mapping "
-              "case_id -> output string", file=sys.stderr)
+        print(
+            "Error: --candidate-outputs must be a JSON object mapping case_id -> output string",
+            file=sys.stderr,
+        )
         return 1
     try:
         result = run_scheduled(
@@ -1501,19 +1616,25 @@ def _tracebench_regress(args: list[str]) -> int:
     except (TracebenchError, ValueError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
-    print(f"Tracebench regression: {suite}/{result.version_id} "
-          f"(mined {result.mined_cases}, new {result.new_cases}, "
-          f"updated {result.updated_cases}, retired {result.retired_cases})")
+    print(
+        f"Tracebench regression: {suite}/{result.version_id} "
+        f"(mined {result.mined_cases}, new {result.new_cases}, "
+        f"updated {result.updated_cases}, retired {result.retired_cases})"
+    )
     print(f"verdict: {result.verdict}")
     if result.previous_corpus_total_lines is not None:
-        print(f"corpus: {result.corpus_total_lines} trace(s) "
-              f"(previous run: {result.previous_corpus_total_lines})")
+        print(
+            f"corpus: {result.corpus_total_lines} trace(s) "
+            f"(previous run: {result.previous_corpus_total_lines})"
+        )
     else:
         print(f"corpus: {result.corpus_total_lines} trace(s)")
     if result.drift_detected:
-        print(f"benchmark drift: {', '.join(result.drifted_case_ids)} — "
-              "the benchmark moved since the previous version; "
-              "last week's certification no longer applies")
+        print(
+            f"benchmark drift: {', '.join(result.drifted_case_ids)} — "
+            "the benchmark moved since the previous version; "
+            "last week's certification no longer applies"
+        )
     if result.previous_stale is not None:
         print(f"previous version stale: {result.previous_stale}")
     if result.version_ignored:
@@ -1574,16 +1695,9 @@ def cmd_flywheel(args: list[str]) -> int:
     if corpus_s:
         corpus_root = Path(corpus_s)
     else:
-        corpus_root = (
-            Path(__file__).resolve().parents[1]
-            / "bugsmith"
-            / "fixtures"
-            / "target"
-        )
+        corpus_root = Path(__file__).resolve().parents[1] / "bugsmith" / "fixtures" / "target"
     ledger_path = (
-        Path(ledger_s)
-        if ledger_s
-        else target_root / ".flywheel" / "gate-catch-ledger.jsonl"
+        Path(ledger_s) if ledger_s else target_root / ".flywheel" / "gate-catch-ledger.jsonl"
     )
     out_dir = Path(out_s) if out_s else target_root / ".flywheel" / "payloads"
 
@@ -1607,17 +1721,12 @@ def cmd_flywheel(args: list[str]) -> int:
     for payload in result.payloads:
         dest = out_dir / payload.rule_kind
         dest.mkdir(parents=True, exist_ok=True)
-        (dest / "PR.md").write_text(
-            f"# {payload.title}\n\n{payload.body}", encoding="utf-8"
-        )
+        (dest / "PR.md").write_text(f"# {payload.title}\n\n{payload.body}", encoding="utf-8")
         for rel, content in payload.files.items():
             path = dest / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-    print(
-        f"detected={result.detected} sampled={result.sampled} "
-        f"payloads={len(result.payloads)}"
-    )
+    print(f"detected={result.detected} sampled={result.sampled} payloads={len(result.payloads)}")
     for line in result.skipped:
         print(f"skipped: {line}")
     rate = leading_gate_catch_rate(ledger_path)
@@ -1626,8 +1735,9 @@ def cmd_flywheel(args: list[str]) -> int:
     else:
         print(f"ledger: {ledger_path} (leading gate-catch rate: {rate:.0%})")
     print(f"payloads: {out_dir}")
-    print("NOTE: payloads are rendered, not posted — the fleet runner "
-          "posts them via the GitHub API.")
+    print(
+        "NOTE: payloads are rendered, not posted — the fleet runner posts them via the GitHub API."
+    )
     return 0
 
 
@@ -1650,6 +1760,11 @@ def main() -> None:
         print("                                [--q 0.05] [--seed 42] [--out report.json]")
         print("       agenteval-bench simpson --slices slices.json")
         print("                                [--allocation-tolerance 0.05] [--out report.json]")
+        print("       agenteval-bench judges --registry <file.json> [--want 2]")
+        print("                                [--json] [--out report.json]")
+        print(
+            "                                (exit 0 satisfied, 2 thin allocation, 1 bad registry)"
+        )
         print("       agenteval-bench bugsmith --repo <dir> --out <dir> [--procedural 8]")
         print("                                [--seed 42] [--local] [--config curation.json]")
         print("                                [--pr-mirror patch:pr-ref]")
@@ -1691,6 +1806,8 @@ def main() -> None:
         sys.exit(cmd_alt_test(rest))
     elif cmd == "simpson":
         sys.exit(cmd_simpson(rest))
+    elif cmd == "judges":
+        sys.exit(cmd_judges(rest))
     elif cmd == "bugsmith":
         sys.exit(cmd_bugsmith(rest))
     elif cmd == "snapshot":

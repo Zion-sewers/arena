@@ -16,6 +16,16 @@ from agenteval_bench.decision import (
     policy_fingerprint,
 )
 from agenteval_bench.engine import EvalRunner
+from agenteval_bench.judges import (
+    UNKNOWN_FAMILY,
+    AllocationReport,
+    Judge,
+    JudgeHole,
+    RejectedJudge,
+    allocate,
+    load_registry,
+    registry_from_json,
+)
 from agenteval_bench.models import EvalCase, EvalResult, EvalSuite, RunResult
 from agenteval_bench.scoring import DeterministicScorer
 from agenteval_bench.validity import (
@@ -31,6 +41,8 @@ from agenteval_bench.validity import (
 )
 
 __all__ = [
+    "UNKNOWN_FAMILY",
+    "AllocationReport",
     "CostEvidence",
     "Decision",
     "DecisionAction",
@@ -42,8 +54,11 @@ __all__ = [
     "EvalResult",
     "EvalRunner",
     "EvalSuite",
+    "Judge",
+    "JudgeHole",
     "MetricValidity",
     "ProportionEvidence",
+    "RejectedJudge",
     "RiskLevel",
     "RiskThresholds",
     "RunResult",
@@ -51,12 +66,15 @@ __all__ = [
     "ValidityGrade",
     "ValidityPolicy",
     "ValidityReport",
+    "allocate",
     "assess_decision",
     "assess_scorer",
     "decide",
     "default_policy",
     "default_validity_policy",
+    "load_registry",
     "policy_fingerprint",
+    "registry_from_json",
     "validate_matcher_labels",
     "validate_proxy",
 ]
