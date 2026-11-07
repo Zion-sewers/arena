@@ -1,0 +1,505 @@
+{
+  "judge": "sharp-judge",
+  "observations": [
+    {
+      "item": "cal-0",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-1",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-2",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-3",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-4",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-5",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-6",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-7",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-8",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-9",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-10",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-11",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-12",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-13",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-14",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-15",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-16",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-17",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-18",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-19",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-20",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-21",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-22",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-23",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-24",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-25",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-26",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-27",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-28",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-29",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-30",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-31",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-32",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-33",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-34",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-35",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-36",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-37",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-38",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-39",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-40",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-41",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-42",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-43",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-44",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-45",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-46",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-47",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-48",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-49",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-50",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-51",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-52",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-53",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-54",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-55",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-56",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-57",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-58",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-59",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-60",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-61",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-62",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-63",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-64",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-65",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-66",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-67",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-68",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-69",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-70",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-71",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-72",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-73",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-74",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-75",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-76",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-77",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-78",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-79",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-80",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-81",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-82",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-83",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-84",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-85",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-86",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-87",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-88",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-89",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-90",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-91",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-92",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-93",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-94",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-95",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-96",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-97",
+      "confidence": 0.5,
+      "agreed": false
+    },
+    {
+      "item": "cal-98",
+      "confidence": 0.5,
+      "agreed": true
+    },
+    {
+      "item": "cal-99",
+      "confidence": 0.5,
+      "agreed": false
+    }
+  ]
+}

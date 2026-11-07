@@ -760,6 +760,71 @@ def cmd_judges(args: list[str]) -> int:
     return 0 if report.satisfied else 2
 
 
+def cmd_calibrate(args: list[str]) -> int:
+    """Calibrate one judge's stated confidence against measured agreement (arena#45).
+
+    Reads recorded (label, stated-confidence) pairs as JSON — a mapping
+    with a ``judge`` string and an ``observations`` list, or a bare list —
+    and grades the judge CALIBRATED / MISCALIBRATED / UNCALIBRATED.
+    Exit 0 = calibrated (the judge's scores may gate); exit 2 =
+    miscalibrated or uncalibrated (the scores must not gate);
+    exit 1 = unusable observations file.
+    """
+    from agenteval_bench.calibration import calibrate, observations_from_json
+
+    args, obs_path = _flag(args, "--observations")
+    args, out = _flag(args, "--out")
+    args, as_json = _has(args, "--json")
+    if not obs_path:
+        print("Error: calibrate needs --observations <file.json>", file=sys.stderr)
+        return 1
+    try:
+        text = Path(obs_path).read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"Error: cannot read observations: {e}", file=sys.stderr)
+        return 1
+    try:
+        judge, observations = observations_from_json(text)
+    except (ValueError, TypeError) as e:
+        print(f"Error: unusable observations: {e}", file=sys.stderr)
+        return 1
+    record = calibrate(judge, observations)
+    if as_json:
+        print(json.dumps(record.to_dict(), indent=2))
+    else:
+        ece = "n/a" if record.ece is None else f"{record.ece:.3f}"
+        print(
+            f"judge {record.judge}: {record.status} "
+            f"({record.n_total} observations, ECE {ece})"
+        )
+        for b in record.bins:
+            print(
+                f"  bin [{b.lower_edge:.1f}, {b.upper_edge:.1f}): n={b.n} "
+                f"mean confidence {b.mean_confidence:.2f}, measured agreement "
+                f"{b.agreement_rate:.2f} "
+                f"(Wilson 95% [{b.agreement_interval[0]:.2f}, "
+                f"{b.agreement_interval[1]:.2f}]) -> "
+                f"{'pass' if b.passed else 'FAIL'}"
+            )
+        for reason in record.reasons:
+            print(f"  ! {reason}")
+        for note in record.notes:
+            print(f"  ! {note}")
+        if record.status == "calibrated":
+            print("This judge's scores may gate.")
+        else:
+            print("This judge's scores must not gate: confidence is not evidence.")
+    if out:
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(json.dumps(record.to_dict(), indent=2) + "\n")
+        except OSError as e:
+            print(f"Error: cannot write report: {e}", file=sys.stderr)
+            return 1
+        print(f"Report: {out}")
+    return 0 if record.status == "calibrated" else 2
+
+
 def cmd_replay(args: list[str]) -> int:
     """Verify a replay log is bit-exact: re-run and byte-compare."""
     args, log_path = _flag(args, "--log")
@@ -1725,6 +1790,9 @@ def main() -> None:
         print("       agenteval-bench judges --registry <file.json> [--want 2]")
         print("                                [--json] [--out report.json]")
         print("                                (exit 0 satisfied, 2 thin allocation, 1 bad registry)")
+        print("       agenteval-bench calibrate --observations <file.json>")
+        print("                                [--json] [--out report.json]")
+        print("                                (exit 0 calibrated, 2 mis/uncalibrated, 1 bad input)")
         print("       agenteval-bench bugsmith --repo <dir> --out <dir> [--procedural 8]")
         print("                                [--seed 42] [--local] [--config curation.json]")
         print("                                [--pr-mirror patch:pr-ref]")
@@ -1768,6 +1836,8 @@ def main() -> None:
         sys.exit(cmd_simpson(rest))
     elif cmd == "judges":
         sys.exit(cmd_judges(rest))
+    elif cmd == "calibrate":
+        sys.exit(cmd_calibrate(rest))
     elif cmd == "bugsmith":
         sys.exit(cmd_bugsmith(rest))
     elif cmd == "snapshot":
