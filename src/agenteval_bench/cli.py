@@ -1327,6 +1327,175 @@ def cmd_tiered(args: list[str]) -> int:
     return 0 if report.verdict == "PASS" else 2
 
 
+def cmd_tracebench(args: list[str]) -> int:
+    """Trace-mined benchmarks (arena#41): mine | regress.
+
+    ``mine`` turns a JSONL production-trace corpus into a living benchmark
+    (manifest + mined cases + oracle outputs). ``regress`` runs one
+    scheduled regression: mine, publish new cases as a frozen version,
+    gate a candidate against it, dispatch gate/rollback/investigation
+    actions into a ledger. Exit 0 = GATE_PASS, 2 = GATE_FAIL, 1 = usage
+    or storage error.
+    """
+    if not args or args[0] in ("--help", "-h"):
+        print("Usage: agenteval-bench tracebench mine --corpus <jsonl> --owner <name>")
+        print("                                --cadence <daily|weekly|monthly> --out <dir>")
+        print("       agenteval-bench tracebench regress --corpus <jsonl> --store <dir>")
+        print("                                --suite <name> --version <new-id> [--prev <id>]")
+        print("                                --candidate-outputs <json> --owner <name>")
+        print("                                --cadence <daily|weekly|monthly> --out <dir>")
+        print("                                [--candidate-name <name>] [--seed 42]")
+        print("                                [--prior-failures 0]")
+        return 0
+    sub, rest = args[0], args[1:]
+    if sub == "mine":
+        return _tracebench_mine(rest)
+    if sub == "regress":
+        return _tracebench_regress(rest)
+    print(f"Error: unknown tracebench subcommand: {sub}", file=sys.stderr)
+    return 1
+
+
+def _tracebench_mine(args: list[str]) -> int:
+    from agenteval_bench.tracebench import (
+        TracebenchError,
+        build_manifest,
+        load_corpus,
+        mine_traces,
+    )
+
+    args, corpus = _flag(args, "--corpus")
+    args, owner = _flag(args, "--owner")
+    args, cadence = _flag(args, "--cadence", "weekly")
+    args, out = _flag(args, "--out")
+    if args:
+        print(f"Error: unknown argument(s): {' '.join(args)}", file=sys.stderr)
+        return 1
+    missing = [n for n, v in (("--corpus", corpus), ("--owner", owner),
+                               ("--out", out)) if not v]
+    if missing:
+        print(f"Error: tracebench mine needs {' '.join(missing)}", file=sys.stderr)
+        return 1
+    try:
+        load = load_corpus(corpus or "")
+        report = mine_traces(
+            load.records,
+            owner=owner or "",
+            cadence=cadence or "weekly",
+            corpus_digest=load.digest,
+            skipped_records=load.skipped,
+        )
+        manifest = build_manifest(
+            report.cases,
+            benchmark_id="tracebench",
+            owner=owner or "",
+            cadence=cadence or "weekly",
+            created_at=report.mined_at,
+            last_mined_at=report.mined_at,
+        )
+    except (TracebenchError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    out_path = Path(out or ".")
+    try:
+        out_path.mkdir(parents=True, exist_ok=True)
+        (out_path / "manifest.json").write_text(manifest.to_json(), encoding="utf-8")
+        (out_path / "mined-cases.json").write_text(report.to_json(), encoding="utf-8")
+        oracle = {c.case.id: c.expected_output for c in report.cases}
+        (out_path / "oracle-outputs.json").write_text(
+            json.dumps(oracle, sort_keys=True, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as e:
+        print(f"Error: cannot write mine outputs: {e}", file=sys.stderr)
+        return 1
+    print(f"Mined {len(report.cases)} case(s) from {load.total_lines} trace(s) "
+          f"({load.skipped} skipped, corpus {load.digest[:19]}...)")
+    for case in report.cases:
+        print(f"  {case.case.id} [{case.pattern}] incident {case.incident_id}")
+    print(f"Manifest: {out_path / 'manifest.json'}")
+    print(f"Mined cases: {out_path / 'mined-cases.json'}")
+    print(f"Oracle outputs: {out_path / 'oracle-outputs.json'}")
+    return 0
+
+
+def _tracebench_regress(args: list[str]) -> int:
+    from agenteval_bench.tracebench import TracebenchError, run_scheduled
+
+    args, corpus = _flag(args, "--corpus")
+    args, store = _flag(args, "--store")
+    args, suite = _flag(args, "--suite")
+    args, version = _flag(args, "--version")
+    args, prev = _flag(args, "--prev")
+    args, cand_path = _flag(args, "--candidate-outputs")
+    args, cand_name = _flag(args, "--candidate-name", "candidate")
+    args, owner = _flag(args, "--owner")
+    args, cadence = _flag(args, "--cadence", "weekly")
+    args, out = _flag(args, "--out")
+    args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
+    args, prior_s = _flag(args, "--prior-failures", "0")
+    if args:
+        print(f"Error: unknown argument(s): {' '.join(args)}", file=sys.stderr)
+        return 1
+    missing = [n for n, v in (("--corpus", corpus), ("--store", store),
+                               ("--suite", suite), ("--version", version),
+                               ("--candidate-outputs", cand_path),
+                               ("--owner", owner), ("--out", out)) if not v]
+    if missing:
+        print(f"Error: tracebench regress needs {' '.join(missing)}", file=sys.stderr)
+        return 1
+    try:
+        seed = int(seed_s or str(DEFAULT_SEED))
+        prior_failures = int(prior_s or "0")
+        if prior_failures < 0:
+            raise ValueError("negative")
+    except ValueError:
+        print("Error: --seed/--prior-failures must be integers (>= 0 for prior)",
+              file=sys.stderr)
+        return 1
+    try:
+        with open(cand_path or "", encoding="utf-8") as f:
+            candidate_outputs = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Error: cannot read --candidate-outputs file: {e}", file=sys.stderr)
+        return 1
+    if not isinstance(candidate_outputs, dict) or not all(
+        isinstance(k, str) and isinstance(v, str)
+        for k, v in candidate_outputs.items()
+    ):
+        print("Error: --candidate-outputs must be a JSON object mapping "
+              "case_id -> output string", file=sys.stderr)
+        return 1
+    try:
+        result = run_scheduled(
+            corpus=corpus or "",
+            store=store or "",
+            suite_name=suite or "",
+            version_id=version or "",
+            prev_version_id=prev,
+            candidate_outputs=candidate_outputs,
+            owner=owner or "",
+            cadence=cadence or "weekly",
+            out_dir=out or "",
+            seed=seed,
+            candidate_name=cand_name or "candidate",
+            prior_consecutive_failures=prior_failures,
+        )
+    except (TracebenchError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    print(f"Tracebench regression: {suite}/{result.version_id} "
+          f"(mined {result.mined_cases}, new {result.new_cases})")
+    print(f"verdict: {result.verdict}")
+    for action in result.actions:
+        print(f"  action: {action.action} — {action.reason}")
+    print(f"consecutive failures: {result.consecutive_failures}")
+    print(f"Report: {result.report_path}")
+    print(f"Action ledger: {result.actions_path}")
+    print(f"Manifest: {result.manifest_path}")
+    return 0 if result.verdict == "GATE_PASS" else 2
+
+
 def cmd_flywheel(args: list[str]) -> int:
     """Run the fix-commit flywheel against a live repo (arena#40).
 
@@ -1463,6 +1632,12 @@ def main() -> None:
         print("       agenteval-bench flywheel --repo owner/name [--target-root .]")
         print("                                [--corpus-root <dir>] [--ledger <path>]")
         print("                                [--out <dir>] [--sample-size 10] [--seed 42]")
+        print("       agenteval-bench tracebench mine --corpus <jsonl> --owner <name>")
+        print("                                --cadence <daily|weekly|monthly> --out <dir>")
+        print("       agenteval-bench tracebench regress --corpus <jsonl> --store <dir>")
+        print("                                --suite <name> --version <new-id> [--prev <id>]")
+        print("                                --candidate-outputs <json> --owner <name>")
+        print("                                --cadence <daily|weekly|monthly> --out <dir>")
         print("       (--seed is recorded for provenance; the test itself is deterministic)")
         return
 
@@ -1475,6 +1650,8 @@ def main() -> None:
         sys.exit(cmd_tiered(rest))
     elif cmd == "flywheel":
         sys.exit(cmd_flywheel(rest))
+    elif cmd == "tracebench":
+        sys.exit(cmd_tracebench(rest))
     elif cmd == "baseline":
         sys.exit(cmd_baseline(rest))
     elif cmd == "replay":

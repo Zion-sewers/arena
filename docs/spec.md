@@ -57,6 +57,15 @@ src/agenteval_bench/
   validity.py     # Measurement validity: every metric carries a reliability
                   #   column (ValidityGrade, validate_proxy, ValidityReport)
   validity_demo.py # Seeded end-to-end demo of measurement validity
+  regression.py   # Production failures -> frozen versions -> release gate
+  snapshots.py    # Immutable benchmark snapshots (hash-verified store)
+  replay.py       # Deterministic seeded replay logs (bit-exact re-runs)
+  tiered.py       # Tiered eval pipeline (gate -> smoke -> expanded -> nightly)
+  tracebench.py   # Trace-mined benchmarks: mine traces -> living benchmark
+                  #   (owner + cadence per benchmark) -> scheduled regression
+                  #   runner with gate/rollback/investigation actions
+  tracebench_demo.py  # Demo: mine the sample corpus, regress oracle +
+                  #   degraded candidates (gate -> investigation -> rollback)
   cli.py          # CLI entry point (run --suite --ci --threshold; decide --suite --policy)
 tests/            # pytest suite (engine + CLI gateway)
 examples/         # Golden replay suites (YAML)
@@ -233,6 +242,7 @@ print(result.summary())
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |
+| Trace-mined benchmarks | ✅ shipped  | v0.2           |
 | LLM-as-judge scoring   | `planned`   | v0.2           |
 | `compare` regression   | `planned`   | v0.2           |
 | `report` (md + json)   | `planned`   | v0.2           |
