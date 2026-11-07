@@ -1098,6 +1098,141 @@ def cmd_register_design(args: list[str]) -> int:
     return 0
 
 
+def cmd_prespec(args: list[str]) -> int:
+    """Run the 10-question review gate over an analysis finding (arena#48).
+
+    Reads a finding (--finding finding.json) and the analysis-plan
+    registry (--registry, default plans/analyses.jsonl), prints all ten
+    questions with pass/fail plus the verdict, and exits 0 only if the
+    review passes (CONFIRMED or EXPLORATORY_ONLY — an exploratory-only
+    pass is a gate pass, not a confirmation). Exit 1 = REFUSED
+    (violations named); exit 2 = unusable input.
+
+    With --plan <file.json>, the plan file is cross-checked against the
+    registry first: the finding's digest must load to the same plan as
+    the file, so a plan edited after registration is unusable input
+    (exit 2), never a refused finding (exit 1).
+    """
+    from experiment.prespec import (
+        finding_from_dict,
+        load_analysis_plan,
+        plan_from_dict,
+        plan_to_dict,
+        review_analysis,
+    )
+
+    args, finding_path = _flag(args, "--finding")
+    args, plan_path = _flag(args, "--plan")
+    args, registry_path = _flag(args, "--registry", "plans/analyses.jsonl")
+    args, out = _flag(args, "--out")
+    if not finding_path:
+        print("Error: prespec needs --finding <file.json>", file=sys.stderr)
+        return 2
+    try:
+        with open(finding_path, encoding="utf-8") as f:
+            finding = finding_from_dict(json.load(f))
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        IndexError,
+        json.JSONDecodeError,
+    ) as e:
+        print(f"Error: invalid finding doc: {e}", file=sys.stderr)
+        return 2
+    if plan_path:
+        try:
+            with open(plan_path, encoding="utf-8") as f:
+                plan = plan_from_dict(json.load(f))
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
+            print(f"Error: invalid plan doc: {e}", file=sys.stderr)
+            return 2
+        try:
+            loaded, _ = load_analysis_plan(finding.plan_digest, registry_path or "")
+        except (OSError, ValueError, KeyError) as e:
+            print(
+                f"Error: finding names an unregistered plan digest: {e}",
+                file=sys.stderr,
+            )
+            return 2
+        if plan_to_dict(loaded) != plan_to_dict(plan):
+            print(
+                "Error: finding names a different registered plan than the "
+                "supplied plan file",
+                file=sys.stderr,
+            )
+            return 2
+    report = review_analysis(finding.plan_digest, registry_path or "", finding)
+    lines = ["10-question review gate (arena#48):"]
+    for q in report.questions:
+        mark = "PASS" if q.passed else "FAIL"
+        lines.append(f"  [{mark}] {q.question_id} {q.question} — {q.evidence}")
+    lines.append(f"verdict: {report.verdict}")
+    if report.violations:
+        lines.append(f"violations: {', '.join(report.violations)}")
+    for note in report.notes:
+        lines.append(f"  note: {note}")
+    print("\n".join(lines))
+    if out:
+        payload = {
+            "tool": "agenteval-bench",
+            "command": "prespec",
+            "verdict": report.verdict,
+            "violations": list(report.violations),
+            "notes": list(report.notes),
+            "plan_digest": report.plan_digest,
+            "questions": [
+                {
+                    "question_id": q.question_id,
+                    "question": q.question,
+                    "passed": q.passed,
+                    "evidence": q.evidence,
+                }
+                for q in report.questions
+            ],
+        }
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+        except OSError as e:
+            print(f"Error: cannot write report: {e}", file=sys.stderr)
+            return 2
+        print(f"Report: {out}")
+    return 0 if report.verdict != "REFUSED" else 1
+
+
+def cmd_register_analysis_plan(args: list[str]) -> int:
+    """Register an analysis plan in the hash chain (arena#48).
+
+    Reads a plan (--plan plan.json) and appends it to the registry
+    (--registry, default plans/analyses.jsonl). Exit 0 = registered
+    (digest printed); exit 2 = unusable plan/registry. Register BEFORE
+    the data is touched: the digest is what the finding must name, and
+    the review gate checks the plan predates the data.
+    """
+    from experiment.prespec import plan_from_dict, register_analysis_plan
+
+    args, plan_path = _flag(args, "--plan")
+    args, registry_path = _flag(args, "--registry", "plans/analyses.jsonl")
+    if not plan_path:
+        print("Error: register-analysis-plan needs --plan <file.json>", file=sys.stderr)
+        return 2
+    try:
+        with open(plan_path, encoding="utf-8") as f:
+            plan = plan_from_dict(json.load(f))
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
+        print(f"Error: unusable plan: {e}", file=sys.stderr)
+        return 2
+    try:
+        digest = register_analysis_plan(plan, registry_path or "")
+    except (ValueError, TypeError, OSError) as e:
+        print(f"Error: cannot register plan: {e}", file=sys.stderr)
+        return 2
+    print(f"registered analysis plan {digest}")
+    return 0
+
+
 def cmd_replay(args: list[str]) -> int:
     """Verify a replay log is bit-exact: re-run and byte-compare."""
     args, log_path = _flag(args, "--log")
@@ -2080,6 +2215,15 @@ def main() -> None:
         print("       agenteval-bench register-design --design <file.json>")
         print("                                [--registry plans/experiments.jsonl]")
         print("                                (exit 0 registered, 2 bad input)")
+        print("       agenteval-bench prespec --finding <file.json>")
+        print("                                [--plan <file.json>]")
+        print("                                [--registry plans/analyses.jsonl]")
+        print("                                [--out report.json]")
+        print("                                (exit 0 CONFIRMED/EXPLORATORY_ONLY,")
+        print("                                 1 REFUSED, 2 bad input)")
+        print("       agenteval-bench register-analysis-plan --plan <file.json>")
+        print("                                [--registry plans/analyses.jsonl]")
+        print("                                (exit 0 registered, 2 bad input)")
         print("       agenteval-bench bugsmith --repo <dir> --out <dir> [--procedural 8]")
         print("                                [--seed 42] [--local] [--config curation.json]")
         print("                                [--pr-mirror patch:pr-ref]")
@@ -2131,6 +2275,10 @@ def main() -> None:
         sys.exit(cmd_ship(rest))
     elif cmd == "register-design":
         sys.exit(cmd_register_design(rest))
+    elif cmd == "prespec":
+        sys.exit(cmd_prespec(rest))
+    elif cmd == "register-analysis-plan":
+        sys.exit(cmd_register_analysis_plan(rest))
     elif cmd == "bugsmith":
         sys.exit(cmd_bugsmith(rest))
     elif cmd == "snapshot":

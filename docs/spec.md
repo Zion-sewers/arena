@@ -120,6 +120,7 @@ docs/             # Specifications, archive, roadmap references
 | `AllocationReport`   | Family-decorrelated judge allocation; unreachable judges are holes, never dropped. |
 | `JudgeCalibration`   | Per-bin stated confidence vs measured agreement; only CALIBRATED may gate. |
 | `ShipVerdict`        | OEC + guardrails + trust gates (SRM, A/A, replication); SHIP only when all pass. |
+| `ReviewGateReport`   | Analysis pre-specification: 10-question gate over a finding vs its registered plan; CONFIRMED / EXPLORATORY_ONLY / REFUSED. |
 | `Selection`          | /diverge selection record: winner vs conventional scores, margin, closed outcome, reason from measured facts; only a token-level-diverse selection graded under the canonical policy with a non-overconfident p may decide on high stakes. |
 | `cli.main`           | Parse argv, load suite, build replay `agent_fn`, print summary + gate. |
 
@@ -286,6 +287,7 @@ print(result.summary())
 | Judge decorrelation (HOST != FAMILY) | ✅ shipped | v0.1.0  |
 | Judge calibration (confidence is not evidence) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | OEC ship gate (OEC + guardrails + trust gates) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
+| Analysis pre-specification (10-question review gate) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Anti-mode-collapse /diverge (5 candidates + p_conventional) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |

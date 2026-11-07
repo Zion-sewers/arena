@@ -47,5 +47,7 @@ jobs:
         run: PYTHONPATH=src python -m agenteval_bench.calibration_demo
       - name: OEC ship-gate demo (OEC + guardrails + trust gates; surprising wins need replication)
         run: PYTHONPATH=src python -m experiment.demo_oec
+      - name: Analysis pre-specification demo (10-question gate; post-hoc refused)
+        run: PYTHONPATH=src python -m experiment.demo_prespec
       - name: Anti-mode-collapse demo (/diverge with 5 candidates + p_conventional; paraphrases refused, single sample refused)
         run: PYTHONPATH=src python -m agenteval_bench.diverge_demo
