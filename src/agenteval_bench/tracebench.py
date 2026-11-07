@@ -32,9 +32,28 @@ A **generator** plus a **scheduled regression runner**:
    failure streak) and writes the new one back, so versions chain and the
    rollback arm is reachable on the 3rd consecutive failure without any
    operator hand-feeding a streak. A mined case whose content changed is
-   published as an update (same id, new content) and a case whose trace
-   left the corpus is retired from the new version — the frozen benchmark
-   is addition-only no longer; both are reported per run.
+   published as an update (same id, new content) and a mined case whose
+   trace left the corpus is retired from the new version — the frozen
+   benchmark is addition-only no longer; both are reported per run.
+   Cases the mine never produced (a hand-seeded base suite) are carried
+   forward untouched: only cases with mining provenance retire.
+3. The drift gate: the scheduled run is a regression, not a smoke test.
+   Before publishing, the newly mined oracle is scored against the
+   previous frozen version — a case whose oracle changed since last week
+   is a drifted case, and a drifted benchmark fails the run (gate +
+   investigation, counting toward the rollback streak) even when the
+   candidate passes the new version: the benchmark moved under the
+   candidate, so last week's certification no longer applies. The new
+   version still publishes, and an unchanged corpus clears the flag the
+   next week. A schedule that mines a static corpus passes, correctly —
+   nothing changed — but it can now fail on a corpus change with no
+   operator in the loop.
+4. Every artifact says what corpus it came from: ``corpus_kind``
+   (``sample`` / ``production`` / ``unknown``) travels on the mine report
+   and the manifest, so a consumer reading an artifact alone can tell
+   invented fixture incidents from real ones. The runner never guesses
+   the kind; the caller declares it (the shipped workflow declares
+   ``sample`` for the checked-in fixture corpus).
 
 Real-incidents boundary (read this before claiming otherwise)
 -------------------------------------------------------------
@@ -66,9 +85,10 @@ from __future__ import annotations
 import hashlib
 import json
 import statistics
+import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -145,6 +165,15 @@ Cadence = Literal["daily", "weekly", "monthly"]
 CADENCE_DAYS: Mapping[str, int] = MappingProxyType(
     {"daily": 1, "weekly": 7, "monthly": 30}
 )
+
+#: What corpus a mined artifact came from. The runner never guesses: the
+#: caller declares it (``sample`` for the checked-in fixture corpus,
+#: ``production`` for a real trace export, ``unknown`` when undeclared).
+#: It travels on the mine report and the manifest so an artifact alone
+#: tells a consumer whether its incident ids are real or invented.
+CorpusKind = Literal["sample", "production", "unknown"]
+
+CORPUS_KINDS: tuple[str, ...] = ("sample", "production", "unknown")
 
 RegressionAction = Literal["gate", "rollback", "investigation"]
 
@@ -421,6 +450,15 @@ def parse_cadence(value: str) -> Cadence:
     if value not in CADENCE_DAYS:
         raise ValueError(
             f"cadence must be one of {sorted(CADENCE_DAYS)}, got {value!r}"
+        )
+    return value  # type: ignore[return-value]
+
+
+def parse_corpus_kind(value: str) -> CorpusKind:
+    """Parse a corpus kind; anything outside the closed set is refused."""
+    if value not in CORPUS_KINDS:
+        raise ValueError(
+            f"corpus_kind must be one of {sorted(CORPUS_KINDS)}, got {value!r}"
         )
     return value  # type: ignore[return-value]
 
@@ -843,6 +881,7 @@ class MineReport:
     cadence: Cadence
     skipped_records: int
     source_records: int
+    corpus_kind: CorpusKind = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -851,6 +890,7 @@ class MineReport:
             "cases": [c.to_dict() for c in self.cases],
             "thresholds": self.thresholds.to_dict(),
             "corpus_digest": self.corpus_digest,
+            "corpus_kind": self.corpus_kind,
             "mined_at": self.mined_at,
             "owner": self.owner,
             "cadence": self.cadence,
@@ -872,6 +912,9 @@ class MineReport:
         thresholds_raw = d.get("thresholds")
         if not isinstance(thresholds_raw, Mapping):
             raise TypeError("mine report: thresholds must be a mapping")
+        corpus_kind_raw = d.get("corpus_kind", "unknown")
+        if not isinstance(corpus_kind_raw, str):
+            raise TypeError("mine report: corpus_kind must be a string")
         return cls(
             cases=tuple(cases),
             thresholds=MineThresholds.from_dict(thresholds_raw),
@@ -881,6 +924,7 @@ class MineReport:
             cadence=parse_cadence(_require_str(d, "cadence", "mine report")),
             skipped_records=_require_int(d, "skipped_records", "mine report"),
             source_records=_require_int(d, "source_records", "mine report"),
+            corpus_kind=parse_corpus_kind(corpus_kind_raw),
         )
 
 
@@ -893,6 +937,7 @@ def mine_traces(
     thresholds: MineThresholds | None = None,
     corpus_digest: str = "",
     skipped_records: int = 0,
+    corpus_kind: str = "unknown",
 ) -> MineReport:
     """Mine benchmark cases from production traces.
 
@@ -971,6 +1016,7 @@ def mine_traces(
         cadence=parsed_cadence,
         skipped_records=skipped_records,
         source_records=len(records),
+        corpus_kind=parse_corpus_kind(corpus_kind),
     )
 
 
@@ -991,6 +1037,7 @@ class BenchmarkManifest:
     source_incidents: tuple[str, ...]
     created_at: str
     last_mined_at: str
+    corpus_kind: CorpusKind = "unknown"
 
     def __post_init__(self) -> None:
         if not self.benchmark_id:
@@ -1020,6 +1067,7 @@ class BenchmarkManifest:
             "source_incidents": list(self.source_incidents),
             "created_at": self.created_at,
             "last_mined_at": self.last_mined_at,
+            "corpus_kind": self.corpus_kind,
         }
 
     def to_json(self) -> str:
@@ -1039,6 +1087,9 @@ class BenchmarkManifest:
             isinstance(x, str) for x in incidents
         ):
             raise TypeError("manifest: source_incidents must be a list of strings")
+        corpus_kind_raw = d.get("corpus_kind", "unknown")
+        if not isinstance(corpus_kind_raw, str):
+            raise TypeError("manifest: corpus_kind must be a string")
         return cls(
             benchmark_id=_require_str(d, "benchmark_id", "manifest"),
             owner=_require_str(d, "owner", "manifest"),
@@ -1047,6 +1098,7 @@ class BenchmarkManifest:
             source_incidents=tuple(incidents),
             created_at=_require_str(d, "created_at", "manifest"),
             last_mined_at=_require_str(d, "last_mined_at", "manifest"),
+            corpus_kind=parse_corpus_kind(corpus_kind_raw),
         )
 
 
@@ -1058,6 +1110,7 @@ def build_manifest(
     cadence: str,
     created_at: str | None = None,
     last_mined_at: str | None = None,
+    corpus_kind: str = "unknown",
 ) -> BenchmarkManifest:
     """Build a benchmark manifest from mined cases.
 
@@ -1085,6 +1138,7 @@ def build_manifest(
         source_incidents=tuple(sorted({c.incident_id for c in cases})),
         created_at=created_at or now,
         last_mined_at=last_mined_at or now,
+        corpus_kind=parse_corpus_kind(corpus_kind),
     )
 
 
@@ -1352,6 +1406,8 @@ class ScheduledRunResult:
     retired_case_ids: tuple[str, ...] = ()
     previous_stale: bool | None = None
     version_ignored: bool = False
+    drift_detected: bool = False
+    drifted_case_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1368,6 +1424,8 @@ class ScheduledRunResult:
             "retired_case_ids": list(self.retired_case_ids),
             "previous_stale": self.previous_stale,
             "version_ignored": self.version_ignored,
+            "drift_detected": self.drift_detected,
+            "drifted_case_ids": list(self.drifted_case_ids),
             "manifest": self.manifest.to_dict(),
             "actions": [a.to_dict() for a in self.actions],
             "consecutive_failures": self.consecutive_failures,
@@ -1410,6 +1468,11 @@ def _load_run_state(
             f"run state {path} is for suite {raw.get('suite_name')!r}, "
             f"not {suite_name!r} — refusing to chain across suites"
         )
+    if "prev_version_id" not in raw:
+        raise TracebenchError(
+            f"run state {path} has no prev_version_id — refusing to "
+            "chain from a state file that does not name its version"
+        )
     prev = raw.get("prev_version_id")
     if prev is not None and not isinstance(prev, str):
         raise TracebenchError(
@@ -1431,34 +1494,116 @@ def _write_run_state(
     consecutive_failures: int,
     updated_at: str,
 ) -> None:
-    """Persist the run's state atomically (temp file + replace)."""
+    """Persist the run's state atomically (unique temp file + replace).
+    Any I/O failure is a TracebenchError, never a raw traceback: the CLI
+    reports it as a clean error line."""
     directory = Path(state_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    doc = {
-        "tool": "agenteval-bench",
-        "kind": "tracebench-run-state",
-        "suite_name": suite_name,
-        "prev_version_id": prev_version_id,
-        "consecutive_failures": consecutive_failures,
-        "updated_at": updated_at,
-    }
-    tmp = directory / (_RUN_STATE_FILENAME + ".tmp")
-    tmp.write_text(_canonical_json(doc), encoding="utf-8")
-    tmp.replace(directory / _RUN_STATE_FILENAME)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        doc = {
+            "tool": "agenteval-bench",
+            "kind": "tracebench-run-state",
+            "suite_name": suite_name,
+            "prev_version_id": prev_version_id,
+            "consecutive_failures": consecutive_failures,
+            "updated_at": updated_at,
+        }
+        fd, tmp_name = tempfile.mkstemp(
+            dir=directory, prefix=_RUN_STATE_FILENAME + "."
+        )
+        try:
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write(_canonical_json(doc))
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+        Path(tmp_name).replace(directory / _RUN_STATE_FILENAME)
+    except TracebenchError:
+        raise
+    except OSError as e:
+        raise TracebenchError(f"cannot write run state in {directory}: {e}") from e
+
+
+def _check_state_dir_writable(state_dir: str | Path) -> None:
+    """Preflight for ``--state-dir``: prove the directory can be written
+    BEFORE the run publishes anything. A state write that fails after
+    publishing leaves a published version with no state, and the next run
+    then re-derives version "1" and dies on the duplicate — the exact
+    hand-feeding ``--state-dir`` was built to eliminate. Fail here, with
+    nothing half-done, instead."""
+    directory = Path(state_dir)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".writable-probe.")
+        try:
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write("ok")
+        finally:
+            Path(tmp_name).unlink(missing_ok=True)
+    except OSError as e:
+        raise TracebenchError(
+            f"state dir {directory} is not writable: {e}"
+        ) from e
+
+
+def _mined_case_ids(
+    store: SnapshotStore, suite_name: str, version_id: str
+) -> set[str]:
+    """Case ids this suite ever mined, walked down the version chain.
+
+    Each version's promotions record only the cases promoted in THAT
+    version, so a case mined in v1 and carried unchanged into v2 has no
+    promotion record in v2 — the set must be collected from every version
+    on the chain. This is what scopes retirement: only a case the mine
+    once produced can retire when its trace leaves the corpus. A
+    hand-seeded base case has no promotion record anywhere on the chain
+    and is therefore never retired. A broken chain fails closed.
+    """
+    mined: set[str] = set()
+    current: str | None = version_id
+    seen: set[str] = set()
+    while current is not None:
+        if current in seen:
+            raise TracebenchError(
+                f"version chain for {suite_name} loops at {current!r} — "
+                "refusing to scope retirement from a corrupt chain"
+            )
+        seen.add(current)
+        try:
+            version, _suite = store.load(suite_name, current)
+        except SnapshotError as e:
+            raise TracebenchError(
+                f"cannot walk the version chain for {suite_name}: {e}"
+            ) from e
+        for promotion in version.promotions:
+            case_id = promotion.get("promoted_case_id")
+            if isinstance(case_id, str):
+                mined.add(case_id)
+        current = version.prev_version_id
+    return mined
 
 
 def _derive_next_version_id(prev_version_id: str | None) -> str:
     """Next version id when the caller passes none: ``"1"`` for a first
     run, otherwise the previous numeric id + 1. A non-numeric previous id
-    fails closed — the runner must never guess how a human versions."""
+    fails closed — the runner must never guess how a human versions.
+    ``int()`` is attempted directly (``str.isdigit`` accepts unicode
+    digits such as "²" that ``int()`` refuses, so it cannot be the test)."""
     if prev_version_id is None:
         return "1"
-    if not prev_version_id.isdigit():
+    try:
+        number = int(prev_version_id)
+    except ValueError:
         raise TracebenchError(
             "cannot auto-derive the next version id from non-numeric "
             f"previous version {prev_version_id!r} — pass --version"
+        ) from None
+    if number < 0:
+        raise TracebenchError(
+            "cannot auto-derive the next version id from negative "
+            f"previous version {prev_version_id!r} — pass --version"
         )
-    return str(int(prev_version_id) + 1)
+    return str(number + 1)
 
 
 def run_scheduled(
@@ -1477,6 +1622,7 @@ def run_scheduled(
     prior_consecutive_failures: int | None = None,
     mined_at: str | None = None,
     state_dir: str | Path | None = None,
+    corpus_kind: str = "unknown",
 ) -> ScheduledRunResult:
     """One scheduled regression run: mine -> publish (when the benchmark
     changed) -> gate against the frozen version -> dispatch actions ->
@@ -1496,18 +1642,34 @@ def run_scheduled(
     ``prior_consecutive_failures`` override the state; with no state dir
     and no explicit values the run behaves exactly as before (previous
     version None, streak 0). A changed case (same id, new content) is
-    published as an update and a case whose trace left the corpus is
-    retired from the new version — except when the mine yields no cases
-    at all, which never retires anything (an unreadable corpus must not
-    wipe the benchmark). An empty ``version_id`` auto-derives the next
-    id from the chained previous version (``"1"`` first run).
+    published as an update and a mined case whose trace left the corpus
+    is retired from the new version — except when the mine yields no
+    cases at all, which never retires anything (an unreadable corpus
+    must not wipe the benchmark). Cases the mine never produced (a
+    hand-seeded base suite) are carried forward untouched: only cases
+    with mining provenance retire. An empty ``version_id`` auto-derives
+    the next id from the chained previous version (``"1"`` first run).
+
+    The drift gate: before the candidate is scored, the newly mined
+    oracle is compared with the previous frozen version. A case whose
+    content changed since last week is drift, and drift fails the run
+    (gate + investigation, counting toward the rollback streak) even
+    when the candidate passes the new version — the benchmark moved
+    under the candidate, so last week's certification no longer
+    applies. The new version still publishes; an unchanged corpus
+    clears the flag the next week. This is what makes the scheduled
+    run a regression instead of a smoke test: with a static corpus it
+    passes, correctly, but a corpus change fails it with no operator
+    in the loop.
     """
     parsed_cadence = parse_cadence(cadence)
     stamp = _parse_instant(mined_at or _utcnow_iso(), "run_scheduled.mined_at")
     state = (
         _load_run_state(state_dir, suite_name) if state_dir is not None else None
     )
-    effective_prev = (
+    if state_dir is not None:
+        _check_state_dir_writable(state_dir)
+    effective_prev: str | None = (
         prev_version_id
         if prev_version_id is not None
         else (state["prev_version_id"] if state is not None else None)
@@ -1529,6 +1691,7 @@ def run_scheduled(
         mined_at=stamp.isoformat(),
         corpus_digest=load.digest,
         skipped_records=load.skipped,
+        corpus_kind=corpus_kind,
     )
     manifest = build_manifest(
         report.cases,
@@ -1537,6 +1700,7 @@ def run_scheduled(
         cadence=parsed_cadence,
         created_at=stamp.isoformat(),
         last_mined_at=stamp.isoformat(),
+        corpus_kind=corpus_kind,
     )
 
     store_obj = SnapshotStore(store)
@@ -1554,8 +1718,16 @@ def run_scheduled(
         prev_created = _parse_instant(
             _prev_version.created_at, "previous version created_at"
         )
+        # Staleness is judged by the benchmark's own recorded cadence, not
+        # the flag this run happened to pass: the same version must not
+        # flip stale/not-stale with the caller's flag.
+        prev_cadence = (
+            parse_cadence(_prev_version.meta.cadence)
+            if _prev_version.meta.cadence
+            else parsed_cadence
+        )
         previous_stale = (stamp - prev_created) > timedelta(
-            days=CADENCE_DAYS[parsed_cadence]
+            days=CADENCE_DAYS[prev_cadence]
         )
     else:
         _prev_version = None
@@ -1576,7 +1748,17 @@ def run_scheduled(
             if m.case.id in prev_by_id
             and _case_content(prev_by_id[m.case.id]) != _case_content(m.case)
         ]
-        retired_ids = [c.id for c in base_suite.cases if c.id not in mined_ids]
+        # Retire only cases with mining provenance (ever promoted on the
+        # version chain): a hand-seeded base case has no trace to leave
+        # the corpus, so "not in the current mine" must never delete it.
+        # _prev_version is only set when effective_prev is set.
+        assert effective_prev is not None
+        ever_mined = _mined_case_ids(store_obj, suite_name, effective_prev)
+        retired_ids = [
+            c.id
+            for c in base_suite.cases
+            if c.id not in mined_ids and c.id in ever_mined
+        ]
 
     if new_mined or updated or retired_ids:
         updated_by_id = {m.case.id: m for m in updated}
@@ -1682,16 +1864,40 @@ def run_scheduled(
             "call order diverged from frozen case order; refusing to score"
         )
 
+    # Drift gate: the newly mined oracle against the previous frozen
+    # version. An updated case means the benchmark moved since last week,
+    # so the previous certification no longer applies — the run fails even
+    # when the candidate passes the new version. The drifted ids are the
+    # updated ids: same detection, same meaning.
+    drifted_ids = [m.case.id for m in updated]
+    drift_reasons = tuple(
+        f"benchmark drift: case {cid} changed since version "
+        f"{effective_prev} — re-verify the candidate against the new version"
+        for cid in drifted_ids
+    )
+    if drifted_ids:
+        regressed = tuple(
+            dict.fromkeys([*comparison.regressed_cases, *drifted_ids])
+        )
+        effective_comparison = replace(
+            comparison,
+            verdict="GATE_FAIL",
+            regressed_cases=regressed,
+            reasons=(*comparison.reasons, *drift_reasons),
+        )
+    else:
+        effective_comparison = comparison
+
     benchmark_id = f"{suite_name}/{effective_version}"
     actions = dispatch_actions(
-        comparison,
+        effective_comparison,
         benchmark_id=benchmark_id,
         run_id=effective_version,
         prior_consecutive_failures=effective_prior,
         recorded_at=stamp.isoformat(),
     )
     consecutive = (
-        effective_prior + 1 if comparison.verdict == "GATE_FAIL" else 0
+        effective_prior + 1 if effective_comparison.verdict == "GATE_FAIL" else 0
     )
 
     out_path = Path(out_dir)
@@ -1701,7 +1907,7 @@ def run_scheduled(
     manifest_path = out_path / "manifest.json"
     result = ScheduledRunResult(
         version_id=effective_version,
-        verdict=comparison.verdict,
+        verdict=effective_comparison.verdict,
         published_new_version=published,
         mined_cases=len(report.cases),
         new_cases=len(new_mined),
@@ -1711,6 +1917,8 @@ def run_scheduled(
         retired_case_ids=tuple(retired_ids),
         previous_stale=previous_stale,
         version_ignored=version_ignored,
+        drift_detected=bool(drifted_ids),
+        drifted_case_ids=tuple(drifted_ids),
         manifest=manifest,
         actions=actions,
         consecutive_failures=consecutive,
@@ -1720,16 +1928,21 @@ def run_scheduled(
     )
     report_doc = result.to_dict()
     report_doc["comparison"] = {
-        "suite_name": comparison.suite_name,
-        "version_id": comparison.version_id,
-        "digest": comparison.digest,
-        "candidate_agent": comparison.candidate_agent,
-        "seed": comparison.seed,
-        "baseline_pass_rate": comparison.baseline_pass_rate,
-        "candidate_pass_rate": comparison.candidate_pass_rate,
-        "regressed_cases": list(comparison.regressed_cases),
-        "reasons": list(comparison.reasons),
+        "suite_name": effective_comparison.suite_name,
+        "version_id": effective_comparison.version_id,
+        "digest": effective_comparison.digest,
+        "candidate_agent": effective_comparison.candidate_agent,
+        "seed": effective_comparison.seed,
+        "baseline_pass_rate": effective_comparison.baseline_pass_rate,
+        "candidate_pass_rate": effective_comparison.candidate_pass_rate,
+        "regressed_cases": list(effective_comparison.regressed_cases),
+        "reasons": list(effective_comparison.reasons),
         "missing_candidate_outputs": missing_ids,
+    }
+    report_doc["drift"] = {
+        "detected": bool(drifted_ids),
+        "drifted_case_ids": list(drifted_ids),
+        "reasons": list(drift_reasons),
     }
     report_doc["mine"] = report.to_dict()
     report_path.write_text(_canonical_json(report_doc), encoding="utf-8")

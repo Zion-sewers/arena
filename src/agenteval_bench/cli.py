@@ -1346,6 +1346,7 @@ def cmd_tracebench(args: list[str]) -> int:
         print("                                --cadence <daily|weekly|monthly> --out <dir>")
         print("                                [--candidate-name <name>] [--seed 42]")
         print("                                [--prior-failures 0] [--state-dir <dir>]")
+        print("                                [--corpus-kind sample|production|unknown]")
         print("       --state-dir closes the loop across runs: it supplies --prev,")
         print("       the failure streak, and the next --version from the previous")
         print("       run's state.json, so versions chain and rollback is reachable")
@@ -1372,6 +1373,7 @@ def _tracebench_mine(args: list[str]) -> int:
     args, owner = _flag(args, "--owner")
     args, cadence = _flag(args, "--cadence", "weekly")
     args, out = _flag(args, "--out")
+    args, corpus_kind = _flag(args, "--corpus-kind", "unknown")
     if args:
         print(f"Error: unknown argument(s): {' '.join(args)}", file=sys.stderr)
         return 1
@@ -1388,6 +1390,7 @@ def _tracebench_mine(args: list[str]) -> int:
             cadence=cadence or "weekly",
             corpus_digest=load.digest,
             skipped_records=load.skipped,
+            corpus_kind=corpus_kind or "unknown",
         )
         manifest = build_manifest(
             report.cases,
@@ -1396,6 +1399,7 @@ def _tracebench_mine(args: list[str]) -> int:
             cadence=cadence or "weekly",
             created_at=report.mined_at,
             last_mined_at=report.mined_at,
+            corpus_kind=corpus_kind or "unknown",
         )
     except (TracebenchError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -1439,6 +1443,7 @@ def _tracebench_regress(args: list[str]) -> int:
     args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
     args, prior_s = _flag(args, "--prior-failures")
     args, state_dir = _flag(args, "--state-dir")
+    args, corpus_kind = _flag(args, "--corpus-kind", "unknown")
     if args:
         print(f"Error: unknown argument(s): {' '.join(args)}", file=sys.stderr)
         return 1
@@ -1491,14 +1496,19 @@ def _tracebench_regress(args: list[str]) -> int:
             candidate_name=cand_name or "candidate",
             prior_consecutive_failures=prior_failures,
             state_dir=state_dir,
+            corpus_kind=corpus_kind or "unknown",
         )
-    except (TracebenchError, ValueError) as e:
+    except (TracebenchError, ValueError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     print(f"Tracebench regression: {suite}/{result.version_id} "
           f"(mined {result.mined_cases}, new {result.new_cases}, "
           f"updated {result.updated_cases}, retired {result.retired_cases})")
     print(f"verdict: {result.verdict}")
+    if result.drift_detected:
+        print(f"benchmark drift: {', '.join(result.drifted_case_ids)} — "
+              "the benchmark moved since the previous version; "
+              "last week's certification no longer applies")
     if result.previous_stale is not None:
         print(f"previous version stale: {result.previous_stale}")
     if result.version_ignored:

@@ -15,11 +15,20 @@ and no --version (auto-derived from the chained state):
 5. week 2 degraded -> GATE_FAIL, streak 2, gate + investigation;
 6. week 3 degraded -> GATE_FAIL, streak 3, rollback appears.
 
+Then the drift gate: the corpus changes under the benchmark, so the
+scheduled run must fail even though the candidate is the oracle:
+
+7. oracle candidate, unchanged corpus -> GATE_PASS, version 1;
+8. one oracle changed in the corpus -> GATE_FAIL (drift), version 2
+   published with the updated case, gate + investigation;
+9. same changed corpus again -> GATE_PASS, flag self-cleared.
+
 Run: ``PYTHONPATH=src python -m agenteval_bench.tracebench_demo``.
 """
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -138,8 +147,98 @@ def main() -> int:
         assert weeks[1] == "gate, investigation"
         assert weeks[2] == "gate, investigation, rollback"
 
+    # Drift gate: one oracle changes in the corpus, so the benchmark
+    # moves under the candidate. The oracle candidate still passes the
+    # new version — but the run must fail on drift alone.
+    with tempfile.TemporaryDirectory(prefix="tracebench-demo-drift-") as tmp:
+        store = Path(tmp) / "store"
+        state_dir = Path(tmp) / "state"
+        changed_lines = []
+        for line in corpus.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record["trace_id"] == "t-001":
+                record["expected_output"] = "escalated with the docs link (fixed)"
+            changed_lines.append(json.dumps(record))
+        changed_corpus = Path(tmp) / "changed.jsonl"
+        changed_corpus.write_text(
+            "\n".join(changed_lines) + "\n", encoding="utf-8"
+        )
+        changed_load = load_corpus(changed_corpus)
+        changed_report = mine_traces(
+            changed_load.records,
+            owner=OWNER,
+            cadence="weekly",
+            mined_at=MINED_AT,
+        )
+        changed_oracle = {
+            c.case.id: c.expected_output for c in changed_report.cases
+        }
+
+        drift_first = run_scheduled(
+            corpus=corpus,
+            store=store,
+            suite_name="bench",
+            version_id="",
+            prev_version_id=None,
+            candidate_outputs=oracle,
+            owner=OWNER,
+            cadence="weekly",
+            out_dir=Path(tmp) / "drift1",
+            mined_at=MINED_AT,
+            state_dir=state_dir,
+        )
+        assert drift_first.verdict == "GATE_PASS", drift_first.verdict
+
+        drift_second = run_scheduled(
+            corpus=changed_corpus,
+            store=store,
+            suite_name="bench",
+            version_id="",
+            prev_version_id=None,
+            candidate_outputs=changed_oracle,
+            owner=OWNER,
+            cadence="weekly",
+            out_dir=Path(tmp) / "drift2",
+            mined_at=MINED_AT,
+            state_dir=state_dir,
+        )
+        assert drift_second.verdict == "GATE_FAIL", drift_second.verdict
+        assert drift_second.drift_detected is True
+        assert drift_second.drifted_case_ids == (
+            "mined:repeated_tool_calls:t-001",
+        )
+        assert drift_second.version_id == "2"
+        assert [a.action for a in drift_second.actions] == [
+            "gate",
+            "investigation",
+        ]
+        print(f"drift week (oracle changed): {drift_second.verdict}, "
+              f"drifted {drift_second.drifted_case_ids[0]}, "
+              f"actions: {', '.join(a.action for a in drift_second.actions)}")
+
+        drift_third = run_scheduled(
+            corpus=changed_corpus,
+            store=store,
+            suite_name="bench",
+            version_id="",
+            prev_version_id=None,
+            candidate_outputs=changed_oracle,
+            owner=OWNER,
+            cadence="weekly",
+            out_dir=Path(tmp) / "drift3",
+            mined_at=MINED_AT,
+            state_dir=state_dir,
+        )
+        assert drift_third.verdict == "GATE_PASS", drift_third.verdict
+        assert drift_third.drift_detected is False
+        print(f"drift week + 1 (unchanged corpus): {drift_third.verdict}, "
+              "drift flag self-cleared")
+
     print("demo: mine -> publish -> gate -> rollback, all contracts held")
     print("demo: closed loop — three weeks, state-chained, rollback on week 3")
+    print("demo: drift gate — oracle change fails the run, clears next week")
     return 0
 
 

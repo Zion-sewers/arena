@@ -62,14 +62,18 @@ src/agenteval_bench/
   replay.py       # Deterministic seeded replay logs (bit-exact re-runs)
   tiered.py       # Tiered eval pipeline (gate -> smoke -> expanded -> nightly)
   tracebench.py   # Trace-mined benchmarks: mine traces -> living benchmark
-                  #   (owner + cadence per benchmark) -> scheduled regression
-                  #   runner with gate/rollback/investigation actions; the
-                  #   loop is closed across runs via --state-dir (previous
-                  #   version + failure streak chained, changed oracles
-                  #   published as updates, vanished patterns retired)
+                  #   (owner + cadence per benchmark, corpus_kind on every
+                  #   artifact) -> scheduled regression runner with
+                  #   gate/rollback/investigation actions; the loop is closed
+                  #   across runs via --state-dir (previous version +
+                  #   failure streak chained, changed oracles published as
+                  #   updates, mined cases retired, base cases carried
+                  #   forward) and the drift gate fails the run when the
+                  #   benchmark moves under the candidate
   tracebench_demo.py  # Demo: mine the sample corpus, regress oracle +
                   #   degraded candidates (gate -> investigation -> rollback),
-                  #   then the closed loop: three state-chained weeks
+                  #   then the closed loop (three state-chained weeks) and
+                  #   the drift gate (oracle change fails, clears next week)
   cli.py          # CLI entry point (run --suite --ci --threshold; decide --suite --policy)
 tests/            # pytest suite (engine + CLI gateway)
 examples/         # Golden replay suites (YAML)
