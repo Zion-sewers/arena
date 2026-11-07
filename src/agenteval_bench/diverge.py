@@ -1,9 +1,12 @@
 """Anti-mode-collapse: /diverge with 5 candidates + p_conventional (arena#47).
 
-A generation step that forces diverse candidates before selection on
-high-stakes choices. Mode collapse is when a generator returns the same
-answer five times in different words and the selector then "chooses"
-between paraphrases: the choice was already made by the mode.
+A checking step that refuses paraphrase sets before selection on
+high-stakes choices. There is no live generation transport: candidates
+are recorded outputs supplied by the caller, and /diverge checks them,
+it does not generate diverse candidates. Mode collapse is when a
+generator returns the same answer five times in different words and
+the selector then "chooses" between paraphrases: the choice was
+already made by the mode.
 
 Rules (from the issue's acceptance criteria, executable form):
 * candidates are scored for token-level diversity (near-duplicate
@@ -19,25 +22,38 @@ Rules (from the issue's acceptance criteria, executable form):
   replaces the content words passes, and that limit is named in
   docs/DIVERGE.md rather than hidden;
 * the selection records why the conventional answer won or lost — the
-  Selection record carries both scores, the runner-up score, the
-  margin (winner over runner-up), a closed outcome and a reason built
-  from the measured facts; ties break toward the candidate with the
-  LOWEST mean pairwise similarity (least like the others), then the
-  lowest index. Every record validates its own invariants in
-  ``__post_init__`` (a forged margin or outcome is refused at
-  construction), and every report, check and selection carries the
-  fingerprint of the candidate set it was computed from — a report
-  from a different set is refused, never silently mixed in;
+  Selection record carries both scores, the full score vector (so a
+  non-argmax winner is refused at construction), the runner-up score,
+  the margin (winner over runner-up), a closed outcome and a reason
+  built from the measured facts; ties break toward the candidate with
+  the LOWEST mean pairwise similarity (least like the others), then
+  the lowest index — and when the conventional candidate ties at the
+  top and wins the tie-break, the outcome is ``tie``, not a win on
+  score, and the reason names the tie-break. Every record validates
+  its own invariants in ``__post_init__`` (a forged margin or outcome
+  is refused at construction), and every report, check and selection
+  carries the fingerprint of the candidate set it was computed from —
+  a report from a different set is refused, never silently mixed in.
+  The boundary is stated plainly: a hand-built record that is
+  internally consistent under the canonical policy is
+  indistinguishable from a pipeline-built one, and the tie-break
+  choice among tied top scorers is trusted rather than re-derived —
+  the record does not carry the per-candidate means the tie-break
+  reads;
 * single-sample generation is NOT sufficient for high-stakes choices —
   building a high-stakes set with fewer than ``n_candidates`` raises
   typed ``SingleSampleError``, a high-stakes policy must ask for
   exactly 5, and the high-stakes gate itself refuses any selection
   whose set covers anything other than 5 candidates, whose set was
-  not diverse, or whose declared ``p_conventional`` was overconfident
-  against the measured share of the conventional answer's own cluster.
-  The gate enforces the count from the selection record, so the
+  not diverse, whose declared ``p_conventional`` was overconfident
+  against the measured share of the conventional answer's own cluster,
+  or whose diversity and p-check grades were computed under anything
+  but the canonical policy (max_pair_similarity 0.80, p tolerance
+  0.15): a lax policy cannot launder a set through the gate. The gate
+  enforces the count and the policy from the selection record, so the
   obligation survives build time: a short set built low-stakes
-  cannot decide high stakes.
+  cannot decide high stakes, and neither can a set graded under lax
+  thresholds.
 
 Measurement discipline (same as validity.py / calibration.py): the
 declared ``p_conventional`` is a CLAIM checked against measurement.
@@ -237,7 +253,13 @@ class Candidate:
 
 @dataclass(frozen=True)
 class DivergePolicy:
-    """Policy for what counts as a genuine divergence.
+    """Policy for what counts as a divergence at token level.
+
+    A set is diverse when no pair of candidates is a near-verbatim
+    paraphrase under the thresholds below — token-level divergence,
+    not semantic divergence. Only the canonical defaults (0.80 pair
+    cap, 0.15 p tolerance) may decide high stakes: a set graded under
+    a laxer policy selects fine, but the high-stakes gate refuses it.
 
     ``n_candidates`` is the exact candidate count /diverge requires
     (5: the issue's number). ``max_pair_similarity`` is the highest
@@ -372,7 +394,12 @@ def build_diverge_set(
     policy that shrinks the count to 2 would let a 2-candidate set
     through the high-stakes gate, which defeats the issue's "5
     candidates" contract on the library seam, not just the CLI.
+    ``stakes`` is a closed pair: anything else is a caller error,
+    never silently treated as low — a typo'd "High" on a short list
+    must not skip the typed SingleSampleError.
     """
+    if stakes not in ("low", "high"):
+        raise ValueError(f"diverge stakes must be 'low' or 'high', got {stakes!r}")
     policy = policy or default_diverge_policy()
     if stakes == "high" and policy.n_candidates != 5:
         raise SingleSampleError(
@@ -410,9 +437,14 @@ def hard_tokens(text: str) -> frozenset[str]:
 
 
 def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
-    """Jaccard similarity; two empty sets are identical (1.0)."""
+    """Jaccard similarity; two empty sets share no content (0.0).
+
+    Scoring two content-free candidates as identical (1.0) convicted
+    glue-only pairs ("the" vs "a") as near-duplicates: they share no
+    content words, so there is nothing to be a paraphrase of.
+    """
     if not left and not right:
-        return 1.0
+        return 0.0
     if not left or not right:
         return 0.0
     return len(left & right) / len(left | right)
@@ -433,8 +465,23 @@ def pair_similarity(left: str, right: str) -> float:
     set. Shared numbers are paraphrase evidence only in bulk; with
     fewer hard tokens, content Jaccard alone decides. Residual,
     disclosed in docs/DIVERGE.md: two genuinely different answers
-    that share three numbers can still be refused.
+    that share three numbers can still be refused. Two candidates
+    with no content tokens at all share no content (similarity 0.0
+    for that signal), so distinct glue-only pairs are not convicted
+    as paraphrases — but texts identical after normalization are
+    always maximally similar (1.0): five copies of one answer are a
+    paraphrase set, even when the answer is only glue, and case,
+    surrounding whitespace or punctuation do not make a copy a
+    different answer.
     """
+    # Identity is judged after the function's own normalization
+    # (lowercased word tokens): "the" vs "The", "the " and "the."
+    # are the same answer five times, not five diverse candidates.
+    # Distinct content-free texts ("the" vs "a") stay 0.0: their
+    # token sequences differ, so they fall through to the Jaccard
+    # signals below.
+    if _TOKEN_RE.findall(left.lower()) == _TOKEN_RE.findall(right.lower()):
+        return 1.0
     content = _jaccard(content_tokens(left), content_tokens(right))
     left_hard = hard_tokens(left)
     right_hard = hard_tokens(right)
@@ -483,7 +530,12 @@ class DiversityReport:
     tie is decided by measured distinctiveness, not by index alone.
     ``set_fingerprint`` binds this report to the candidate set it was
     computed from; a pipeline step refuses a report whose fingerprint
-    does not match the set in hand.
+    does not match the set in hand. ``max_pair_similarity`` is the
+    threshold the pairs were graded under, carried so a pipeline step
+    can refuse a report graded under a different policy than the
+    set's: the fingerprint already binds the policy, but the threshold
+    is what the grades mean, so it must be visible on the record
+    rather than hidden inside the fingerprint.
 
     The record validates its own invariants — and it recomputes
     them from the pairs, it does not trust the flags: the
@@ -604,6 +656,7 @@ class DiversityReport:
             "min_pair_diversity": self.min_pair_diversity,
             "mean_pair_diversity": self.mean_pair_diversity,
             "diverse": self.diverse,
+            "diversity_scope": "token-level near-duplicate",
             "clusters": [list(c) for c in self.clusters],
             "modal_cluster": list(self.modal_cluster),
             "modal_share": self.modal_share,
@@ -703,7 +756,14 @@ class PConventionalCheck:
     a forged interval, or a conventional share above the modal share
     is refused at construction.
     ``set_fingerprint`` binds this check to the candidate set it was
-    computed from.
+    computed from. ``conventional_index`` and ``clusters`` are carried
+    so the modal share and the conventional share are re-derivable
+    from the record alone: the modal share must equal the largest
+    cluster over n, the conventional share the conventional
+    candidate's own cluster over n, and ``conventional_in_modal``
+    must say whether that cluster is the modal one. A check with a
+    forged modal share or a flipped conventional_in_modal is refused
+    at construction.
     """
 
     declared_p: float
@@ -716,6 +776,8 @@ class PConventionalCheck:
     set_fingerprint: str
     tolerance: float
     n: int
+    conventional_index: int
+    clusters: tuple[tuple[int, ...], ...]
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -733,6 +795,44 @@ class PConventionalCheck:
             raise ValueError(
                 "conventional share cannot exceed the modal share: "
                 f"{self.conventional_share} > {self.modal_share}"
+            )
+        if not 0 <= self.conventional_index < self.n:
+            raise ValueError(
+                f"conventional_index {self.conventional_index} out of range for n={self.n}"
+            )
+        # The modal share, the conventional share and the in-modal
+        # flag are re-derived from the carried clusters, never
+        # trusted: a forged modal share or a flipped
+        # conventional_in_modal is refused here.
+        flat = sorted(i for cluster in self.clusters for i in cluster)
+        if flat != list(range(self.n)):
+            raise ValueError("clusters must partition the candidate indices")
+        if any(len(c) == 0 for c in self.clusters):
+            raise ValueError("clusters must not contain an empty cluster")
+        modal = max(self.clusters, key=lambda c: (len(c), -min(c)))
+        if abs(self.modal_share - len(modal) / self.n) > 1e-12:
+            raise ValueError(
+                "modal_share must equal len(modal_cluster) / n: "
+                f"{self.modal_share} != {len(modal)}/{self.n}"
+            )
+        conventional_cluster = next(
+            cluster for cluster in self.clusters if self.conventional_index in cluster
+        )
+        if abs(self.conventional_share - len(conventional_cluster) / self.n) > 1e-12:
+            raise ValueError(
+                "conventional_share must equal the conventional "
+                "candidate's cluster share: "
+                f"{self.conventional_share} != {len(conventional_cluster)}/{self.n}"
+            )
+        if self.conventional_in_modal != (set(conventional_cluster) == set(modal)):
+            raise ValueError(
+                "conventional_in_modal contradicts the clusters: the "
+                "conventional candidate is "
+                + (
+                    "in the modal cluster"
+                    if set(conventional_cluster) == set(modal)
+                    else "outside the modal cluster"
+                )
             )
         low, high = self.agreement_interval
         if not 0.0 <= low <= high <= 1.0:
@@ -785,6 +885,8 @@ class PConventionalCheck:
             "set_fingerprint": self.set_fingerprint,
             "tolerance": self.tolerance,
             "n": self.n,
+            "conventional_index": self.conventional_index,
+            "clusters": [list(c) for c in self.clusters],
         }
 
 
@@ -800,6 +902,20 @@ def check_p_conventional(diverge_set: DivergeSet, report: DiversityReport) -> PC
         raise ValueError(
             "diversity report is for a different candidate set: "
             "refusing to check p_conventional against a foreign measurement"
+        )
+    if report.n != len(diverge_set.candidates):
+        raise ValueError(
+            "diversity report covers n="
+            f"{report.n} candidates but the set has "
+            f"{len(diverge_set.candidates)}: refusing to check "
+            "p_conventional against a measurement on a different-sized set"
+        )
+    if report.max_pair_similarity != diverge_set.policy.max_pair_similarity:
+        raise ValueError(
+            "diversity report was graded under a different "
+            f"max_pair_similarity ({report.max_pair_similarity:.2f}) than "
+            f"the set's policy ({diverge_set.policy.max_pair_similarity:.2f}): "
+            "the clusters the p-check reads depend on that threshold"
         )
     conventional_cluster = next(
         cluster for cluster in report.clusters if diverge_set.conventional_index in cluster
@@ -856,6 +972,8 @@ def check_p_conventional(diverge_set: DivergeSet, report: DiversityReport) -> PC
         set_fingerprint=diverge_set.fingerprint(),
         tolerance=tolerance,
         n=report.n,
+        conventional_index=diverge_set.conventional_index,
+        clusters=report.clusters,
     )
 
 
@@ -892,8 +1010,8 @@ class Selection:
     """The recorded selection: why the conventional answer won or lost.
 
     ``margin`` is the winner's score minus the RUNNER-UP score (the
-    highest score among the non-winners; 0.0 on an exact tie at the
-    top), the same quantity in every outcome — never the
+    highest score among the non-winners; 0.0 on a tie at the top,
+    within the 1e-12 tie tolerance), the same quantity in every outcome — never the
     winner-minus-conventional gap, which is 0.0 exactly when the
     conventional answer wins and means something else when it loses.
     ``runner_up_score`` is carried so the margin is checkable from the
@@ -902,7 +1020,20 @@ class Selection:
     sits in the modal cluster, the diversity grade and the p-check
     verdict. The record IS the explanation — there is no prose beside
     it to drift from it. ``set_fingerprint`` binds the selection to
-    the candidate set it was computed from.
+    the candidate set it was computed from. ``scores`` is the full
+    score vector, carried so the winner is checkable as the argmax
+    from the record alone: a winner that does not hold the top score,
+    or a runner-up that is not the best of the rest, is refused.
+    ``max_pair_similarity`` and ``p_conventional_tolerance`` are the
+    thresholds the diversity and p-check grades were computed under,
+    carried so the high-stakes gate can pin the canonical policy
+    (0.80 / 0.15) instead of trusting grades computed under thresholds
+    it cannot see. The boundary, stated plainly: a hand-built record
+    that is internally consistent under the canonical policy is
+    indistinguishable from a pipeline-built one, and the tie-break
+    choice among tied top scorers is trusted rather than re-derived —
+    the record does not carry the per-candidate means the tie-break
+    reads.
 
     The record validates its own invariants: a hand-built Selection
     whose margin is not winner-minus-runner-up, whose outcome does
@@ -923,6 +1054,9 @@ class Selection:
     diverse: bool
     p_verdict: PCheckVerdict
     set_fingerprint: str
+    scores: tuple[float, ...]
+    max_pair_similarity: float
+    p_conventional_tolerance: float
 
     def __post_init__(self) -> None:
         if self.n < 2:
@@ -941,7 +1075,13 @@ class Selection:
         ):
             if not math.isfinite(value):
                 raise ValueError(f"{name} must be finite, got {value!r}")
-        if self.runner_up_score > self.winner_score:
+        # Tolerance-consistent with the tie-break in select(): a winner
+        # picked by the tie-break can sit up to 1e-12 below the strict
+        # top score, so the best of the rest can exceed the winner by
+        # at most the tie tolerance (scores 0.0 vs 7.6e-268 are tied
+        # at 1e-12). Anything beyond the tolerance is still a forged
+        # non-argmax winner and is refused.
+        if self.runner_up_score > self.winner_score + 1e-12:
             raise ValueError(
                 "runner-up score cannot exceed the winner score: "
                 f"{self.runner_up_score} > {self.winner_score}"
@@ -956,9 +1096,60 @@ class Selection:
                 "margin must equal winner_score - runner_up_score: "
                 f"{self.margin} != {self.winner_score} - {self.runner_up_score}"
             )
+        if len(self.scores) != self.n:
+            raise ValueError(
+                f"selection needs one score per candidate, got {len(self.scores)} for n={self.n}"
+            )
+        if not all(math.isfinite(s) for s in self.scores):
+            raise ValueError("selection scores must all be finite")
+        if not 0.0 < self.max_pair_similarity < 1.0:
+            raise ValueError(
+                f"max_pair_similarity must be in (0, 1), got {self.max_pair_similarity}"
+            )
+        if not 0.0 <= self.p_conventional_tolerance < 1.0:
+            raise ValueError(
+                f"p_conventional_tolerance must be in [0, 1), got {self.p_conventional_tolerance}"
+            )
+        # The winner must be an argmax of the carried scores, and the
+        # runner-up the best of the rest: a forged non-argmax winner
+        # (a winner_index whose own score is not the top score) is
+        # refused here, not at the gate.
+        if abs(self.winner_score - max(self.scores)) > 1e-12:
+            raise ValueError(
+                "winner_score is not the top score: "
+                f"{self.winner_score} != max(scores) {max(self.scores)}"
+            )
+        if abs(self.scores[self.winner_index] - self.winner_score) > 1e-12:
+            raise ValueError(
+                f"winner_index {self.winner_index} holds score "
+                f"{self.scores[self.winner_index]}, not the winner_score {self.winner_score}"
+            )
+        expected_runner_up = max(s for i, s in enumerate(self.scores) if i != self.winner_index)
+        if abs(self.runner_up_score - expected_runner_up) > 1e-12:
+            raise ValueError(
+                "runner_up_score must be the best score among the "
+                f"non-winners: {self.runner_up_score} != {expected_runner_up}"
+            )
+        # The conventional score is read by the outcome derivation
+        # below, so it must match the carried vector like every other
+        # score: a forged conventional_score that flips lost to tie
+        # (or tie to lost) is refused here.
+        if abs(self.conventional_score - self.scores[self.conventional_index]) > 1e-12:
+            raise ValueError(
+                "conventional_score must equal scores[conventional_index]: "
+                f"{self.conventional_score} != {self.scores[self.conventional_index]}"
+            )
+        tied_at_top = any(
+            abs(s - self.winner_score) <= 1e-12
+            for i, s in enumerate(self.scores)
+            if i != self.winner_index
+        )
         if self.winner_index == self.conventional_index:
-            expected: SelectionOutcome = "conventional_won"
-        elif self.conventional_score == self.winner_score:
+            # A conventional candidate that ties at the top and wins
+            # the tie-break did not win on score: the outcome is a
+            # tie, and the reason must name the tie-break.
+            expected: SelectionOutcome = "tie" if tied_at_top else "conventional_won"
+        elif abs(self.conventional_score - self.winner_score) <= 1e-12:
             expected = "tie"
         else:
             expected = "conventional_lost"
@@ -989,8 +1180,12 @@ class Selection:
             "margin": self.margin,
             "reason": self.reason,
             "diverse": self.diverse,
+            "diversity_scope": "token-level near-duplicate",
             "p_verdict": self.p_verdict,
             "set_fingerprint": self.set_fingerprint,
+            "scores": list(self.scores),
+            "max_pair_similarity": self.max_pair_similarity,
+            "p_conventional_tolerance": self.p_conventional_tolerance,
         }
 
 
@@ -1012,7 +1207,11 @@ def select(
     paraphrase set never silently selects. A report or p-check from a
     different candidate set raises ValueError: the fingerprint must
     match, so mismatched measurements never compose into a
-    valid-looking selection.
+    valid-looking selection. The same holds inside one set: the p-check
+    must agree with the report on the clusters, the declared p and the
+    conventional index — a check graded on foreign clusters (or a
+    foreign declared p) composes into a verdict on a measurement the
+    report does not make, so it is refused here, not at the gate.
     """
     if report.set_fingerprint != diverge_set.fingerprint():
         raise ValueError(
@@ -1024,6 +1223,62 @@ def select(
             "p_conventional check is for a different candidate set: "
             "refusing to select from a foreign measurement"
         )
+    if report.max_pair_similarity != diverge_set.policy.max_pair_similarity:
+        raise ValueError(
+            "diversity report was graded under a different "
+            f"max_pair_similarity ({report.max_pair_similarity:.2f}) than "
+            f"the set's policy ({diverge_set.policy.max_pair_similarity:.2f}): "
+            "refusing to select from a mismatched measurement"
+        )
+    if p_check.tolerance != diverge_set.policy.p_conventional_tolerance:
+        raise ValueError(
+            "p_conventional check was graded under a different "
+            f"tolerance ({p_check.tolerance:.2f}) than the set's policy "
+            f"({diverge_set.policy.p_conventional_tolerance:.2f}): "
+            "refusing to select from a mismatched measurement"
+        )
+    # The p-check must agree with the report it composes with: same
+    # clusters (the shares the verdict was computed on), same n, same
+    # conventional index, same declared p. A check graded on foreign
+    # clusters would lend its verdict to a measurement the report
+    # does not make.
+    if tuple(p_check.clusters) != tuple(report.clusters):
+        raise ValueError(
+            "p_conventional check clusters do not match the diversity "
+            "report clusters: refusing to select from contradictory "
+            "measurements"
+        )
+    if report.n != len(diverge_set.candidates):
+        raise ValueError(
+            "diversity report covers n="
+            f"{report.n} candidates but the set has "
+            f"{len(diverge_set.candidates)}: refusing to select from "
+            "a measurement on a different-sized set"
+        )
+    if p_check.n != len(diverge_set.candidates):
+        raise ValueError(
+            "p_conventional check covers n="
+            f"{p_check.n} candidates but the set has "
+            f"{len(diverge_set.candidates)}: refusing to select from "
+            "a measurement on a different-sized set"
+        )
+    if p_check.n != report.n:
+        raise ValueError(
+            f"p_conventional check covers n={p_check.n} but the "
+            f"diversity report covers n={report.n}"
+        )
+    if p_check.conventional_index != diverge_set.conventional_index:
+        raise ValueError(
+            "p_conventional check names a different conventional "
+            f"candidate ({p_check.conventional_index}) than the set "
+            f"({diverge_set.conventional_index})"
+        )
+    if abs(p_check.declared_p - diverge_set.p_conventional) > 1e-12:
+        raise ValueError(
+            "p_conventional check declared_p "
+            f"({p_check.declared_p:.2f}) does not match the set's "
+            f"p_conventional ({diverge_set.p_conventional:.2f})"
+        )
     if not report.diverse:
         dupes = [p for p in report.pairs if p.near_duplicate]
         raise NotDiverseError(
@@ -1033,14 +1288,26 @@ def select(
         )
     scores = [c.score for c in diverge_set.candidates]
     top = max(scores)
-    tied = [i for i, s in enumerate(scores) if s == top]
+    # Ties are float-tolerance ties (1e-12), the same tolerance the
+    # Selection record uses: an exact-equality test here would let a
+    # within-tolerance winner_score rebuild the false "won on score"
+    # record the tie outcome exists to prevent.
+    tied = [i for i, s in enumerate(scores) if abs(s - top) <= 1e-12]
     winner = min(tied, key=lambda i: (report.mean_similarity_by_candidate[i], i))
     conv = diverge_set.conventional_index
     conv_score = scores[conv]
     runner_up = max(s for i, s in enumerate(scores) if i != winner)
     margin = scores[winner] - runner_up
+    if -1e-12 <= margin < 0:
+        # A tie-break winner can sit up to 1e-12 below the strict top
+        # score, so the margin can go microscopically negative; the
+        # record quotes it as +0.00, never -0.00.
+        margin = 0.0
     if winner == conv:
-        outcome: SelectionOutcome = "conventional_won"
+        # A tie at the top won by the conventional candidate on the
+        # tie-break is a tie, not a win on score: the margin is 0.00
+        # and the reason must say the tie-break decided it.
+        outcome: SelectionOutcome = "tie" if len(tied) > 1 else "conventional_won"
     elif conv in tied:
         outcome = "tie"
     else:
@@ -1078,7 +1345,8 @@ def select(
         modal_note = "no two candidates converge (all clusters are singletons)"
     reason = (
         f"{why}. {modal_note}. "
-        f"Set diverse (min pairwise diversity "
+        f"Set diverse at token level (no near-verbatim pair, not "
+        f"semantic diversity; min pairwise diversity "
         f"{report.min_pair_diversity:.2f}). p_conventional "
         f"{p_check.declared_p:.2f} is {p_check.verdict} against the "
         f"measured share of the conventional answer's cluster "
@@ -1097,22 +1365,39 @@ def select(
         diverse=report.diverse,
         p_verdict=p_check.verdict,
         set_fingerprint=diverge_set.fingerprint(),
+        scores=tuple(scores),
+        max_pair_similarity=diverge_set.policy.max_pair_similarity,
+        p_conventional_tolerance=diverge_set.policy.p_conventional_tolerance,
     )
 
 
 def may_decide_high_stakes(selection: Selection) -> bool:
-    """True only for a diverse 5-candidate selection with a non-overconfident p.
+    """True only for a token-level-diverse 5-candidate selection with a non-overconfident p.
 
-    A high-stakes decision needs all three: exactly 5 candidates (the
+    A high-stakes decision needs all four: exactly 5 candidates (the
     issue's number), token-level diversity (the choice was between
-    answers that are not near-verbatim paraphrases), and a
-    p_conventional the measurement does not refute. The count is
-    enforced HERE, from the selection record — not at build time,
-    where a caller could pass low stakes and decide high stakes
-    anyway. A 2-candidate selection, however diverse and however
-    confident, may not decide.
+    answers that are not near-verbatim paraphrases), a
+    p_conventional the measurement does not refute, and the canonical
+    policy (max_pair_similarity 0.80, p tolerance 0.15). The count and
+    the policy are enforced HERE, from the selection record — not at
+    build time, where a caller could pass low stakes and decide high
+    stakes anyway, and not on trust, where a caller could grade a set
+    under a lax policy (a near-verbatim pair at 0.83 passes a 0.99
+    cap; a declared p of 0.95 passes a 0.99 tolerance) and hand the
+    gate a "diverse" / "consistent" record it cannot distinguish from
+    a default-policy one. The selection carries the thresholds it was
+    graded under, so the gate reads them instead of trusting them. A
+    2-candidate selection, however diverse and however confident, may
+    not decide — and neither may a lax-policy one.
     """
-    return selection.n == 5 and selection.diverse and selection.p_verdict != "overconfident"
+    canonical = default_diverge_policy()
+    return (
+        selection.n == 5
+        and selection.diverse
+        and selection.p_verdict != "overconfident"
+        and selection.max_pair_similarity == canonical.max_pair_similarity
+        and selection.p_conventional_tolerance == canonical.p_conventional_tolerance
+    )
 
 
 def require_high_stakes_decision(selection: Selection) -> Selection:
@@ -1125,6 +1410,17 @@ def require_high_stakes_decision(selection: Selection) -> Selection:
     if not may_decide_high_stakes(selection):
         if selection.n != 5:
             why = f"selection covers {selection.n} candidates, high-stakes /diverge needs exactly 5"
+        elif (
+            selection.max_pair_similarity != default_diverge_policy().max_pair_similarity
+            or selection.p_conventional_tolerance
+            != default_diverge_policy().p_conventional_tolerance
+        ):
+            why = (
+                "selection was graded under a non-canonical policy "
+                f"(max_pair_similarity {selection.max_pair_similarity:.2f}, "
+                f"p tolerance {selection.p_conventional_tolerance:.2f}); "
+                "high-stakes /diverge needs the canonical 0.80 / 0.15 thresholds"
+            )
         elif not selection.diverse:
             why = "selection is not diverse"
         else:

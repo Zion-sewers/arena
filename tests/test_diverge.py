@@ -18,12 +18,15 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from agenteval_bench.cli import cmd_diverge
+from agenteval_bench.decision import wilson_interval
 from agenteval_bench.diverge import (
     Candidate,
     DivergePolicy,
     DivergeSet,
     HighStakesRefused,
     NotDiverseError,
+    PairSimilarity,
+    PConventionalCheck,
     Selection,
     SingleSampleError,
     Stakes,
@@ -89,6 +92,29 @@ class TestSimilarity:
         # Two texts sharing only glue words ("use the ... of the ...")
         # must not read as similar: content is what counts.
         assert pair_similarity("Use the thing of the day", "Use the stuff of the week") < 0.5
+
+    def test_content_free_candidates_share_no_content(self) -> None:
+        # Two DISTINCT candidates with no content tokens at all
+        # ("the" vs "a") share nothing to be a paraphrase of:
+        # empty-vs-empty content similarity is 0.0, so a distinct
+        # glue-only pair is not convicted as a near-duplicate and a
+        # set of distinct glue-only candidates stays diverse. But
+        # identical texts are always maximally similar: five copies
+        # of "the" are one answer five times, and the set is refused.
+        assert pair_similarity("the", "a") == 0.0
+        assert pair_similarity("the", "the") == 1.0
+        candidates = [
+            Candidate("the", 0.70),
+            Candidate("a", 0.90),
+            Candidate("of the", 0.60),
+            Candidate("to be", 0.80),
+            Candidate("in on", 0.75),
+        ]
+        diverge_set = build_diverge_set(PROMPT, candidates, 0, 0.50, stakes="low")
+        assert analyze_diversity(diverge_set).diverse
+        identical = [Candidate("the", s) for s in (0.70, 0.90, 0.60, 0.80, 0.75)]
+        identical_set = build_diverge_set(PROMPT, identical, 0, 0.50, stakes="low")
+        assert not analyze_diversity(identical_set).diverse
 
     def test_near_verbatim_rewrite_is_convicted_by_content_tokens(self) -> None:
         # A one-word change in a long text keeps content Jaccard at
@@ -341,6 +367,55 @@ class TestPConventional:
         with pytest.raises(ValueError, match="cannot exceed the modal share"):
             replace(check, conventional_share=0.99)
 
+    def test_a_forged_modal_share_is_refused(self) -> None:
+        # The modal share is re-derived from the carried clusters: a
+        # check claiming 0.99 while the modal cluster holds 1 of 5
+        # is refused at construction.
+        _, diverge_set = _set(p=0.60)
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        with pytest.raises(ValueError, match="modal_share must equal"):
+            replace(check, modal_share=0.99)
+
+    def test_a_forged_conventional_in_modal_is_refused(self) -> None:
+        # The minority fixture converges on a rival (0, 1, 2) while
+        # the conventional candidate (4) stands alone: flipping the
+        # flag to True contradicts the carried clusters.
+        candidates = [
+            Candidate(HASHMAP_LONG, 0.70),
+            Candidate(HASHMAP_LONG_PARA, 0.90),
+            Candidate(HASHMAP_LONG_ID, 0.60),
+            Candidate(TRIE, 0.80),
+            Candidate(CACHE, 0.75),
+        ]
+        diverge_set = build_diverge_set(PROMPT, candidates, 4, 0.95, stakes="high")
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        assert not check.conventional_in_modal
+        with pytest.raises(ValueError, match="conventional_in_modal contradicts"):
+            replace(check, conventional_in_modal=True)
+
+    def test_p_check_refuses_a_report_graded_under_another_policy(self) -> None:
+        # The clusters the p-check reads depend on the diversity
+        # threshold, so a report graded under a 0.99 cap must not
+        # validate a claim about a default-policy set.
+        _, diverge_set = _set(p=0.60)
+        report = analyze_diversity(diverge_set)
+        lax_report = replace(report, max_pair_similarity=0.99)
+        with pytest.raises(ValueError, match="different max_pair_similarity"):
+            check_p_conventional(diverge_set, lax_report)
+
+    def test_p_check_refuses_an_empty_cluster(self) -> None:
+        # A trailing empty cluster passes the partition check (it
+        # contributes no indices) but must not reach the modal
+        # derivation as an IndexError: every invariant violation in
+        # this module is a ValueError.
+        _, diverge_set = _set(p=0.60)
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        with pytest.raises(ValueError, match="must not contain an empty cluster"):
+            replace(check, clusters=check.clusters + ((),))
+
     def test_conventional_outside_the_modal_cluster_is_a_finding(self) -> None:
         candidates = [
             Candidate(HASHMAP_LONG, 0.70),
@@ -400,6 +475,32 @@ class TestSelection:
         assert tied.winner_index == 2
         assert "tie-break" in tied.reason
 
+    def test_conventional_winning_a_top_score_tie_is_recorded_as_a_tie(self) -> None:
+        # The conventional candidate ties at the top (0.90) and wins
+        # the tie-break (lowest mean similarity): the margin is 0.00,
+        # so recording "conventional_won ... won on score" would be
+        # a false explanation. The outcome is "tie" and the reason
+        # names the tie-break.
+        candidates = [
+            Candidate(HASHMAP, 0.90),
+            Candidate(SORT, 0.90),
+            Candidate(SCAN, 0.60),
+            Candidate(TRIE, 0.80),
+            Candidate(CACHE, 0.75),
+        ]
+        diverge_set = build_diverge_set(PROMPT, candidates, 0, 0.60, stakes="low")
+        report = analyze_diversity(diverge_set)
+        won_tie = select(diverge_set, report, check_p_conventional(diverge_set, report))
+        assert won_tie.outcome == "tie"
+        assert won_tie.winner_index == 0
+        assert won_tie.margin == 0.0
+        assert "tie-break" in won_tie.reason
+        assert "won on score" not in won_tie.reason
+        # The corrected outcome is enforced, not just produced: the
+        # record refuses to be built as a win on score.
+        with pytest.raises(ValueError, match="contradicts the scores"):
+            replace(won_tie, outcome="conventional_won")
+
     def test_a_forged_selection_is_refused_at_construction(self) -> None:
         selection = _diverse_selection()
         # A margin that is not winner-minus-runner-up.
@@ -412,6 +513,70 @@ class TestSelection:
         # An index outside the candidate set.
         with pytest.raises(ValueError, match="out of range"):
             replace(selection, winner_index=5)
+
+    def test_a_forged_conventional_score_is_refused_at_construction(self) -> None:
+        # The outcome derivation reads conventional_score, so it must
+        # match the carried vector like every other score: forging it
+        # flips a lost conventional answer to tied, and a tied one to
+        # lost, without touching the winner or the scores.
+        selection = _diverse_selection()
+        assert selection.outcome == "conventional_lost"
+        with pytest.raises(ValueError, match="conventional_score must equal"):
+            replace(selection, conventional_score=0.90, outcome="tie")
+        with pytest.raises(ValueError, match="conventional_score must equal"):
+            replace(selection, conventional_score=0.10)
+        candidates = [
+            Candidate(HASHMAP, 0.70),
+            Candidate(SORT, 0.90),
+            Candidate(TRIE, 0.90),
+            Candidate(CACHE, 0.75),
+            Candidate(SCAN, 0.60),
+        ]
+        diverge_set = build_diverge_set(PROMPT, candidates, 1, 0.40, stakes="low")
+        report = analyze_diversity(diverge_set)
+        tied = select(diverge_set, report, check_p_conventional(diverge_set, report))
+        assert tied.outcome == "tie"
+        with pytest.raises(ValueError, match="conventional_score must equal"):
+            replace(tied, conventional_score=0.60, outcome="conventional_lost")
+
+    def test_a_within_tolerance_forged_winner_score_cannot_flip_a_tie(self) -> None:
+        # The tie test is tolerance-consistent with the margin check:
+        # a winner_score 5e-13 above a tied top score must not rebuild
+        # the false "conventional_won ... won on score" record.
+        candidates = [
+            Candidate(HASHMAP, 0.90),
+            Candidate(SORT, 0.90),
+            Candidate(SCAN, 0.60),
+            Candidate(TRIE, 0.80),
+            Candidate(CACHE, 0.75),
+        ]
+        diverge_set = build_diverge_set(PROMPT, candidates, 0, 0.60, stakes="low")
+        report = analyze_diversity(diverge_set)
+        won_tie = select(diverge_set, report, check_p_conventional(diverge_set, report))
+        assert won_tie.outcome == "tie"
+        with pytest.raises(ValueError, match="contradicts the scores"):
+            replace(
+                won_tie,
+                outcome="conventional_won",
+                winner_score=0.9000000000005,
+                runner_up_score=0.90,
+                margin=0.0000000000005,
+            )
+
+    def test_a_non_argmax_selection_is_refused_at_construction(self) -> None:
+        # The selection carries the full score vector, so a winner
+        # that does not hold the top score is refused: the forgery
+        # (winner_index 2, whose own score is 0.60, recorded with
+        # the top score's 0.90) cannot be built, and neither can a
+        # record whose scores contradict its winner or runner-up.
+        selection = _diverse_selection()
+        assert selection.winner_index == 1
+        with pytest.raises(ValueError, match="not the winner_score"):
+            replace(selection, winner_index=2)
+        with pytest.raises(ValueError, match="not the top score"):
+            replace(selection, scores=(0.70, 0.60, 0.60, 0.80, 0.75))
+        with pytest.raises(ValueError, match="runner_up_score must be the best"):
+            replace(selection, scores=(0.70, 0.90, 0.60, 0.85, 0.75))
 
     def test_a_rounded_literal_margin_is_accepted(self) -> None:
         # Float subtraction is not exact (0.95 - 0.90 is
@@ -495,6 +660,296 @@ class TestHighStakesGate:
         with pytest.raises(HighStakesRefused, match="exactly 5"):
             require_high_stakes_decision(selection)
 
+    def test_gate_refuses_a_lax_policy_selection(self) -> None:
+        # A paraphrase pair passes a 0.99 cap, so the set is diverse
+        # and the p-check is consistent — but the grades were computed
+        # under a lax policy the gate cannot trust, so the selection
+        # may not decide high stakes.
+        candidates = [
+            Candidate(HASHMAP_LONG, 0.70),
+            Candidate(HASHMAP_LONG_PARA, 0.90),
+            Candidate(SORT, 0.60),
+            Candidate(TRIE, 0.80),
+            Candidate(CACHE, 0.75),
+        ]
+        lax = build_diverge_set(
+            PROMPT,
+            candidates,
+            0,
+            0.20,
+            stakes="low",
+            policy=DivergePolicy(max_pair_similarity=0.99),
+        )
+        report = analyze_diversity(lax)
+        assert report.diverse
+        selection = select(lax, report, check_p_conventional(lax, report))
+        assert not may_decide_high_stakes(selection)
+        with pytest.raises(HighStakesRefused, match="non-canonical"):
+            require_high_stakes_decision(selection)
+
+    def test_select_refuses_a_report_graded_under_another_policy(self) -> None:
+        # A diverse report re-graded under a 0.99 threshold is still
+        # internally consistent (no near-duplicate flags to contradict),
+        # but it must not compose into a selection from a default-policy set.
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        lax_report = replace(report, max_pair_similarity=0.99)
+        with pytest.raises(ValueError, match="different max_pair_similarity"):
+            select(diverge_set, lax_report, check_p_conventional(diverge_set, report))
+
+    def test_select_refuses_a_p_check_graded_under_another_tolerance(self) -> None:
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        lax_check = replace(check, tolerance=0.99)
+        with pytest.raises(ValueError, match="different tolerance"):
+            select(diverge_set, report, lax_check)
+
+    def test_select_refuses_a_p_check_on_foreign_clusters(self) -> None:
+        # A check graded on all-in-one clusters (share 1.00, p 0.95
+        # consistent) must not compose with an all-singleton report
+        # (real share 0.20): the verdict would vouch for a measurement
+        # the report does not make.
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        low, high = wilson_interval(5, 5)
+        forged = replace(
+            check,
+            clusters=((0, 1, 2, 3, 4),),
+            modal_share=1.0,
+            conventional_share=1.0,
+            agreement_interval=(low, high),
+            declared_p=0.95,
+        )
+        assert forged.verdict == "consistent"
+        with pytest.raises(ValueError, match="clusters do not match"):
+            select(diverge_set, report, forged)
+
+    def test_select_refuses_a_p_check_with_a_foreign_declared_p(self) -> None:
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        forged = replace(check, declared_p=0.50)
+        assert forged.verdict == "consistent"
+        with pytest.raises(ValueError, match="does not match the set's"):
+            select(diverge_set, report, forged)
+
+    def test_select_refuses_a_p_check_naming_another_conventional_candidate(self) -> None:
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        forged = replace(check, conventional_index=1, conventional_in_modal=False)
+        with pytest.raises(ValueError, match="different conventional candidate"):
+            select(diverge_set, report, forged)
+
+    def test_check_p_conventional_refuses_a_report_covering_another_n(self) -> None:
+        # Round-5 H2/NEW1: a pair of hand-built records that agree
+        # with each other on n=3 (fingerprint copied) must not
+        # validate a claim about a 5-candidate set — the Wilson
+        # interval at n=3 does not refute what n=5 refutes.
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        forged = replace(
+            report,
+            n=3,
+            pairs=tuple(
+                PairSimilarity(i, j, 0.0, False) for i in range(3) for j in range(i + 1, 3)
+            ),
+            clusters=((0,), (1,), (2,)),
+            modal_cluster=(0,),
+            modal_share=1 / 3,
+            min_pair_diversity=1.0,
+            mean_pair_diversity=1.0,
+            mean_similarity_by_candidate=(0.0, 0.0, 0.0),
+        )
+        with pytest.raises(ValueError, match="different-sized set"):
+            check_p_conventional(diverge_set, forged)
+
+    def test_check_p_conventional_refuses_a_short_report_with_a_high_conventional_index(
+        self,
+    ) -> None:
+        # Same n gap, second-order effect: with conventional_index 4
+        # and a forged n=3 report, the pre-fix code raised raw
+        # StopIteration from the cluster lookup; the n check converts
+        # it into a clean ValueError.
+        _, diverge_set = _set(conventional=4)
+        report = analyze_diversity(diverge_set)
+        forged = replace(
+            report,
+            n=3,
+            pairs=tuple(
+                PairSimilarity(i, j, 0.0, False) for i in range(3) for j in range(i + 1, 3)
+            ),
+            clusters=((0,), (1,), (2,)),
+            modal_cluster=(0,),
+            modal_share=1 / 3,
+            min_pair_diversity=1.0,
+            mean_pair_diversity=1.0,
+            mean_similarity_by_candidate=(0.0, 0.0, 0.0),
+        )
+        with pytest.raises(ValueError, match="different-sized set"):
+            check_p_conventional(diverge_set, forged)
+
+    def test_check_p_conventional_refuses_the_p_laundering_n4_report(self) -> None:
+        # Round-5 H2 replay: declared p 0.80 is overconfident on the
+        # true n=5 measurement (Wilson(1,5) upper 0.6245 + 0.15) but
+        # consistent on a forged n=4 one (Wilson(1,4) upper 0.6994 +
+        # 0.15) — the check must refuse the foreign-n report before
+        # any verdict is computed.
+        _, diverge_set = _set(p=0.80)
+        assert check_p_conventional(diverge_set, analyze_diversity(diverge_set)).verdict == (
+            "overconfident"
+        )
+        report = analyze_diversity(diverge_set)
+        forged = replace(
+            report,
+            n=4,
+            pairs=tuple(
+                PairSimilarity(i, j, 0.0, False) for i in range(4) for j in range(i + 1, 4)
+            ),
+            clusters=((0,), (1,), (2,), (3,)),
+            modal_cluster=(0,),
+            modal_share=0.25,
+            min_pair_diversity=1.0,
+            mean_pair_diversity=1.0,
+            mean_similarity_by_candidate=(0.0, 0.0, 0.0, 0.0),
+        )
+        with pytest.raises(ValueError, match="different-sized set"):
+            check_p_conventional(diverge_set, forged)
+
+    def test_select_refuses_a_report_covering_another_n(self) -> None:
+        # The n=3 forgery, end to end through select(): the forged
+        # check is built to match the forged report (same n, same
+        # clusters, same declared p), so only the n-vs-set check can
+        # refuse the composition.
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        forged_report = replace(
+            report,
+            n=3,
+            pairs=tuple(
+                PairSimilarity(i, j, 0.0, False) for i in range(3) for j in range(i + 1, 3)
+            ),
+            clusters=((0,), (1,), (2,)),
+            modal_cluster=(0,),
+            modal_share=1 / 3,
+            min_pair_diversity=1.0,
+            mean_pair_diversity=1.0,
+            mean_similarity_by_candidate=(0.0, 0.0, 0.0),
+        )
+        low, high = wilson_interval(1, 3)
+        forged_check = PConventionalCheck(
+            declared_p=0.60,
+            modal_share=1 / 3,
+            conventional_share=1 / 3,
+            agreement_interval=(low, high),
+            verdict="consistent",
+            conventional_in_modal=True,
+            notes=(),
+            set_fingerprint=diverge_set.fingerprint(),
+            tolerance=0.15,
+            n=3,
+            conventional_index=0,
+            clusters=((0,), (1,), (2,)),
+        )
+        with pytest.raises(ValueError, match="different-sized set"):
+            select(diverge_set, forged_report, forged_check)
+
+    def test_select_refuses_a_report_covering_seven_candidates(self) -> None:
+        # The n=7 variant of the same forgery: 21 zero-similarity
+        # pairs, 7 singleton clusters, matching forged check.
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        forged_report = replace(
+            report,
+            n=7,
+            pairs=tuple(
+                PairSimilarity(i, j, 0.0, False) for i in range(7) for j in range(i + 1, 7)
+            ),
+            clusters=((0,), (1,), (2,), (3,), (4,), (5,), (6,)),
+            modal_cluster=(0,),
+            modal_share=1 / 7,
+            min_pair_diversity=1.0,
+            mean_pair_diversity=1.0,
+            mean_similarity_by_candidate=(0.0,) * 7,
+        )
+        low, high = wilson_interval(1, 7)
+        forged_check = PConventionalCheck(
+            declared_p=0.60,
+            modal_share=1 / 7,
+            conventional_share=1 / 7,
+            agreement_interval=(low, high),
+            verdict="consistent",
+            conventional_in_modal=True,
+            notes=(),
+            set_fingerprint=diverge_set.fingerprint(),
+            tolerance=0.15,
+            n=7,
+            conventional_index=0,
+            clusters=((0,), (1,), (2,), (3,), (4,), (5,), (6,)),
+        )
+        with pytest.raises(ValueError, match="different-sized set"):
+            select(diverge_set, forged_report, forged_check)
+
+    def test_select_refuses_a_short_report_when_the_top_score_is_outside_it(self) -> None:
+        # Second-order effect: with the top score at index 4 and a
+        # forged n=3 report, the pre-fix tie-break raised raw
+        # IndexError from the per-candidate means lookup; the n check
+        # converts it into a clean ValueError.
+        _, diverge_set = _set(scores=(0.70, 0.60, 0.50, 0.40, 0.90))
+        report = analyze_diversity(diverge_set)
+        forged_report = replace(
+            report,
+            n=3,
+            pairs=tuple(
+                PairSimilarity(i, j, 0.0, False) for i in range(3) for j in range(i + 1, 3)
+            ),
+            clusters=((0,), (1,), (2,)),
+            modal_cluster=(0,),
+            modal_share=1 / 3,
+            min_pair_diversity=1.0,
+            mean_pair_diversity=1.0,
+            mean_similarity_by_candidate=(0.0, 0.0, 0.0),
+        )
+        low, high = wilson_interval(1, 3)
+        forged_check = PConventionalCheck(
+            declared_p=0.60,
+            modal_share=1 / 3,
+            conventional_share=1 / 3,
+            agreement_interval=(low, high),
+            verdict="consistent",
+            conventional_in_modal=True,
+            notes=(),
+            set_fingerprint=diverge_set.fingerprint(),
+            tolerance=0.15,
+            n=3,
+            conventional_index=0,
+            clusters=((0,), (1,), (2,)),
+        )
+        with pytest.raises(ValueError, match="different-sized set"):
+            select(diverge_set, forged_report, forged_check)
+
+    def test_gate_refuses_a_tolerance_only_lax_policy_selection(self) -> None:
+        # A declared p of 0.95 is consistent only under a 0.99
+        # tolerance; the gate pins the canonical 0.15, so the
+        # selection may not decide high stakes.
+        candidates, _ = _set()
+        lax = build_diverge_set(
+            PROMPT,
+            candidates,
+            0,
+            0.95,
+            stakes="low",
+            policy=DivergePolicy(p_conventional_tolerance=0.99),
+        )
+        report = analyze_diversity(lax)
+        selection = select(lax, report, check_p_conventional(lax, report))
+        assert selection.p_verdict == "consistent"
+        assert not may_decide_high_stakes(selection)
+        with pytest.raises(HighStakesRefused, match="non-canonical"):
+            require_high_stakes_decision(selection)
+
     def test_short_list_on_low_stakes_is_a_shape_error_not_a_sample_error(self) -> None:
         candidates, _ = _set()
         with pytest.raises(ValueError, match="exactly 5"):
@@ -537,6 +992,19 @@ class TestValidation:
             DivergePolicy(max_pair_similarity=1.0)
         with pytest.raises(ValueError):
             DivergePolicy(p_conventional_tolerance=1.0)
+
+    def test_build_diverge_set_refuses_an_unknown_stakes_value(self) -> None:
+        # The library seam validates stakes like the loader does: an
+        # unknown value is a caller error, never silently low — a
+        # typo'd "High" on a short list must not skip the typed
+        # SingleSampleError.
+        candidates, _ = _set()
+        with pytest.raises(ValueError, match="stakes must be 'low' or 'high'"):
+            build_diverge_set(PROMPT, candidates, 0, 0.50, stakes=cast(Stakes, "critical"))
+        with pytest.raises(ValueError, match="stakes must be 'low' or 'high'"):
+            build_diverge_set(PROMPT, candidates, 0, 0.50, stakes=cast(Stakes, "High"))
+        with pytest.raises(SingleSampleError, match="not sufficient"):
+            build_diverge_set(PROMPT, candidates[:1], 0, 0.50, stakes="high")
 
 
 class TestLoader:
@@ -938,4 +1406,56 @@ def test_selection_is_deterministic(scores: list[float]) -> None:
     first = select(diverge_set, report, check_p_conventional(diverge_set, report))
     second = select(diverge_set, report, check_p_conventional(diverge_set, report))
     assert first == second
-    assert first.winner_score == max(scores)
+    # Tolerance, not exact equality: the tie-break in select() treats
+    # scores within 1e-12 of the top as tied, so a tie-break winner
+    # can sit up to 1e-12 below the strict max (e.g. 0.0 vs 7.6e-268).
+    assert abs(first.winner_score - max(scores)) <= 1e-12
+
+
+def test_selection_survives_sub_tolerance_score_spread() -> None:
+    # Regression: hypothesis found scores [0, 0, 0, 7.6e-268, 0] —
+    # all tied at 1e-12 — where the tie-break winner (score 0.0) had
+    # a runner-up (7.6e-268) strictly above it, and Selection refused
+    # its own pipeline-built record with ValueError.
+    scores = [0.0, 0.0, 0.0, 7.591571019389426e-268, 0.0]
+    candidates = [Candidate(t, s) for t, s in zip([HASHMAP, SORT, SCAN, TRIE, CACHE], scores)]
+    diverge_set = build_diverge_set(PROMPT, candidates, 0, 0.5, stakes="low")
+    report = analyze_diversity(diverge_set)
+    first = select(diverge_set, report, check_p_conventional(diverge_set, report))
+    second = select(diverge_set, report, check_p_conventional(diverge_set, report))
+    assert first == second
+    assert first.outcome == "tie"
+    assert abs(first.winner_score - max(scores)) <= 1e-12
+    assert first.runner_up_score - first.winner_score <= 1e-12
+    assert first.margin >= -1e-12
+    # The margin is clamped at 0.0: a tie-break winner sitting up to
+    # 1e-12 below the strict top must not print as "-0.00".
+    assert first.margin == 0.0
+    assert "-0.00" not in first.reason
+
+
+def test_glue_variants_differing_only_by_case_or_punctuation_are_identical() -> None:
+    # Round-5 NEW2 sub-case: identity is judged after normalization
+    # (lowercased word tokens), so case / whitespace / punctuation
+    # variants of one glue answer are the same answer, not five
+    # diverse candidates — while distinct glue stays 0.0.
+    assert pair_similarity("the", "The") == 1.0
+    assert pair_similarity("the", "THE") == 1.0
+    assert pair_similarity("the", "the ") == 1.0
+    assert pair_similarity("the", "the.") == 1.0
+    assert pair_similarity("the", "the!") == 1.0
+    assert pair_similarity("the", "a") == 0.0
+    variants = build_diverge_set(
+        PROMPT,
+        [
+            Candidate(t, s)
+            for t, s in zip(("the", "The", "THE", "the ", "the."), (0.70, 0.90, 0.60, 0.80, 0.75))
+        ],
+        0,
+        0.5,
+        stakes="low",
+    )
+    report = analyze_diversity(variants)
+    assert not report.diverse
+    with pytest.raises(NotDiverseError):
+        select(variants, report, check_p_conventional(variants, report))

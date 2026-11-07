@@ -11,8 +11,12 @@ A generator asked once returns the mode: the single most likely answer.
 Asked five times at temperature it often returns the same answer five
 times in different words, and a selector then "chooses" between
 paraphrases. The choice was already made by the mode; the selection
-step is theater. /diverge makes the divergence real before any
-selection happens.
+step is theater. /diverge makes the *check* real before any
+selection happens: it refuses paraphrase sets and overconfident p
+claims. The divergence itself still depends entirely on the caller
+supplying token-level-diverse candidates — a caller supplying five
+paraphrases gets a refusal, not token-level-diverse candidates.
+Generation is not implemented; candidates are caller-supplied.
 
 ## The protocol
 
@@ -21,7 +25,7 @@ record 5 candidates (with caller-supplied scores)
   -> score the set for token-level diversity (near-duplicate detection, not semantic diversity)
   -> check declared p_conventional against the measured share of the conventional answer's cluster
   -> select on score; the record says why the conventional answer won or lost
-  -> high-stakes decisions need a diverse 5-candidate selection with a non-overconfident p
+  -> high-stakes decisions need a token-level-diverse 5-candidate selection, graded under the canonical policy, with a non-overconfident p
 ```
 
 ### 1. Candidates are recorded, never invented
@@ -55,7 +59,13 @@ convict a paraphrase, and averaging would let a reworded text with
 the same numbers slip through on a low content score.
 
 A pair above `max_pair_similarity` (default 0.80) is a near-duplicate.
-The set grade is the **weakest link**: one near-verbatim pair fails
+Texts identical after normalization are always maximally similar
+(1.0): the comparison lowercases and reads the word-token sequence,
+so case, surrounding whitespace and punctuation variants of one
+answer ("the" vs "The", "the ", "the.") are the same answer, not five
+diverse candidates. Distinct candidates with no content tokens share
+no content (similarity 0.0), so they are not convicted as paraphrases
+of each other. The set grade is the **weakest link**: one near-verbatim pair fails
 the whole set, and `select()` refuses it with typed
 `NotDiverseError`. Near-duplicate edges form clusters; the largest
 cluster is the modal cluster, and its size over n is the **modal
@@ -122,14 +132,28 @@ record validates its own invariants at construction, recomputed from
 the fields it carries: the report re-derives its near-duplicate
 flags, clusters, modal cluster, diversities and per-candidate means
 from the pairs; the p-check re-derives its interval and verdict from
-the conventional share, n and tolerance; the selection re-derives
-its margin and outcome from the scores. A record that satisfies
-every invariant is indistinguishable from a pipeline-built one —
-the validations catch inconsistent records, not a determined forger
-who builds a consistent one — but no gate-relevant field is a bare
-echo anymore: the tie-break means, the p verdict, and the gate's
-count are all either recomputed or enforced (the gate refuses any
-selection covering anything other than 5 candidates).
+the conventional share, n and tolerance, and its modal and
+conventional shares from the clusters it carries; the selection
+re-derives its margin and outcome from the scores it carries, and
+refuses a winner that is not the argmax. Each record carries what its
+own checks need, and `select()` cross-checks the records against each
+other before composing them — fingerprints, thresholds, clusters,
+declared p, conventional index and n — so two measurements that
+contradict each other, or either measurement against the set it
+claims to cover, never compose into a valid-looking selection.
+The gate itself reads only the Selection record: it enforces the
+count (n == 5) and the canonical policy (0.80 / 0.15) from the
+carried fields, and trusts `diverse` and `p_verdict` as echoes of
+the cross-validated records — stamped with the canonical policy, and
+bounded by the determined-forger concession below. The tie-break
+means are carried by the report, not the selection, so the tie-break
+choice among tied top scorers is trusted, not re-derived. Two limits
+remain, stated plainly: a record that satisfies every invariant is
+indistinguishable from a pipeline-built one — the validations catch
+inconsistent records, not a determined forger who builds a consistent
+one under the canonical policy — and the tie-break choice among tied
+top scorers is trusted, not re-derived, since the record does not
+carry the per-candidate means the tie-break reads.
 
 ### 4. Selection records why the conventional answer won or lost
 
@@ -144,7 +168,10 @@ conventional candidate, both scores, the runner-up score, the margin
 (winner over runner-up, the same quantity in every outcome) and a
 reason string built from the measured facts. When no two candidates
 converge, the reason says so instead of naming an arbitrary modal
-cluster as a finding. The record IS the explanation; there is no
+cluster as a finding. When the conventional candidate ties at the
+top and wins the tie-break, the outcome is `tie`, not a win on score
+— the reason names the tie-break, since a margin of +0.00 is not a
+win on score. The record IS the explanation; there is no
 prose beside it to drift from it.
 
 ### 5. Single-sample generation is not sufficient for high stakes
@@ -153,11 +180,14 @@ prose beside it to drift from it.
   candidates raises typed `SingleSampleError`, and a high-stakes
   policy must ask for exactly 5 — a policy that shrinks the count
   would let a 2-candidate set through the gate on the library seam.
-- `may_decide_high_stakes(selection)` is True only for a diverse
-  selection covering exactly 5 candidates with a non-overconfident
-  p; `require_high_stakes_decision` raises typed `HighStakesRefused`
-  otherwise. The gate enforces the count itself from the selection
-  record, so a short set built low-stakes cannot decide high stakes.
+- `may_decide_high_stakes(selection)` is True only for a token-level-diverse
+  selection covering exactly 5 candidates, graded under the canonical
+  policy (max_pair_similarity 0.80, p tolerance 0.15), with a
+  non-overconfident p; `require_high_stakes_decision` raises typed
+  `HighStakesRefused` otherwise. The gate enforces the count and the
+  policy itself from the selection record, so a short set built
+  low-stakes cannot decide high stakes — and neither can a set graded
+  under a laxer policy, which selects fine but is refused at the gate.
   The gate takes ONLY the selection record: a bare candidate, a
   single sample, or a score has no path through it.
 

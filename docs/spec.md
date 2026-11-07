@@ -120,7 +120,7 @@ docs/             # Specifications, archive, roadmap references
 | `AllocationReport`   | Family-decorrelated judge allocation; unreachable judges are holes, never dropped. |
 | `JudgeCalibration`   | Per-bin stated confidence vs measured agreement; only CALIBRATED may gate. |
 | `ShipVerdict`        | OEC + guardrails + trust gates (SRM, A/A, replication); SHIP only when all pass. |
-| `Selection`          | /diverge selection record: winner vs conventional scores, margin, closed outcome, reason from measured facts; only a diverse selection with a non-overconfident p may decide on high stakes. |
+| `Selection`          | /diverge selection record: winner vs conventional scores, margin, closed outcome, reason from measured facts; only a token-level-diverse selection graded under the canonical policy with a non-overconfident p may decide on high stakes. |
 | `cli.main`           | Parse argv, load suite, build replay `agent_fn`, print summary + gate. |
 
 ### 4.3 Data-flow diagram
