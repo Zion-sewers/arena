@@ -23,8 +23,10 @@ every acceptance expectation holds:
 The fixture judges mirror the issue's named source (claude-setup
 tools/review/actors.json): nvidia-nim and openrouter as multi-vendor
 resellers, the VARIES-BY-MODEL reseller, and the measured / declared /
-unreachable reachability legend. Any failure raises, so CI can gate on
-this demo directly.
+unreachable reachability legend. The reachability values in the demo
+registry below are fixture labels, not measurements: no probe runs in
+this demo, and the CLI runs no probe either. Any failure raises, so CI
+can gate on this demo directly.
 """
 
 from __future__ import annotations
@@ -140,6 +142,14 @@ def main() -> int:
         [j.id for j in report.picked] == ["deepseek-nim"],
         "the probe run still picks the reachable judge",
     )
+    _expect(
+        report.picked[0].reachable == "measured",
+        "a probe-True verdict stamps the pick measured, never unreachable",
+    )
+    _expect(
+        any("probe measured reachable" in n for n in report.notes),
+        "the probe override is noted in the report",
+    )
 
     # 5. Thin registry says so.
     thin = allocate(TRAP[:2], want=2)
@@ -189,14 +199,14 @@ def main() -> int:
                 "host": "nvidia-nim",
                 "model_family": "deepseek-r1",
                 "model": "deepseek-ai/DeepSeek-R1",
-                "reachable": "measured",
+                "reachable": "declared",
             },
             {
                 "id": "qwen-ds",
                 "host": "alibaba-dashscope",
                 "model_family": "alibaba-qwen",
                 "model": "qwen3-flash",
-                "reachable": "measured",
+                "reachable": "declared",
             },
             {
                 "id": "codex",

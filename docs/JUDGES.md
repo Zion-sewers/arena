@@ -33,11 +33,17 @@ the code is arena's.
   dropped. Reachability is declared in the registry (`measured` /
   `declared` / `unreachable`), or measured live when the caller supplies a
   `probe`. A probe that returns False makes a hole; a probe that raises
-  makes a hole naming the exception. A probe that returns True revives a
-  declared-unreachable judge.
+  makes a hole naming the exception. A probe that returns True stamps the
+  judge's effective reachability as `measured` in the report, and the
+  override is noted when it differs from the declaration, so a picked
+  judge is never labelled unreachable.
 - A thin allocation (fewer distinct reachable families than `want`) says so
   in `notes` and reports `satisfied: false`. It never silently returns a
   short list as if it were full.
+- The report accounts for every registry judge exactly once — `picked`,
+  `holes`, `rejected`, or `surplus` (reachable judges with distinct
+  families the quota did not need). A same-family rejection and a
+  VARIES-BY-MODEL exclusion are both typed `rejected` entries, not prose.
 - Allocation is deterministic: candidates are ordered by (reachability
   rank, id), so the same registry always allocates the same way.
 
@@ -68,7 +74,11 @@ agenteval-bench judges --registry registry.json --want 2 [--json] [--out report.
 
 Exit 0 = the allocation satisfied the request; exit 2 = thin allocation;
 exit 1 = unusable registry. The report JSON carries `picked`, `families`,
-`holes`, `rejected`, and `notes`.
+`holes`, `rejected`, and `notes`. The CLI runs no probe: reachability in
+its output is as declared in the registry, and the human-readable output
+says so. A registry that claims `"reachable": "measured"` without any
+probe behind it is an unverified claim, not a measurement. A copyable
+example registry ships at `examples/judges-registry.json`.
 
 ## Coverage boundary
 

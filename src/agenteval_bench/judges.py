@@ -20,9 +20,15 @@ not the code):
   never silently dropped;
 * reachability is a declared property of the registry (``measured`` /
   ``declared`` / ``unreachable``), or a live measurement when the caller
-  supplies a ``probe``. The module itself makes no network call: arena has
-  no live judge transport (README: "LLM-as-judge is planned, not
+  supplies a ``probe``. A probe that returns True stamps the judge's
+  effective reachability as ``"measured"`` in the report (and the override
+  is noted when it differs from the declaration), so a picked judge is
+  never labelled unreachable. The module itself makes no network call:
+  arena has no live judge transport (README: "LLM-as-judge is planned, not
   implemented"), so a probe is an injectable callable the caller owns.
+* the report accounts for every registry judge exactly once — picked,
+  holes, rejected, or surplus (reachable judges with distinct families the
+  quota did not need) — so nothing is silently dropped.
 
 Everything is stdlib-only and deterministic: candidates are ordered by
 (reachability rank, id), so the same registry always allocates the same way.
@@ -32,7 +38,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import Literal
 
 #: A family that varies by model is not a family. Pairing on it is the
@@ -40,8 +47,11 @@ from typing import Literal
 UNKNOWN_FAMILY = "VARIES-BY-MODEL"
 
 #: Reachability ranks; unreachable judges are ordered last and REPORTED,
-#: never silently dropped.
-REACH_RANK: dict[str, int] = {"measured": 0, "declared": 1, "unreachable": 2}
+#: never silently dropped. Frozen: the ordering the determinism and
+#: hole-reporting guarantees rest on cannot be redefined by an importer.
+REACH_RANK: Mapping[str, int] = MappingProxyType(
+    {"measured": 0, "declared": 1, "unreachable": 2}
+)
 
 Reachability = Literal["measured", "declared", "unreachable"]
 
@@ -101,14 +111,51 @@ class RejectedJudge:
 
 @dataclass(frozen=True)
 class AllocationReport:
-    """The result of one allocation: picks, holes, rejections, notes."""
+    """The result of one allocation: picks, holes, rejections, notes.
+
+    The report accounts for every registry judge exactly once across
+    ``picked``, ``holes``, ``rejected`` and ``surplus`` — nothing is
+    silently dropped and nothing is double-counted. ``surplus`` holds
+    reachable judges with distinct families the quota did not need.
+    """
 
     want: int
     picked: tuple[Judge, ...] = ()
     families: tuple[str, ...] = ()
     holes: tuple[JudgeHole, ...] = ()
     rejected: tuple[RejectedJudge, ...] = ()
+    surplus: tuple[Judge, ...] = ()
     notes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        picked_families = [j.model_family for j in self.picked]
+        if len(set(picked_families)) != len(picked_families):
+            raise ValueError("picked judges must carry distinct model families")
+        if tuple(picked_families) != self.families:
+            raise ValueError("families must match the picked judges' model families")
+        buckets = {
+            "picked": {j.id for j in self.picked},
+            "holes": {h.judge for h in self.holes},
+            "rejected": {r.judge for r in self.rejected},
+            "surplus": {j.id for j in self.surplus},
+        }
+        seen: dict[str, str] = {}
+        for name, ids in buckets.items():
+            for judge_id in ids:
+                if judge_id in seen:
+                    raise ValueError(
+                        f"judge {judge_id!r} appears in both {seen[judge_id]} and {name}"
+                    )
+                seen[judge_id] = name
+        for rejected in self.rejected:
+            if (
+                rejected.family not in picked_families
+                and rejected.family != UNKNOWN_FAMILY
+            ):
+                raise ValueError(
+                    f"rejected judge {rejected.judge!r} names family "
+                    f"{rejected.family!r} that was not picked"
+                )
 
     @property
     def satisfied(self) -> bool:
@@ -143,6 +190,16 @@ class AllocationReport:
             "rejected": [
                 {"judge": r.judge, "family": r.family, "reason": r.reason} for r in self.rejected
             ],
+            "surplus": [
+                {
+                    "id": j.id,
+                    "host": j.host,
+                    "model_family": j.model_family,
+                    "model": j.model,
+                    "reachable": j.reachable,
+                }
+                for j in self.surplus
+            ],
             "notes": list(self.notes),
         }
 
@@ -159,10 +216,18 @@ def allocate(
     """Pick up to ``want`` judges, no two sharing a model_family.
 
     ``probe``, when supplied, is the authority on reachability: it is
-    called exactly once per judge, and a judge it reports unreachable (or
-    one it raises on) becomes a hole with the reason recorded. Without a
-    probe, the registry's declared reachability rules. Either way an
-    unreachable judge is reported, never dropped.
+    called exactly once per judge, BEFORE family filtering, so a judge
+    that ends up surplus or rejected is probed too. A judge it reports
+    unreachable (or one it raises on) becomes a hole with the reason
+    recorded. A judge it reports reachable has its effective reachability
+    stamped ``"measured"`` in the report, and the override is noted when
+    it differs from the declaration — a picked judge is never labelled
+    unreachable. Candidates are ordered by EFFECTIVE reachability, so a
+    probe-revived judge competes on its measured rank, not its stale
+    declared rank. A probe that returns a non-bool is a programming
+    error and raises ``TypeError`` loudly instead of being read as
+    truthiness. Without a probe, the registry's declared reachability
+    rules. Either way an unreachable judge is reported, never dropped.
     """
     if want < 1:
         raise ValueError(f"want must be >= 1, got {want}")
@@ -176,12 +241,13 @@ def allocate(
             notes=("no judges in the registry; nothing to allocate",),
         )
 
-    # Effective reachability: the probe, when given, overrides the
-    # declaration (a declared-unreachable judge a probe can reach is
+    # Phase 1 — effective reachability: the probe, when given, overrides
+    # the declaration (a declared-unreachable judge a probe can reach is
     # reachable again); a probe failure is a hole, never a crash.
     reachable: list[Judge] = []
     holes: list[JudgeHole] = []
-    for judge in sorted(judges, key=_sort_key):
+    notes: list[str] = []
+    for judge in judges:
         if probe is not None:
             try:
                 alive = probe(judge)
@@ -195,6 +261,11 @@ def allocate(
                     )
                 )
                 continue
+            if not isinstance(alive, bool):
+                raise TypeError(
+                    f"probe for judge {judge.id!r} must return bool, "
+                    f"got {type(alive).__name__}"
+                )
             if not alive:
                 holes.append(
                     JudgeHole(
@@ -205,7 +276,14 @@ def allocate(
                     )
                 )
                 continue
-            reachable.append(judge)
+            if judge.reachable != "measured":
+                notes.append(
+                    f"{judge.id}: probe measured reachable "
+                    f"(declared {judge.reachable})"
+                )
+                reachable.append(replace(judge, reachable="measured"))
+            else:
+                reachable.append(judge)
         elif judge.reachable == "unreachable":
             holes.append(
                 JudgeHole(
@@ -217,21 +295,26 @@ def allocate(
             )
         else:
             reachable.append(judge)
+    holes.sort(key=lambda h: h.judge)
 
-    notes: list[str] = []
     rejected: list[RejectedJudge] = []
+    surplus: list[Judge] = []
     picked: list[Judge] = []
     used_families: set[str] = set()
 
     # An UNKNOWN_FAMILY judge is admissible ONLY as a solitary reviewer.
     # Its family cannot be shown to DIFFER from anything, so it cannot
     # satisfy decorrelation against any partner, in either slot order.
-    known = [j for j in reachable if j.model_family != UNKNOWN_FAMILY]
-    unknown = [j for j in reachable if j.model_family == UNKNOWN_FAMILY]
+    # Phase 2 orders by effective reachability, so the probe's verdict —
+    # not the stale declaration — decides who competes first.
+    known = [
+        j for j in sorted(reachable, key=_sort_key) if j.model_family != UNKNOWN_FAMILY
+    ]
+    unknown = [
+        j for j in sorted(reachable, key=_sort_key) if j.model_family == UNKNOWN_FAMILY
+    ]
 
     for candidate in known:
-        if len(picked) >= want:
-            break
         if candidate.model_family in used_families:
             first = next(p.id for p in picked if p.model_family == candidate.model_family)
             rejected.append(
@@ -242,6 +325,9 @@ def allocate(
                     "host diversity is not decorrelation",
                 )
             )
+            continue
+        if len(picked) >= want:
+            surplus.append(candidate)
             continue
         picked.append(candidate)
         used_families.add(candidate.model_family)
@@ -256,9 +342,28 @@ def allocate(
             "half of a decorrelated pair, because a reseller family cannot "
             "be shown to differ from a partner it may itself be serving."
         )
+        for extra in unknown[1:]:
+            rejected.append(
+                RejectedJudge(
+                    extra.id,
+                    UNKNOWN_FAMILY,
+                    f"same model_family {UNKNOWN_FAMILY!r} as {solo.id!r}; "
+                    "a reseller family cannot be shown to differ from a "
+                    "partner it may itself be serving",
+                )
+            )
     elif unknown:
+        for extra in unknown:
+            rejected.append(
+                RejectedJudge(
+                    extra.id,
+                    UNKNOWN_FAMILY,
+                    f"a {UNKNOWN_FAMILY} family cannot be shown to differ "
+                    "from the judges picked",
+                )
+            )
         notes.append(
-            f"{', '.join(j.id for j in unknown)} excluded from the pair: a "
+            f"{', '.join(j.id for j in unknown)} excluded: a "
             f"{UNKNOWN_FAMILY} family cannot be shown to differ from the "
             "judges picked."
         )
@@ -276,6 +381,7 @@ def allocate(
         families=tuple(j.model_family for j in picked),
         holes=tuple(holes),
         rejected=tuple(rejected),
+        surplus=tuple(surplus),
         notes=tuple(notes),
     )
 
