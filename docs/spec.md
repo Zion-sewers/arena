@@ -66,6 +66,8 @@ src/agenteval_bench/
                   #   (ConfidenceObservation, calibrate, JudgeCalibration;
                   #   per-bin stated confidence vs Wilson lower bound on
                   #   measured agreement; only CALIBRATED may gate)
+                  #   First agenteval_bench -> alt_test import (types only):
+                  #   the bridge reads recorded AltTestItem labels.
   calibration_demo.py # Seeded end-to-end demo of judge calibration
   regression.py   # Production failures -> frozen versions -> release gate
   snapshots.py    # Immutable benchmark snapshots (hash-verified store)
@@ -303,6 +305,6 @@ print(result.summary())
 - [x] CLI `run` with `--ci`/`--threshold` gates CI on pass rate.
 - [x] Golden replay suite passes in this repo's own CI.
 - [x] README accurate and AEO-optimized; spec, roadmap, and repo hygiene mature.
-- [ ] LLM-judge integration with cost bounding — *planned (v0.2)*.
+- [ ] LLM-judge integration with cost bounding — *planned (v0.2)*. When the transport lands, it must call `require_calibrated` before judge scores gate anything (see `docs/CALIBRATION.md`).
 - [ ] `compare` command for run-vs-run regression — *planned (v0.2)*.
 - [ ] `report` generation (markdown + JSON) — *planned (v0.2)*.

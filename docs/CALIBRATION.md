@@ -45,6 +45,26 @@ annotations.
   for a measurement. `require_calibrated` refuses anything else with
   a typed `UncalibratedJudgeError` naming the judge, its status, and
   every failed condition.
+- The grade record cannot be forged: `JudgeCalibration` enforces
+  status↔evidence consistency at construction (CALIBRATED needs
+  non-empty all-passing bins, no reasons, a measured ECE, and
+  `n_total` equal to the bins' total; MISCALIBRATED needs reasons and
+  a failed bin; UNCALIBRATED carries no bins and no ECE). The record
+  also carries the grading policy it was computed under, so a
+  CALIBRATED record minted under a lax custom policy is
+  distinguishable from a default-policy one.
+
+## Defaults
+
+`min_total` 50 aligns with alt-test's `min_items` floor; 10 bins are
+deciles, the standard calibration grid; `min_bin_n` 5 is the smallest
+bin for which a Wilson interval carries any meaning at all; tolerance
+0.10 is one bin width, i.e. a judge may overstate by at most one decile
+before it fails. All four are policy choices, documented as such —
+the same framing as `validity.py`'s agreement bar — and the CLI
+overrides them with `--min-total` / `--bins` / `--min-bin-n` /
+`--tolerance`. A team that grades under a different policy records
+that policy in the grade itself (`JudgeCalibration.policy`).
 
 ## Observations format
 
@@ -70,10 +90,22 @@ measured agreement. A copyable example ships at
 ## Measured agreement: the alt-test bridge
 
 `observations_from_alt_test(items, confidences, judge)` derives
-observations from recorded alt-test labels: agreement is the judge's
-label vs the majority annotator label on the same item (discrete tasks
-only — a continuous or text task is refused, not approximated, because
+observations from recorded alt-test labels (Python API only — there is
+no CLI path for the bridge yet). Agreement is the judge's label vs the
+majority annotator label on the same item (discrete tasks only — a
+continuous or text task is refused, not approximated, because
 agreement there needs a similarity threshold this module does not own).
+Where does a confidence come from? From the judge's own recorded
+output alongside its label: alt-test datasets carry labels, not
+confidences, so the caller supplies the per-item confidence mapping
+from wherever the judge recorded it. A label with no supplied
+confidence produces no observation — the module never invents one.
+The bridge enforces the alt-test data contract it relies on
+(`runner._validate` / `_check_label_types`): every item needs at
+least 3 annotator labels, and every compared label must be a string
+(a bool or a float label is refused at the boundary). A mixed-task
+dataset is refused as a whole, like alt-test itself; within one task
+type, ties and missing confidences are handled per item (see below).
 Items the judge never labelled are not scored on it (alt-test
 convention). Items with a tied annotator majority, or with a label but
 no supplied confidence, are named in `skipped` — nothing is silently

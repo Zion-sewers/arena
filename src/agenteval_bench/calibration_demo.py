@@ -114,7 +114,7 @@ def main() -> int:
         AltTestItem(
             id="tie",
             task="discrete",
-            annotator_labels={"h1": "yes", "h2": "no"},
+            annotator_labels={"h1": "yes", "h2": "yes", "h3": "no", "h4": "no"},
             judge_labels={JUDGE: "yes"},
         ),
         AltTestItem(

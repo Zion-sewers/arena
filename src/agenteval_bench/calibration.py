@@ -15,7 +15,10 @@ Rules (from the issue's acceptance criteria, executable form):
 * self-reported confidence is NOT evidence — the gate takes ONLY the
   calibration record. Stated confidence is not even an argument to the
   gate, so no call site can pass a high confidence number in place of a
-  measurement.
+  measurement. The grade record itself enforces status↔evidence
+  consistency at construction (see ``JudgeCalibration``), so a
+  hand-built record claiming CALIBRATED without the measurement behind
+  it is refused before it can reach the gate.
 
 Measurement discipline (same as validity.py / decision.py): the grade rests
 on the Wilson 95% interval LOWER bound on agreement, never on the point
@@ -41,7 +44,7 @@ import json
 import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from agenteval_bench.decision import wilson_interval
@@ -125,8 +128,17 @@ class CalibrationPolicy:
         if not 0.0 <= self.tolerance <= 1.0:
             raise ValueError(f"tolerance must be in [0, 1], got {self.tolerance}")
 
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form of the policy."""
+        return {
+            "min_total": self.min_total,
+            "bins": self.bins,
+            "min_bin_n": self.min_bin_n,
+            "tolerance": self.tolerance,
+        }
 
-def default_policy() -> CalibrationPolicy:
+
+def default_calibration_policy() -> CalibrationPolicy:
     """A CalibrationPolicy built from the defaults."""
     return CalibrationPolicy()
 
@@ -173,6 +185,15 @@ class JudgeCalibration:
     diagnostic, never the grade. ``status`` is the grade; ``reasons`` name
     every failed condition (empty when CALIBRATED); ``notes`` carry
     non-failing observations such as conservative (underconfident) bins.
+    ``policy`` is the grading policy the status was computed under, so a
+    CALIBRATED record minted under a lax custom policy is distinguishable
+    from a default-policy one.
+
+    The record enforces status↔evidence consistency in ``__post_init__``
+    (the same discipline as ``Decision`` in decision.py and
+    ``AllocationReport`` in judges.py): a hand-built record that claims
+    CALIBRATED without the measurement behind it is refused at
+    construction, so the gate cannot be passed a forged record.
     """
 
     judge: str
@@ -182,6 +203,68 @@ class JudgeCalibration:
     bins: tuple[CalibrationBin, ...] = ()
     reasons: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
+    policy: CalibrationPolicy = field(default_factory=default_calibration_policy)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.policy, CalibrationPolicy):
+            raise TypeError(
+                f"calibration policy must be a CalibrationPolicy, "
+                f"got {self.policy!r}"
+            )
+        if self.status == "calibrated":
+            if not self.bins:
+                raise ValueError(
+                    "a CALIBRATED record needs non-empty bins: a grade "
+                    "without a measurement is a forgery"
+                )
+            if not all(b.passed for b in self.bins):
+                raise ValueError(
+                    "a CALIBRATED record cannot carry a failed bin"
+                )
+            if self.reasons:
+                raise ValueError("a CALIBRATED record cannot carry reasons")
+            if self.ece is None:
+                raise ValueError("a CALIBRATED record needs a measured ECE")
+        elif self.status == "miscalibrated":
+            if not self.bins:
+                raise ValueError(
+                    "a MISCALIBRATED record needs non-empty bins"
+                )
+            if not self.reasons:
+                raise ValueError(
+                    "a MISCALIBRATED record needs non-empty reasons"
+                )
+            if not any(not b.passed for b in self.bins):
+                raise ValueError(
+                    "a MISCALIBRATED record needs at least one failed bin"
+                )
+            if self.ece is None:
+                raise ValueError("a MISCALIBRATED record needs a measured ECE")
+        elif self.status == "uncalibrated":
+            if self.bins:
+                raise ValueError(
+                    "an UNCALIBRATED record cannot carry bins: too little "
+                    "data is not a measurement"
+                )
+            if self.ece is not None:
+                raise ValueError("an UNCALIBRATED record cannot carry an ECE")
+        else:  # pragma: no cover - Literal type, unreachable in typed code
+            raise ValueError(f"unknown calibration status {self.status!r}")
+        if self.status in ("calibrated", "miscalibrated"):
+            if self.n_total != sum(b.n for b in self.bins):
+                raise ValueError(
+                    f"n_total {self.n_total} does not match the bins' "
+                    f"total {sum(b.n for b in self.bins)}"
+                )
+            for b in self.bins:
+                if b.passed != (
+                    b.mean_confidence - b.agreement_interval[0]
+                    <= self.policy.tolerance
+                ):
+                    raise ValueError(
+                        f"bin {b.bin_index} passed={b.passed} contradicts "
+                        "its gap under the record's policy"
+                    )
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form of the record."""
@@ -193,6 +276,7 @@ class JudgeCalibration:
             "bins": [b.to_dict() for b in self.bins],
             "reasons": list(self.reasons),
             "notes": list(self.notes),
+            "policy": self.policy.to_dict(),
         }
 
 
@@ -200,6 +284,18 @@ def _bin_index(confidence: float, bins: int) -> int:
     """Bin index for a confidence in [0, 1]; 1.0 lands in the last bin."""
     index = int(confidence * bins)
     return min(index, bins - 1)
+
+
+def bin_range_label(lower_edge: float, upper_edge: float) -> str:
+    """Human-readable bin range: the last bin is closed on top.
+
+    Bin 9 of a 10-bin grid covers [0.9, 1.0] — confidence 1.0 lands in
+    it — so it prints with a closed bracket, not the half-open ``)``
+    the other bins use.
+    """
+    if upper_edge >= 1.0:
+        return f"[{lower_edge:.1f}, {upper_edge:.1f}]"
+    return f"[{lower_edge:.1f}, {upper_edge:.1f})"
 
 
 def calibrate(
@@ -218,15 +314,24 @@ def calibrate(
       the Wilson lower bound on its agreement by more than ``tolerance``;
     * CALIBRATED otherwise.
     """
-    policy = policy or default_policy()
+    policy = policy or default_calibration_policy()
     if not judge:
         raise ValueError("judge must be non-empty")
+    seen: set[tuple[str, str]] = set()
     for obs in observations:
         if obs.judge != judge:
             raise ValueError(
                 f"observation for judge {obs.judge!r} mixed into calibration "
                 f"of {judge!r}"
             )
+        pair = (obs.judge, obs.item_id)
+        if pair in seen:
+            raise ValueError(
+                f"duplicate observation for judge {obs.judge!r} item "
+                f"{obs.item_id!r}: one item is one measurement, copies "
+                "cannot inflate n"
+            )
+        seen.add(pair)
     n_total = len(observations)
     if n_total == 0:
         return JudgeCalibration(
@@ -240,6 +345,7 @@ def calibrate(
                     "uncalibrated by definition"
                 ),
             ),
+            policy=policy,
         )
     if n_total < policy.min_total:
         return JudgeCalibration(
@@ -250,6 +356,7 @@ def calibrate(
             reasons=(
                 f"only {n_total} observations, policy needs {policy.min_total}",
             ),
+            policy=policy,
         )
 
     grouped: dict[int, list[ConfidenceObservation]] = {}
@@ -271,11 +378,12 @@ def calibrate(
                 ece=None,
                 reasons=(
                     (
-                        f"bin {index} [{index / policy.bins:.1f}, "
-                        f"{(index + 1) / policy.bins:.1f}) holds only {n} "
-                        f"observations, policy needs {policy.min_bin_n}"
+                        f"bin {index} "
+                        f"{bin_range_label(index / policy.bins, (index + 1) / policy.bins)} "
+                        f"holds only {n} observations, policy needs {policy.min_bin_n}"
                     ),
                 ),
+                policy=policy,
             )
         mean_confidence = sum(o.stated_confidence for o in group) / n
         agreed = sum(1 for o in group if o.agreed)
@@ -285,19 +393,19 @@ def calibrate(
         passed = gap <= policy.tolerance
         if not passed:
             reasons.append(
-                f"bin {index} [{index / policy.bins:.1f}, "
-                f"{(index + 1) / policy.bins:.1f}): mean confidence "
-                f"{mean_confidence:.2f} exceeds the Wilson lower bound on "
-                f"measured agreement {interval[0]:.2f} by {gap:.2f} "
-                f"(tolerance {policy.tolerance:.2f})"
+                f"bin {index} "
+                f"{bin_range_label(index / policy.bins, (index + 1) / policy.bins)}: "
+                f"mean confidence {mean_confidence:.2f} exceeds the Wilson "
+                f"lower bound on measured agreement {interval[0]:.2f} by "
+                f"{gap:.2f} (tolerance {policy.tolerance:.2f})"
             )
         elif interval[0] - mean_confidence > policy.tolerance:
             notes.append(
-                f"bin {index} [{index / policy.bins:.1f}, "
-                f"{(index + 1) / policy.bins:.1f}) is conservative: measured "
-                f"agreement lower bound {interval[0]:.2f} exceeds mean "
-                f"confidence {mean_confidence:.2f} by "
-                f"{interval[0] - mean_confidence:.2f}"
+                f"bin {index} "
+                f"{bin_range_label(index / policy.bins, (index + 1) / policy.bins)} "
+                "is conservative: measured agreement lower bound "
+                f"{interval[0]:.2f} exceeds mean confidence "
+                f"{mean_confidence:.2f} by {interval[0] - mean_confidence:.2f}"
             )
         ece += (n / n_total) * abs(agreement_rate - mean_confidence)
         bins.append(
@@ -323,6 +431,7 @@ def calibrate(
             bins=tuple(bins),
             reasons=tuple(reasons),
             notes=tuple(notes),
+            policy=policy,
         )
     return JudgeCalibration(
         judge=judge,
@@ -332,6 +441,7 @@ def calibrate(
         bins=tuple(bins),
         reasons=(),
         notes=tuple(notes),
+        policy=policy,
     )
 
 
@@ -387,6 +497,40 @@ class AltTestObservations:
     notes: tuple[str, ...] = ()
 
 
+def _check_bridge_items(items: Sequence[AltTestItem], judge: str) -> None:
+    """Enforce the alt-test data contract the bridge relies on.
+
+    Mirrors ``alt_test.runner._validate`` / ``_check_label_types`` for the
+    items the bridge reads, scoped to the target judge and the annotators
+    (labels of other judges are not the bridge's business): every item
+    needs at least 3 annotator labels — a 1- or 2-annotator "majority" is
+    not a majority — and every label the bridge compares must be a string
+    (discrete tasks only; a bool or a float label is refused at the
+    boundary instead of silently counting as disagreement).
+    """
+    for item in items:
+        n_ann = len(item.annotator_labels)
+        if n_ann < 3:
+            raise ValueError(
+                f"item {item.id!r} has {n_ann} annotators, "
+                "need at least 3 for a majority reference"
+            )
+        labels = list(item.annotator_labels.items())
+        judge_label = item.judge_labels.get(judge)
+        if judge_label is not None:
+            labels.append((judge, judge_label))
+        for name, label in labels:
+            if isinstance(label, bool):
+                raise TypeError(
+                    f"item {item.id!r}: label {name!r} must not be a bool"
+                )
+            if not isinstance(label, str):
+                raise TypeError(
+                    f"item {item.id!r}: discrete task needs string labels, "
+                    f"{name!r} got {label!r}"
+                )
+
+
 def observations_from_alt_test(
     items: Sequence[AltTestItem],
     confidences: Mapping[str, float],
@@ -412,6 +556,7 @@ def observations_from_alt_test(
                 f"observations_from_alt_test supports discrete tasks only; "
                 f"item {item.id!r} is {item.task!r}"
             )
+    _check_bridge_items(items, judge)
     observations: list[ConfidenceObservation] = []
     skipped: list[SkippedAltTestItem] = []
     for item in items:

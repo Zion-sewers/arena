@@ -11,14 +11,17 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from typing import cast
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from agenteval_bench.calibration import (
+    CalibrationBin,
     CalibrationPolicy,
     ConfidenceObservation,
+    JudgeCalibration,
     UncalibratedJudgeError,
     calibrate,
     may_gate,
@@ -27,7 +30,7 @@ from agenteval_bench.calibration import (
     require_calibrated,
 )
 from agenteval_bench.cli import cmd_calibrate
-from alt_test.types import AltTestItem
+from alt_test.types import AltTestItem, Label
 
 JUDGE = "sharp-judge"
 
@@ -103,6 +106,21 @@ def test_mixed_judge_observations_are_refused_not_mixed_in() -> None:
     observations = _obs(JUDGE, 60, 0.5, True) + _obs("other-judge", 1, 0.5, True)
     with pytest.raises(ValueError, match="mixed into calibration"):
         calibrate(JUDGE, observations)
+
+
+def test_duplicate_observations_are_refused_by_calibrate() -> None:
+    # Copies of one observation cannot inflate n: one item is one
+    # measurement, wherever the observations came from.
+    observations = [ConfidenceObservation(JUDGE, "same-item", 0.5, True)] * 50
+    with pytest.raises(ValueError, match="duplicate observation"):
+        calibrate(JUDGE, observations)
+
+
+def test_last_bin_range_is_closed() -> None:
+    record = calibrate(JUDGE, _mixed(confidence=1.0, n_agree=50, n_disagree=50))
+    assert record.status == "miscalibrated"
+    assert "[0.9, 1.0]" in record.reasons[0]
+    assert "[0.9, 1.0)" not in record.reasons[0]
 
 
 # --- The grade ------------------------------------------------------------
@@ -216,6 +234,87 @@ def test_record_round_trips_through_json() -> None:
     assert parsed["n_total"] == 200
     assert parsed["ece"] == 0.0
     assert len(parsed["bins"]) == 1
+    assert parsed["policy"]["tolerance"] == 0.10
+    assert parsed["policy"]["min_total"] == 50
+
+
+def test_policy_is_recorded_on_the_grade() -> None:
+    policy = CalibrationPolicy(min_total=10, bins=5, min_bin_n=1, tolerance=0.5)
+    record = calibrate(JUDGE, _mixed(confidence=0.5, n_agree=10, n_disagree=10), policy)
+    assert record.policy == policy
+    assert record.policy.tolerance == 0.5
+
+
+def test_forged_calibrated_record_is_refused_at_construction() -> None:
+    # The arch FAIL: a hand-built CALIBRATED record with no measurement
+    # behind it must not reach the gate.
+    with pytest.raises(ValueError, match="without a measurement"):
+        JudgeCalibration(judge=JUDGE, status="calibrated", n_total=0, ece=None)
+    good = calibrate(JUDGE, _mixed(confidence=0.5, n_agree=100, n_disagree=100))
+    failed_bin = CalibrationBin(
+        bin_index=9,
+        lower_edge=0.9,
+        upper_edge=1.0,
+        n=50,
+        mean_confidence=1.0,
+        agreement_rate=0.5,
+        agreement_interval=(0.4, 0.6),
+        gap=0.6,
+        passed=False,
+    )
+    with pytest.raises(ValueError, match="failed bin"):
+        JudgeCalibration(
+            judge=JUDGE,
+            status="calibrated",
+            n_total=50,
+            ece=0.5,
+            bins=(failed_bin,),
+        )
+    with pytest.raises(ValueError, match="cannot carry reasons"):
+        JudgeCalibration(
+            judge=JUDGE,
+            status="calibrated",
+            n_total=200,
+            ece=0.0,
+            bins=(good.bins[0],),
+            reasons=("forged",),
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        JudgeCalibration(
+            judge=JUDGE,
+            status="calibrated",
+            n_total=199,
+            ece=0.0,
+            bins=good.bins,
+        )
+
+
+def test_forged_miscalibrated_and_uncalibrated_records_are_refused() -> None:
+    good = calibrate(JUDGE, _mixed(confidence=0.5, n_agree=100, n_disagree=100))
+    with pytest.raises(ValueError, match="non-empty reasons"):
+        JudgeCalibration(
+            judge=JUDGE,
+            status="miscalibrated",
+            n_total=200,
+            ece=0.1,
+            bins=good.bins,
+        )
+    with pytest.raises(ValueError, match="cannot carry bins"):
+        JudgeCalibration(
+            judge=JUDGE,
+            status="uncalibrated",
+            n_total=200,
+            ece=None,
+            bins=good.bins,
+        )
+
+
+def test_package_exports_calibration_names() -> None:
+    from agenteval_bench import calibrate as package_calibrate
+    from agenteval_bench import may_gate as package_may_gate
+
+    assert package_calibrate is calibrate
+    assert package_may_gate is may_gate
 
 
 # --- Alt-test bridge ------------------------------------------------------
@@ -267,7 +366,7 @@ def test_bridge_names_tied_majority_and_missing_confidence() -> None:
         AltTestItem(
             id="tie",
             task="discrete",
-            annotator_labels={"h1": "yes", "h2": "no"},
+            annotator_labels={"h1": "yes", "h2": "yes", "h3": "no", "h4": "no"},
             judge_labels={JUDGE: "yes"},
         ),
         AltTestItem(
@@ -282,6 +381,49 @@ def test_bridge_names_tied_majority_and_missing_confidence() -> None:
     assert [s.item_id for s in bridged.skipped] == ["tie", "noconf"]
     assert "tied" in bridged.skipped[0].reason
     assert "no confidence" in bridged.skipped[1].reason
+
+
+def test_bridge_refuses_items_with_fewer_than_three_annotators() -> None:
+    # A 1- or 2-annotator "majority" is not a majority (alt-test needs >= 3).
+    items = [
+        AltTestItem(
+            id="thin",
+            task="discrete",
+            annotator_labels={"h1": "yes", "h2": "yes"},
+            judge_labels={JUDGE: "yes"},
+        )
+    ]
+    with pytest.raises(ValueError, match="need at least 3"):
+        observations_from_alt_test(items, {"thin": 0.9}, JUDGE)
+
+
+def test_bridge_refuses_wrong_typed_labels() -> None:
+    # A float judge label on a discrete task is refused at the boundary,
+    # not silently counted as disagreement.
+    items = [
+        AltTestItem(
+            id="badtype",
+            task="discrete",
+            annotator_labels={"h1": "yes", "h2": "yes", "h3": "yes"},
+            judge_labels={JUDGE: 1.0},
+        )
+    ]
+    with pytest.raises(TypeError, match="string labels"):
+        observations_from_alt_test(items, {"badtype": 0.9}, JUDGE)
+    bool_items = [
+        AltTestItem(
+            id="booltype",
+            task="discrete",
+            annotator_labels={
+                "h1": cast(Label, True),
+                "h2": cast(Label, True),
+                "h3": cast(Label, True),
+            },
+            judge_labels={JUDGE: "yes"},
+        )
+    ]
+    with pytest.raises(TypeError, match="must not be a bool"):
+        observations_from_alt_test(bool_items, {"booltype": 0.9}, JUDGE)
 
 
 def test_bridge_refuses_non_discrete_tasks() -> None:
@@ -412,11 +554,44 @@ def test_cli_writes_json_report(tmp_path: Path) -> None:
     assert report["status"] == "calibrated" and report["n_total"] == 200
 
 
+def test_cli_json_stdout_stays_parseable_with_out(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _write_observations(tmp_path, 100, 100, 0.5)
+    out = tmp_path / "report.json"
+    code = cmd_calibrate(["--observations", str(path), "--json", "--out", str(out)])
+    assert code == 0
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)  # must not raise "Extra data"
+    assert parsed["status"] == "calibrated"
+    assert f"Report: {out}" in captured.err
+
+
 def test_cli_bad_input_exits_one(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path = tmp_path / "bad.json"
     path.write_text("{not json", encoding="utf-8")
     assert cmd_calibrate(["--observations", str(path)]) == 1
     assert cmd_calibrate([]) == 1
+
+
+def test_cli_policy_flags_change_the_grade(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Confidence 1.0 at 50% agreement is miscalibrated under the default
+    # tolerance — but a lax --tolerance 1.0 grades it calibrated, and the
+    # record says so. The flags are real policy, not decoration.
+    path = _write_observations(tmp_path, 50, 50, 1.0)
+    assert cmd_calibrate(["--observations", str(path)]) == 2
+    assert cmd_calibrate(["--observations", str(path), "--tolerance", "1.0"]) == 0
+    out = capsys.readouterr().out
+    assert "calibrated" in out
+
+
+def test_cli_bad_policy_exits_one(tmp_path: Path) -> None:
+    path = _write_observations(tmp_path, 100, 100, 0.5)
+    assert cmd_calibrate(["--observations", str(path), "--tolerance", "abc"]) == 1
+    assert cmd_calibrate(["--observations", str(path), "--tolerance", "2"]) == 1
+    assert cmd_calibrate(["--observations", str(path), "--min-total", "0"]) == 1
 
 
 # --- Properties -----------------------------------------------------------
