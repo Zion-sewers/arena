@@ -378,8 +378,33 @@ SCORER_VALIDITY: Mapping[str, MetricValidity] = MappingProxyType(
 )
 
 
+def _require_bar_cleared(note: MetricValidity, policy: ValidityPolicy) -> None:
+    """Refuse a caller-supplied VALIDATED_PROXY note that fails the bar.
+
+    :func:`validate_proxy` enforces the bar when it mints the grade; a
+    hand-built note bypasses that body, so the factories re-check here.
+    A forged VALIDATED_PROXY (grade claimed, lower bound below the bar)
+    raises instead of entering a report as trusted. Other grades need
+    no check: DIRECT carries no interval, and UNVALIDATED_PROXY and
+    UNASSESSED are never trusted.
+    """
+    if note.grade is not ValidityGrade.VALIDATED_PROXY:
+        return
+    if note.agreement is None:  # pragma: no cover - __post_init__ refuses this
+        raise ValueError(
+            f"metric {note.metric!r}: VALIDATED_PROXY needs an agreement interval"
+        )
+    if note.agreement[0] < policy.min_agreement_lower:
+        raise ValueError(
+            f"metric {note.metric!r}: agreement lower bound {note.agreement[0]:.3f} "
+            f"below policy bar {policy.min_agreement_lower:.3f}"
+        )
+
+
 def assess_scorer(
     notes: Mapping[str, MetricValidity] | None = None,
+    *,
+    policy: ValidityPolicy | None = None,
 ) -> ValidityReport:
     """Validity report over the deterministic scorer's matchers.
 
@@ -387,8 +412,12 @@ def assess_scorer(
     notes override built-ins per metric — that is how a suite author
     upgrades a matcher with a :func:`validate_proxy` result. An unknown
     metric name in ``notes`` raises: a typo must fail loudly, not
-    silently add a metric no report reads.
+    silently add a metric no report reads. A caller note that claims
+    VALIDATED_PROXY is re-checked against the policy bar (see
+    ``_require_bar_cleared``): the grade means the bar was cleared,
+    whoever minted the note.
     """
+    policy = policy or default_validity_policy()
     merged: dict[str, MetricValidity] = dict(SCORER_VALIDITY)
     for metric, note in (notes or {}).items():
         if metric not in SCORER_VALIDITY:
@@ -398,6 +427,7 @@ def assess_scorer(
             )
         if note.metric != metric:
             raise ValueError(f"validity for {note.metric!r} filed under {metric!r}")
+        _require_bar_cleared(note, policy)
         merged[metric] = note
     return ValidityReport(
         assessments=merged, expected_metrics=frozenset(SCORER_METRICS)
@@ -409,6 +439,7 @@ def assess_decision(
     *,
     reliability_kind: Literal["live", "replay"],
     notes: Mapping[str, MetricValidity] | None = None,
+    policy: ValidityPolicy | None = None,
 ) -> ValidityReport:
     """Validity report over the four decision dimensions.
 
@@ -419,8 +450,11 @@ def assess_decision(
       ``assess_scorer`` carries the matcher grades.
     * reliability — replay is UNVALIDATED_PROXY: replay-agreement
       (recorded outputs re-scored) cannot detect live-agent flakiness
-      (engine.py). Live with a measured agreement is VALIDATED_PROXY,
-      with the cross-run agreement interval carried as the evidence.
+      (engine.py). Live is graded exactly as :func:`validate_proxy`
+      grades a proxy: VALIDATED_PROXY iff the Wilson lower bound on the
+      cross-run agreement clears the policy bar, else UNVALIDATED_PROXY
+      with the interval carried as the evidence that it fell short.
+      A live agreement of 30/60 is untrusted, not certified.
       Unmeasured (fewer than 2 runs) is UNASSESSED: decision.py refuses
       to compute it, and so does this report.
     * cost — measured over >= 2 observations is DIRECT ("mean of measured
@@ -431,12 +465,14 @@ def assess_decision(
     ``reliability_kind`` is caller-declared ("live" | "replay"), never
     auto-detected: this function cannot see how the runs were produced,
     so it does not pretend to. Caller-supplied ``notes`` override
-    built-ins per dimension; an unknown dimension raises.
+    built-ins per dimension; an unknown dimension raises, and a note
+    claiming VALIDATED_PROXY is re-checked against the policy bar.
     """
     if reliability_kind not in ("live", "replay"):
         raise ValueError(
             f"reliability_kind must be 'live' or 'replay', got {reliability_kind!r}"
         )
+    policy = policy or default_validity_policy()
     built: dict[str, MetricValidity] = {}
     for dimension in Dimension:
         verdict = decision.verdicts[dimension]
@@ -474,14 +510,28 @@ def assess_decision(
                     ),
                 )
             else:
+                lower, _upper = evidence.interval
+                if lower >= policy.min_agreement_lower:
+                    grade = ValidityGrade.VALIDATED_PROXY
+                    basis = (
+                        "per-case pass/fail agreement across repeated runs "
+                        "with genuinely different executions; Wilson lower "
+                        f"bound {lower:.3f} clears the policy bar "
+                        f"{policy.min_agreement_lower:.3f}"
+                    )
+                else:
+                    grade = ValidityGrade.UNVALIDATED_PROXY
+                    basis = (
+                        "per-case pass/fail agreement across repeated runs "
+                        "with genuinely different executions; Wilson lower "
+                        f"bound {lower:.3f} below the policy bar "
+                        f"{policy.min_agreement_lower:.3f}"
+                    )
                 built[name] = MetricValidity(
                     metric=name,
-                    grade=ValidityGrade.VALIDATED_PROXY,
+                    grade=grade,
                     phenomenon="live-agent run-to-run stability",
-                    basis=(
-                        "per-case pass/fail agreement across repeated runs "
-                        "with genuinely different executions"
-                    ),
+                    basis=basis,
                     agreement=evidence.interval,
                     agreement_n=evidence.trials,
                 )
@@ -512,6 +562,7 @@ def assess_decision(
             )
         if note.metric != metric:
             raise ValueError(f"validity for {note.metric!r} filed under {metric!r}")
+        _require_bar_cleared(note, policy)
         built[metric] = note
     return ValidityReport(
         assessments=built,

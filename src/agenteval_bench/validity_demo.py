@@ -17,7 +17,10 @@ holds:
 - the same decision assessed as replay does NOT trust reliability
   (replay-agreement cannot detect live-agent flakiness);
 - a report with an unassessed metric never trusts it, and a report that
-  omits a metric refuses to be built at all.
+  omits a metric refuses to be built at all;
+- a flaky live agent whose verdict varies with the seed (20/40 cross-run
+  agreement) does NOT get a trusted reliability grade: the policy bar
+  applies on the live path too.
 
 Any failure raises, so CI can gate on this demo directly.
 """
@@ -64,6 +67,23 @@ def _seeded_stub(correct: dict[str, str]) -> Callable[[str, int], str]:
     def agent_fn(prompt: str, seed: int) -> str:
         case_id = prompt.removeprefix("prompt-")
         return f"{correct.get(case_id, '')} [seed {seed}]"
+
+    return agent_fn
+
+
+def _flaky_stub(correct: dict[str, str]) -> Callable[[str, int], str]:
+    """A stub whose verdict varies with the seed: odd cases are always
+    right, even cases are right only on even seeds. Across seeds 42 and
+    43 the even cases flip, so cross-run agreement is 20/40 — below the
+    policy bar. A seed-invariant stub would prove nothing about the
+    live branch except that it prints VALIDATED_PROXY."""
+
+    def agent_fn(prompt: str, seed: int) -> str:
+        case_id = prompt.removeprefix("prompt-")
+        idx = int(case_id[1:])
+        if idx % 2 == 1 or seed % 2 == 0:
+            return f"{correct.get(case_id, '')} [seed {seed}]"
+        return f"wrong [seed {seed}]"
 
     return agent_fn
 
@@ -161,7 +181,29 @@ def main() -> int:
     else:  # pragma: no cover - the constructor must raise
         raise AssertionError("ValidityReport built with a missing metric")
 
-    print("validity demo: all 7 expectations hold")
+    # 8. Flaky live agent: verdict varies with the seed, agreement 20/40,
+    # Wilson lower bound 0.352 — below the 0.80 bar, so reliability is
+    # UNVALIDATED_PROXY even though the runs were genuinely live.
+    suite = _suite("demo-validity-flaky", 20, 20)
+    correct = {c.id: (c.expected.contains[0] if c.expected.contains else "") for c in suite.cases}
+    decision = runner.run_decision(
+        suite,
+        None,
+        default_policy(),
+        RiskLevel.LOW,
+        cost_fn=lambda case, _output: case.cost,
+        seeded_agent_fn=_flaky_stub(correct),
+    )
+    flaky = assess_decision(decision, reliability_kind="live")
+    print(flaky.summary())
+    assert flaky.assessments[Dimension.RELIABILITY.value].grade is (
+        ValidityGrade.UNVALIDATED_PROXY
+    )
+    assert not flaky.trusted(Dimension.RELIABILITY.value)
+    assert not flaky.all_trusted
+    assert flaky.assessments[Dimension.RELIABILITY.value].agreement_n == 40
+
+    print("validity demo: all 8 expectations hold")
     return 0
 
 

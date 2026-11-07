@@ -72,8 +72,10 @@ the four decision dimensions. Quality and safety are DIRECT for the
 stated phenomenon ("share of this suite's cases passed"); the proportion
 is exact, but the cases are only as good as their matchers. Reliability
 in replay mode is UNVALIDATED_PROXY (replay-agreement cannot detect
-live-agent flakiness); live with a measured agreement is
-VALIDATED_PROXY, carrying the cross-run agreement interval. Cost over
+live-agent flakiness); live is graded exactly as `validate_proxy`
+grades a proxy — VALIDATED_PROXY only when the Wilson lower bound on
+the cross-run agreement clears the policy bar (default 0.80), else
+UNVALIDATED_PROXY with the interval carried as the evidence. Cost over
 >= 2 observations is DIRECT; a single observation is UNVALIDATED_PROXY
 (no measured uncertainty); unmeasured is UNASSESSED.
 

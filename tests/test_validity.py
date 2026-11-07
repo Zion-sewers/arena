@@ -376,6 +376,38 @@ def test_assess_scorer_rejects_an_unknown_metric():
 # ------------------------------------------------------- assess_decision
 
 
+def test_assess_decision_live_below_the_bar_is_unvalidated():
+    # Arch FAIL (PR #140): live reliability 30/60 used to grade
+    # VALIDATED_PROXY and trusted. The bar applies on this path too.
+    decision = _decision(reliability=(30, 60))
+    report = assess_decision(decision, reliability_kind="live")
+    assert report.assessments["reliability"].grade is ValidityGrade.UNVALIDATED_PROXY
+    assert not report.trusted("reliability")
+    assert not report.all_trusted
+    assert report.untrusted_metrics() == ["reliability"]
+    agreement = report.assessments["reliability"].agreement
+    assert agreement is not None
+    assert agreement[0] < 0.80  # 30/60 Wilson lower bound is 0.377
+
+
+def test_assess_decision_live_two_of_two_is_unvalidated():
+    # 2/2 agreement is a point estimate of 1.0 with a lower bound of
+    # ~0.34: it must not clear the bar either.
+    decision = _decision(reliability=(2, 2))
+    report = assess_decision(decision, reliability_kind="live")
+    assert report.assessments["reliability"].grade is ValidityGrade.UNVALIDATED_PROXY
+    assert not report.trusted("reliability")
+
+
+def test_assess_decision_live_strict_policy_downgrades():
+    # 20/20 clears the default 0.80 bar (lower 0.839) but not a 0.95 bar.
+    decision = _decision(reliability=(20, 20))
+    strict = ValidityPolicy(min_agreement_lower=0.95)
+    report = assess_decision(decision, reliability_kind="live", policy=strict)
+    assert report.assessments["reliability"].grade is ValidityGrade.UNVALIDATED_PROXY
+    assert not report.trusted("reliability")
+
+
 def test_assess_decision_live_trusts_all_four_dimensions():
     report = assess_decision(_decision(), reliability_kind="live")
     assert report.all_trusted
@@ -408,6 +440,34 @@ def test_assess_decision_single_cost_observation_is_unvalidated():
     report = assess_decision(decision, reliability_kind="live")
     assert report.assessments["cost"].grade is ValidityGrade.UNVALIDATED_PROXY
     assert not report.trusted("cost")
+
+
+def test_assess_decision_override_validated_proxy_below_bar_rejected():
+    # A hand-built VALIDATED_PROXY note that fails the bar is a forgery:
+    # the factories re-check the grade whoever minted the note.
+    forged = MetricValidity(
+        metric="reliability",
+        grade=ValidityGrade.VALIDATED_PROXY,
+        phenomenon="live-agent run-to-run stability",
+        basis="caller says so",
+        agreement=(0.10, 0.20),
+        agreement_n=60,
+    )
+    with pytest.raises(ValueError, match="below policy bar"):
+        assess_decision(_decision(), reliability_kind="live", notes={"reliability": forged})
+
+
+def test_assess_scorer_override_validated_proxy_below_bar_rejected():
+    forged = MetricValidity(
+        metric="contains",
+        grade=ValidityGrade.VALIDATED_PROXY,
+        phenomenon="output states the required fact",
+        basis="caller says so",
+        agreement=(0.10, 0.20),
+        agreement_n=60,
+    )
+    with pytest.raises(ValueError, match="below policy bar"):
+        assess_scorer(notes={"contains": forged})
 
 
 def test_assess_decision_rejects_an_unknown_reliability_kind():
