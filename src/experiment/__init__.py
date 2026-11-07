@@ -31,6 +31,17 @@ plan, the SRM and A/A trust tests pass BEFORE the OEC result is read,
 no guardrail regressed beyond its pre-registered budget, the OEC won
 significantly in the declared direction, and a surprising win
 (Twyman's law) carries confirming replication evidence.
+
+Analysis pre-specification (agenteval-bench#48, Spiegelhalter *The Art
+of Statistics*) is enforced at the `prespec.review_analysis` /
+`prespec.check_analysis` seam: an agent-produced analysis is reviewed
+against its pre-registered analysis plan through the 10-question gate
+(plan registered before data touched, exploratory/confirmatory split,
+hypotheses pre-specified, sample sizes and assumptions stated,
+uncertainty as an interval, decision rule declared, reproducible).
+A confirmatory finding must quote a registered hypothesis verbatim —
+post-hoc storytelling is refused as POST_HOC_CONFIRMATION, never
+presented as a conclusion.
 """
 
 from __future__ import annotations
@@ -77,6 +88,25 @@ from experiment.oec import (
     two_proportion_z,
     two_sided_p,
 )
+from experiment.prespec import (
+    AnalysisFinding,
+    AnalysisPlan,
+    AnalysisRegistryCorrupted,
+    AnalysisRegistryMalformed,
+    AnalysisViolation,
+    Assumption,
+    QuestionResult,
+    ReviewGateReport,
+    check_analysis,
+    find_analysis_plan,
+    finding_from_dict,
+    finding_to_dict,
+    load_analysis_plan,
+    plan_from_dict,
+    plan_to_dict,
+    register_analysis_plan,
+    review_analysis,
+)
 from experiment.registry import (
     ExperimentEvidence,
     ExperimentVerdict,
@@ -111,6 +141,12 @@ __all__ = [
     "AggregationReport",
     "AggregationVerdict",
     "AggregationViolation",
+    "AnalysisFinding",
+    "AnalysisPlan",
+    "AnalysisRegistryCorrupted",
+    "AnalysisRegistryMalformed",
+    "AnalysisViolation",
+    "Assumption",
     "CovariateSpec",
     "CovariateViolation",
     "CupedResult",
@@ -127,7 +163,9 @@ __all__ = [
     "MetricObservation",
     "MetricRole",
     "PeekRefused",
+    "QuestionResult",
     "ReplicationEvidence",
+    "ReviewGateReport",
     "SequentialGate",
     "ShipEvidence",
     "ShipRefused",
@@ -141,6 +179,7 @@ __all__ = [
     "assert_aggregation",
     "check_aa",
     "check_aggregation",
+    "check_analysis",
     "check_experiment",
     "check_guardrail",
     "check_ship",
@@ -152,15 +191,23 @@ __all__ = [
     "design_from_json",
     "disaggregate",
     "evidence_from_json",
+    "find_analysis_plan",
+    "finding_from_dict",
+    "finding_to_dict",
     "group_sequential_boundaries",
     "inv_normal_cdf",
+    "load_analysis_plan",
     "load_plan",
     "load_registered_design",
     "newcombe_interval",
     "obrien_fleming_spend",
+    "plan_from_dict",
+    "plan_to_dict",
     "pooled_rates",
+    "register_analysis_plan",
     "register_design",
     "register_plan",
+    "review_analysis",
     "ship_decision",
     "spending_report",
     "stratum_delta",

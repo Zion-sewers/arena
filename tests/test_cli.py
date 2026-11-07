@@ -146,3 +146,85 @@ def test_bugsmith_unknown_command(monkeypatch, capsys):
     code, _, err = _run(["frobnicate"], monkeypatch, capsys)
     assert code == 1
     assert "Unknown command" in err
+
+
+# --- prespec review gate (arena#48) ---
+
+PRESPEC_PLAN = {
+    "name": "reranker-v2-failure-modes",
+    "mode": "confirmatory",
+    "question": "Does reranker v2 reduce the hallucinated-citation failure mode?",
+    "hypotheses": [
+        "reranker v2 cuts hallucinated citations by at least 10pp vs v1"
+    ],
+    "assumptions": [
+        {
+            "text": "the eval suite's citation cases represent production traffic",
+            "falsifier": "suite citation cases differ from production by >20pp",
+        }
+    ],
+    "n_planned": 200,
+    "decision_rule": "confirm iff the 95% interval on the delta excludes 0",
+    "data_source": "golden replay suite, seed 42",
+}
+
+
+def _prespec_files(tmp_path, hypothesis, accessed="2026-11-08T00:00:00+00:00"):
+    import json
+
+    from experiment import plan_from_dict, register_analysis_plan
+
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(PRESPEC_PLAN), encoding="utf-8")
+    registry = str(tmp_path / "analyses.jsonl")
+    digest = register_analysis_plan(plan_from_dict(PRESPEC_PLAN), registry)
+    finding = {
+        "plan_digest": digest,
+        "mode": "confirmatory",
+        "hypothesis": hypothesis,
+        "claim": "v2 cuts hallucinated citations by 14pp",
+        "n_observed": 200,
+        "interval": [0.08, 0.20],
+        "data_digest": "sha256:golden-suite-seed42",
+        "data_accessed_at": accessed,
+        "code_version": "arena@dbf6909",
+    }
+    finding_path = tmp_path / "finding.json"
+    finding_path.write_text(json.dumps(finding), encoding="utf-8")
+    return str(plan_path), str(finding_path), registry
+
+
+def test_prespec_cli_confirms(monkeypatch, capsys, tmp_path):
+    plan, finding, registry = _prespec_files(
+        tmp_path,
+        "reranker v2 cuts hallucinated citations by at least 10pp vs v1",
+    )
+    code, out, _ = _run(
+        ["prespec", "--finding", finding, "--plan", plan, "--registry", registry],
+        monkeypatch, capsys,
+    )
+    assert code == 0, out
+    assert "verdict: CONFIRMED" in out
+    assert "[PASS] Q5" in out
+
+
+def test_prespec_cli_refuses_post_hoc(monkeypatch, capsys, tmp_path):
+    _, finding, registry = _prespec_files(
+        tmp_path, "v2 is better somehow",
+    )
+    code, out, _ = _run(
+        ["prespec", "--finding", finding, "--registry", registry],
+        monkeypatch, capsys,
+    )
+    assert code == 1, out
+    assert "verdict: REFUSED" in out
+    assert "POST_HOC_CONFIRMATION" in out
+
+
+def test_prespec_cli_bad_input(monkeypatch, capsys, tmp_path):
+    code, _, err = _run(
+        ["prespec", "--finding", str(tmp_path / "missing.json")],
+        monkeypatch, capsys,
+    )
+    assert code == 2
+    assert "invalid finding doc" in err
