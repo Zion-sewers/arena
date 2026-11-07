@@ -42,6 +42,7 @@ Each eval suite rises to its pass rate against the dashed gate line. One suite b
 - Regression tracking: compare runs, see which cases moved.
 - Python API: `EvalSuite.from_yaml` + `EvalRunner.run(suite, agent_fn)` for live agents.
 - Judge decorrelation: `agenteval-bench judges --registry examples/judges-registry.json` allocates judges from distinct model families (HOST != FAMILY) and reports unreachable judges as holes, never dropped.
+- Judge calibration: `agenteval-bench calibrate --observations examples/calibration-observations.json` grades a judge's stated confidence against measured agreement; only a CALIBRATED judge's scores may gate, once a live judge transport exists (see docs/CALIBRATION.md).
 
 ## Honest limits
 

@@ -62,6 +62,13 @@ src/agenteval_bench/
                   #   judges reported as holes, VARIES-BY-MODEL never a
                   #   second slot)
   judges_demo.py  # Seeded end-to-end demo of judge decorrelation
+  calibration.py  # Judge calibration: confidence is not evidence
+                  #   (ConfidenceObservation, calibrate, JudgeCalibration;
+                  #   per-bin stated confidence vs Wilson lower bound on
+                  #   measured agreement; only CALIBRATED may gate)
+                  #   First agenteval_bench -> alt_test import (types only):
+                  #   the bridge reads recorded AltTestItem labels.
+  calibration_demo.py # Seeded end-to-end demo of judge calibration
   regression.py   # Production failures -> frozen versions -> release gate
   snapshots.py    # Immutable benchmark snapshots (hash-verified store)
   replay.py       # Deterministic seeded replay logs (bit-exact re-runs)
@@ -102,6 +109,7 @@ docs/             # Specifications, archive, roadmap references
 | `EvalRunner`         | Iterate cases, invoke `agent_fn`, collect `EvalResult`s into `RunResult`. |
 | `ValidityReport`     | Validity assessment per metric; a metric without a note is UNASSESSED and untrusted. |
 | `AllocationReport`   | Family-decorrelated judge allocation; unreachable judges are holes, never dropped. |
+| `JudgeCalibration`   | Per-bin stated confidence vs measured agreement; only CALIBRATED may gate. |
 | `cli.main`           | Parse argv, load suite, build replay `agent_fn`, print summary + gate. |
 
 ### 4.3 Data-flow diagram
@@ -204,6 +212,7 @@ table:
 |---|---|---|---|---|
 | `run` | clean / gate passed | bad input | gate failed | — |
 | `decide` | GATE | ROLLBACK | INVESTIGATE | usage error |
+| `calibrate` | calibrated | bad input | mis/uncalibrated | — |
 
 > The `compare` and `report` subcommands described in earlier drafts are **`planned`**
 > (see §9) and are **not** implemented in v0.1.0; invoking an unknown command exits `1`.
@@ -261,6 +270,7 @@ print(result.summary())
 | Deterministic scoring  | ✅ shipped  | v0.1.0         |
 | Measurement-validity column (decide + scorer) | ✅ shipped | v0.1.0  |
 | Judge decorrelation (HOST != FAMILY) | ✅ shipped | v0.1.0  |
+| Judge calibration (confidence is not evidence) | ✅ shipped | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |
@@ -295,6 +305,6 @@ print(result.summary())
 - [x] CLI `run` with `--ci`/`--threshold` gates CI on pass rate.
 - [x] Golden replay suite passes in this repo's own CI.
 - [x] README accurate and AEO-optimized; spec, roadmap, and repo hygiene mature.
-- [ ] LLM-judge integration with cost bounding — *planned (v0.2)*.
+- [ ] LLM-judge integration with cost bounding — *planned (v0.2)*. When the transport lands, it must call `require_calibrated` before judge scores gate anything (see `docs/CALIBRATION.md`).
 - [ ] `compare` command for run-vs-run regression — *planned (v0.2)*.
 - [ ] `report` generation (markdown + JSON) — *planned (v0.2)*.
