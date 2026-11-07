@@ -6,17 +6,18 @@ answer five times in different words and the selector then "chooses"
 between paraphrases: the choice was already made by the mode.
 
 Rules (from the issue's acceptance criteria, executable form):
-* candidates are scored for genuine diversity, not paraphrases — pair
-  similarity is content-token Jaccard, with a hard-token (numbers and
-  digit-bearing tokens) Jaccard that applies only when BOTH sides
-  carry at least two hard tokens: a single shared number is
-  coincidence, not paraphrase evidence, and Jaccard on singleton sets
-  is 0 or 1, so it used to score genuinely different answers sharing
-  one number as identical. The set grade is the WEAKEST link, so one
-  near-verbatim pair fails the set. What this measures is
-  near-duplicate detection at token level, NOT semantic diversity: a
-  fluent synonym rewrite that replaces the content words passes, and
-  that limit is named in docs/DIVERGE.md rather than hidden;
+* candidates are scored for token-level diversity (near-duplicate
+  detection, not semantic diversity) — pair similarity is
+  content-token Jaccard, with a hard-token (numbers and digit-bearing
+  tokens) Jaccard that applies only when BOTH sides carry at least
+  three hard tokens: Jaccard on tiny hard-token sets has almost no
+  gradation (two shared numbers score 1.0), so a smaller anchor
+  convicts genuinely different answers that merely share a number.
+  The set grade is the WEAKEST link, so one near-verbatim pair fails
+  the set. What this measures is near-duplicate detection at token
+  level, NOT semantic diversity: a fluent synonym rewrite that
+  replaces the content words passes, and that limit is named in
+  docs/DIVERGE.md rather than hidden;
 * the selection records why the conventional answer won or lost — the
   Selection record carries both scores, the runner-up score, the
   margin (winner over runner-up), a closed outcome and a reason built
@@ -30,10 +31,13 @@ Rules (from the issue's acceptance criteria, executable form):
 * single-sample generation is NOT sufficient for high-stakes choices —
   building a high-stakes set with fewer than ``n_candidates`` raises
   typed ``SingleSampleError``, a high-stakes policy must ask for
-  exactly 5, and the high-stakes gate refuses a selection whose set
-  was not diverse or whose declared ``p_conventional`` was
-  overconfident against the measured share of the conventional
-  answer's own cluster.
+  exactly 5, and the high-stakes gate itself refuses any selection
+  whose set covers anything other than 5 candidates, whose set was
+  not diverse, or whose declared ``p_conventional`` was overconfident
+  against the measured share of the conventional answer's own cluster.
+  The gate enforces the count from the selection record, so the
+  obligation survives build time: a short set built low-stakes
+  cannot decide high stakes.
 
 Measurement discipline (same as validity.py / calibration.py): the
 declared ``p_conventional`` is a CLAIM checked against measurement.
@@ -294,19 +298,26 @@ class DivergeSet:
         fingerprint, and the pipeline steps refuse a measurement whose
         fingerprint does not match the set in hand — so a report from
         a different candidate set can never silently mix into a
-        selection from this one.
+        selection from this one. Numbers are coerced to float (and
+        -0.0 to 0.0) before hashing, so int and float spellings of the
+        same set — score 1 vs 1.0, p 1 vs 1.0 — fingerprint alike.
         """
         payload = {
             "prompt": self.prompt,
             "candidates": [
-                {"text": c.text, "score": c.score, "label": c.label} for c in self.candidates
+                {
+                    "text": c.text,
+                    "score": _fp_number(c.score),
+                    "label": c.label,
+                }
+                for c in self.candidates
             ],
             "conventional_index": self.conventional_index,
-            "p_conventional": self.p_conventional,
+            "p_conventional": _fp_number(self.p_conventional),
             "policy": {
                 "n_candidates": self.policy.n_candidates,
-                "max_pair_similarity": self.policy.max_pair_similarity,
-                "p_conventional_tolerance": self.policy.p_conventional_tolerance,
+                "max_pair_similarity": _fp_number(self.policy.max_pair_similarity),
+                "p_conventional_tolerance": _fp_number(self.policy.p_conventional_tolerance),
             },
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
@@ -328,6 +339,18 @@ class DivergeSet:
             raise ValueError(f"p_conventional must be finite, got {self.p_conventional!r}")
         if not 0.0 <= self.p_conventional <= 1.0:
             raise ValueError(f"p_conventional must be in [0, 1], got {self.p_conventional}")
+
+
+def _fp_number(value: float) -> float:
+    """Canonical float for fingerprinting.
+
+    ``json.dumps(1)`` is ``"1"`` but ``json.dumps(1.0)`` is ``"1.0"``,
+    so int and float spellings of the same set would fingerprint
+    differently. Coercing to float (and -0.0 to 0.0) makes the
+    fingerprint a function of the set, not of its spelling.
+    """
+    value = float(value)
+    return 0.0 if value == 0 else value
 
 
 def build_diverge_set(
@@ -399,21 +422,23 @@ def pair_similarity(left: str, right: str) -> float:
     """Similarity of two candidate texts in [0, 1].
 
     Content-token Jaccard, with hard-token Jaccard taking the max
-    only when BOTH sides carry at least two hard tokens. Max, not
+    only when BOTH sides carry at least three hard tokens. Max, not
     mean: either signal can convict a paraphrase, and averaging would
     let a reworded text with the same numbers slip through on a low
-    content score. The two-hard-token floor is load-bearing: Jaccard
-    on singleton sets is 0 or 1 with no gradation, so a single shared
-    number ("Retry after 30 seconds" vs "Delete after 30 days") used
-    to score two genuinely different answers as identical (1.0) and
-    refuse the set. A lone shared number is coincidence, not
-    paraphrase evidence; with fewer hard tokens, content Jaccard
-    alone decides.
+    content score. The three-hard-token floor is load-bearing:
+    Jaccard on tiny hard-token sets has almost no gradation, so a
+    single shared number ("Retry after 30 seconds" vs "Delete after
+    30 days") — and even two shared numbers — used to score two
+    genuinely different answers as identical (1.0) and refuse the
+    set. Shared numbers are paraphrase evidence only in bulk; with
+    fewer hard tokens, content Jaccard alone decides. Residual,
+    disclosed in docs/DIVERGE.md: two genuinely different answers
+    that share three numbers can still be refused.
     """
     content = _jaccard(content_tokens(left), content_tokens(right))
     left_hard = hard_tokens(left)
     right_hard = hard_tokens(right)
-    if len(left_hard) < 2 or len(right_hard) < 2:
+    if len(left_hard) < 3 or len(right_hard) < 3:
         return content
     return max(content, _jaccard(left_hard, right_hard))
 
@@ -460,10 +485,17 @@ class DiversityReport:
     computed from; a pipeline step refuses a report whose fingerprint
     does not match the set in hand.
 
-    The record validates its own invariants: a hand-built report that
-    claims ``diverse`` while holding a near-duplicate pair, or whose
-    clusters do not partition the candidates, or whose modal share
-    does not match its modal cluster, is refused at construction.
+    The record validates its own invariants — and it recomputes
+    them from the pairs, it does not trust the flags: the
+    near-duplicate flags must match similarity vs threshold, the
+    clusters must be the connected components over the near-duplicate
+    edges, the modal cluster must be the largest (ties: lowest first
+    index), and the min/mean diversities and per-candidate means must
+    match the pairs. A hand-built report that claims ``diverse``
+    while holding a near-duplicate pair, or whose clusters do not
+    partition the candidates, or whose modal share does not match
+    its modal cluster, is refused at construction — and so is one
+    whose tie-break means are forged, since ``select()`` reads them.
     """
 
     n: int
@@ -504,6 +536,21 @@ class DiversityReport:
             raise ValueError(
                 f"max_pair_similarity must be in (0, 1), got {self.max_pair_similarity}"
             )
+        # Pair coverage: exactly one pair per (i, j), i < j.
+        expected_pairs = [(i, j) for i in range(self.n) for j in range(i + 1, self.n)]
+        if sorted((p.i, p.j) for p in self.pairs) != expected_pairs:
+            raise ValueError("pairs must cover every (i, j) with i < j exactly once")
+        # near_duplicate flags are recomputed from similarity vs
+        # threshold, never trusted: a pair at 0.99 similarity cannot
+        # claim to be a non-duplicate, and a pair at 0.10 cannot claim
+        # to be one.
+        for pair in self.pairs:
+            if pair.near_duplicate != (pair.similarity > self.max_pair_similarity):
+                raise ValueError(
+                    f"pair {pair.i}/{pair.j} near_duplicate flag contradicts "
+                    f"its similarity {pair.similarity:.2f} vs threshold "
+                    f"{self.max_pair_similarity:.2f}"
+                )
         if self.diverse != (not any(p.near_duplicate for p in self.pairs)):
             raise ValueError(
                 "diverse flag contradicts the pair measurements: a set "
@@ -512,10 +559,40 @@ class DiversityReport:
         flat = sorted(i for cluster in self.clusters for i in cluster)
         if flat != list(range(self.n)):
             raise ValueError("clusters must partition the candidate indices")
+        # Clusters must be the connected components over the
+        # near-duplicate edges, and the modal cluster the largest
+        # (ties: lowest first index) — recomputed, not trusted.
+        edges = [(p.i, p.j) for p in self.pairs if p.near_duplicate]
+        expected_clusters = _clusters(self.n, edges)
+        if sorted(tuple(c) for c in self.clusters) != sorted(tuple(c) for c in expected_clusters):
+            raise ValueError(
+                "clusters must be the connected components over the near-duplicate edges"
+            )
+        expected_modal = max(expected_clusters, key=lambda c: (len(c), -c[0]))
+        if tuple(self.modal_cluster) != tuple(expected_modal):
+            raise ValueError(
+                f"modal_cluster must be the largest cluster {expected_modal}, "
+                f"got {list(self.modal_cluster)}"
+            )
         if self.modal_cluster not in self.clusters:
             raise ValueError("modal_cluster must be one of the clusters")
         if abs(self.modal_share - len(self.modal_cluster) / self.n) > 1e-12:
             raise ValueError("modal_share must equal len(modal_cluster) / n")
+        # Min/mean diversity and per-candidate means are recomputed
+        # from the pairs: the tie-break reads the means, so forged
+        # means must not steer a tie.
+        similarities = [p.similarity for p in self.pairs]
+        if abs(self.min_pair_diversity - min(1.0 - s for s in similarities)) > 1e-12:
+            raise ValueError("min_pair_diversity must match the pair similarities")
+        if (
+            abs(self.mean_pair_diversity - sum(1.0 - s for s in similarities) / len(similarities))
+            > 1e-12
+        ):
+            raise ValueError("mean_pair_diversity must match the pair similarities")
+        for i in range(self.n):
+            own = [p.similarity for p in self.pairs if p.i == i or p.j == i]
+            if abs(self.mean_similarity_by_candidate[i] - sum(own) / len(own)) > 1e-12:
+                raise ValueError(f"mean similarity for candidate {i} must match the pairs")
         if not self.set_fingerprint:
             raise ValueError("set_fingerprint must be non-empty")
 
@@ -557,7 +634,7 @@ def _clusters(n: int, edges: Sequence[tuple[int, int]]) -> list[list[int]]:
 
 
 def analyze_diversity(diverge_set: DivergeSet) -> DiversityReport:
-    """Score a candidate set for genuine diversity, not paraphrases."""
+    """Score a candidate set for token-level diversity, not paraphrases."""
     texts = [c.text for c in diverge_set.candidates]
     n = len(texts)
     pairs: list[PairSimilarity] = []
@@ -617,6 +694,14 @@ class PConventionalCheck:
     candidate is not in the modal cluster — the candidates converge on
     a different answer than the one declared conventional, recorded
     here and in the selection reason, never smoothed over.
+    ``tolerance`` and ``n`` are carried so the verdict is checkable
+    from the record alone: the verdict must follow from the interval
+    ± tolerance, the interval must be the Wilson 95% interval on the
+    conventional share, and the conventional share can never exceed
+    the modal share (the conventional cluster is one cluster; the
+    modal cluster is the largest). A check with a flipped verdict,
+    a forged interval, or a conventional share above the modal share
+    is refused at construction.
     ``set_fingerprint`` binds this check to the candidate set it was
     computed from.
     """
@@ -629,6 +714,8 @@ class PConventionalCheck:
     conventional_in_modal: bool
     notes: tuple[str, ...]
     set_fingerprint: str
+    tolerance: float
+    n: int
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -638,11 +725,45 @@ class PConventionalCheck:
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1], got {value}")
+        if self.n < 2:
+            raise ValueError(f"p-check needs n >= 2, got {self.n}")
+        if not 0.0 <= self.tolerance < 1.0:
+            raise ValueError(f"tolerance must be in [0, 1), got {self.tolerance}")
+        if self.conventional_share > self.modal_share:
+            raise ValueError(
+                "conventional share cannot exceed the modal share: "
+                f"{self.conventional_share} > {self.modal_share}"
+            )
         low, high = self.agreement_interval
         if not 0.0 <= low <= high <= 1.0:
             raise ValueError(
                 f"agreement interval must satisfy 0 <= low <= high <= 1, "
                 f"got {self.agreement_interval!r}"
+            )
+        # The interval must be the Wilson 95% interval on the
+        # conventional share (k = round(share * n) of n candidates).
+        expected_low, expected_high = wilson_interval(
+            round(self.conventional_share * self.n), self.n
+        )
+        if abs(low - expected_low) > 1e-12 or abs(high - expected_high) > 1e-12:
+            raise ValueError(
+                "agreement interval must be the Wilson 95% interval on "
+                f"the conventional share {self.conventional_share:.2f} "
+                f"over n={self.n}"
+            )
+        # The verdict must follow from the interval ± tolerance.
+        if self.declared_p > high + self.tolerance:
+            expected_verdict: PCheckVerdict = "overconfident"
+        elif self.declared_p < low - self.tolerance:
+            expected_verdict = "underconfident"
+        else:
+            expected_verdict = "consistent"
+        if self.verdict != expected_verdict:
+            raise ValueError(
+                f"verdict {self.verdict!r} contradicts the interval "
+                f"[{low:.2f}, {high:.2f}] ± tolerance {self.tolerance:.2f} "
+                f"for declared p {self.declared_p:.2f}: expected "
+                f"{expected_verdict!r}"
             )
         if self.verdict not in ("consistent", "overconfident", "underconfident"):
             raise ValueError(f"unknown p-check verdict: {self.verdict!r}")
@@ -662,6 +783,8 @@ class PConventionalCheck:
             "conventional_in_modal": self.conventional_in_modal,
             "notes": list(self.notes),
             "set_fingerprint": self.set_fingerprint,
+            "tolerance": self.tolerance,
+            "n": self.n,
         }
 
 
@@ -731,6 +854,8 @@ def check_p_conventional(diverge_set: DivergeSet, report: DiversityReport) -> PC
         conventional_in_modal=in_modal,
         notes=tuple(notes),
         set_fingerprint=diverge_set.fingerprint(),
+        tolerance=tolerance,
+        n=report.n,
     )
 
 
@@ -821,7 +946,12 @@ class Selection:
                 "runner-up score cannot exceed the winner score: "
                 f"{self.runner_up_score} > {self.winner_score}"
             )
-        if self.margin != self.winner_score - self.runner_up_score:
+        # Float subtraction is not exact (0.95 - 0.90 is
+        # 0.04999999999999993, not 0.05), so a mathematically correct
+        # margin written as a literal must not be refused as forged:
+        # compare with the same 1e-12 tolerance the diversity report
+        # uses for modal_share.
+        if abs(self.margin - (self.winner_score - self.runner_up_score)) > 1e-12:
             raise ValueError(
                 "margin must equal winner_score - runner_up_score: "
                 f"{self.margin} != {self.winner_score} - {self.runner_up_score}"
@@ -971,13 +1101,18 @@ def select(
 
 
 def may_decide_high_stakes(selection: Selection) -> bool:
-    """True only for a diverse selection with a non-overconfident p.
+    """True only for a diverse 5-candidate selection with a non-overconfident p.
 
-    A high-stakes decision needs both: genuine diversity (the choice
-    was between different answers) and a p_conventional the
-    measurement does not refute.
+    A high-stakes decision needs all three: exactly 5 candidates (the
+    issue's number), token-level diversity (the choice was between
+    answers that are not near-verbatim paraphrases), and a
+    p_conventional the measurement does not refute. The count is
+    enforced HERE, from the selection record — not at build time,
+    where a caller could pass low stakes and decide high stakes
+    anyway. A 2-candidate selection, however diverse and however
+    confident, may not decide.
     """
-    return selection.diverse and selection.p_verdict != "overconfident"
+    return selection.n == 5 and selection.diverse and selection.p_verdict != "overconfident"
 
 
 def require_high_stakes_decision(selection: Selection) -> Selection:
@@ -988,15 +1123,17 @@ def require_high_stakes_decision(selection: Selection) -> Selection:
     single sample, or a score has no path through this function.
     """
     if not may_decide_high_stakes(selection):
-        raise HighStakesRefused(
-            "high-stakes decision refused: "
-            + (
-                "selection is not diverse"
-                if not selection.diverse
-                else "p_conventional was overconfident against the measured "
+        if selection.n != 5:
+            why = f"selection covers {selection.n} candidates, high-stakes /diverge needs exactly 5"
+        elif not selection.diverse:
+            why = "selection is not diverse"
+        else:
+            why = (
+                "p_conventional was overconfident against the measured "
                 "share of the conventional answer's cluster"
             )
-            + f" (outcome {selection.outcome}, p verdict "
+        raise HighStakesRefused(
+            "high-stakes decision refused: " + why + f" (outcome {selection.outcome}, p verdict "
             f"{selection.p_verdict})"
         )
     return selection

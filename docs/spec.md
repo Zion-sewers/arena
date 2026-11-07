@@ -72,9 +72,11 @@ src/agenteval_bench/
   diverge.py      # Anti-mode-collapse: /diverge with 5 candidates +
                   #   p_conventional (Candidate, DivergeSet, DiversityReport,
                   #   check_p_conventional, select, require_high_stakes_decision;
-                  #   pair similarity = max(content-token, hard-token) Jaccard,
-                  #   weakest-link grade, Wilson interval on the modal share;
-                  #   single-sample generation refused on high stakes)
+                  #   pair similarity = max(content-token, hard-token) Jaccard
+                  #   (hard-token signal only with >= 3 hard tokens per side),
+                  #   weakest-link grade, Wilson interval on the conventional
+                  #   cluster's share; single-sample generation refused on
+                  #   high stakes; the high-stakes gate requires exactly 5)
   diverge_demo.py # Seeded end-to-end demo of /diverge
   regression.py   # Production failures -> frozen versions -> release gate
   snapshots.py    # Immutable benchmark snapshots (hash-verified store)

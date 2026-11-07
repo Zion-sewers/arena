@@ -863,14 +863,15 @@ def cmd_diverge(args: list[str]) -> int:
 
     Reads a candidates file (--candidates file.json: prompt, 5
     candidates with scores, conventional_index, p_conventional, and
-    optional stakes), scores the set for genuine diversity, checks the
+    optional stakes), scores the set for token-level diversity
+    (near-duplicate detection, not semantic diversity), checks the
     declared p_conventional against the measured share of the
     conventional answer's cluster, and selects on score — recording
     why the conventional answer won or lost. Exit 0 = a selection was
     made and it may decide on the declared stakes; exit 2 = refused
-    (paraphrase set, overconfident p on high stakes, or too few
-    candidates on high stakes); exit 1 = unusable candidates file or
-    policy.
+    (paraphrase set, overconfident p on high stakes, too few
+    candidates on high stakes, or a selection covering anything other
+    than 5 candidates); exit 1 = unusable candidates file or policy.
     """
     from agenteval_bench.diverge import (
         DivergePolicy,
@@ -935,6 +936,7 @@ def cmd_diverge(args: list[str]) -> int:
     payload = {
         "prompt": diverge_set.prompt,
         "stakes": stakes,
+        "diversity_scope": "token-level near-duplicate",
         "report": report.to_dict(),
         "p_conventional": p_check.to_dict(),
         "selection": selection.to_dict(),
@@ -946,7 +948,11 @@ def cmd_diverge(args: list[str]) -> int:
         print(
             f"diverge: {'diverse' if report.diverse else 'NOT diverse'} "
             f"(min pairwise diversity {report.min_pair_diversity:.2f}, "
-            f"modal share {report.modal_share:.2f})"
+            f"conventional share {p_check.conventional_share:.2f})"
+        )
+        print(
+            "  note: diversity is token-level only — 'diverse' means no "
+            "near-verbatim pair, not semantic diversity"
         )
         print(
             f"  p_conventional {p_check.declared_p:.2f} is {p_check.verdict} "

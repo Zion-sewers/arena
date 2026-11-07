@@ -114,6 +114,23 @@ class TestSimilarity:
         assert pair_similarity(HASHMAP, paraphrase) < 0.80
         assert pair_similarity(CACHE, "Store results in Redis expiring after one minute") < 0.80
 
+    def test_two_shared_numbers_do_not_convict_different_answers(self) -> None:
+        # The hard-token anchor needs three shared numbers: Jaccard on
+        # two-element sets is 0 or 1, so two shared numbers used to
+        # score genuinely different answers as identical.
+        assert pair_similarity("Set timeout 30 retries 3", "Set limit 30 attempts 3") < 0.80
+
+    def test_three_shared_numbers_still_anchor_a_paraphrase(self) -> None:
+        # Same three numbers, reworded glue, content overlap below the
+        # bar: the hard-token anchor still convicts.
+        assert (
+            pair_similarity(
+                "Use timeout 30 retries 2 backoff 5",
+                "Set timeout 30 retries 2 backoff 5 now",
+            )
+            > 0.80
+        )
+
     def test_different_numbers_are_different_answers(self) -> None:
         assert pair_similarity("Retry after 30 seconds", "Retry after 300 seconds") < 0.80
 
@@ -183,6 +200,41 @@ class TestDiversity:
         report = analyze_diversity(diverge_set)
         with pytest.raises(ValueError, match="contradicts the pair measurements"):
             replace(report, diverse=False)
+
+    def test_a_forged_near_duplicate_flag_is_refused(self) -> None:
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        forged_pair = replace(report.pairs[0], near_duplicate=True)
+        forged_pairs = (forged_pair,) + report.pairs[1:]
+        with pytest.raises(ValueError, match="near_duplicate flag contradicts"):
+            replace(report, pairs=forged_pairs)
+
+    def test_forged_means_are_refused(self) -> None:
+        # The tie-break reads the per-candidate means, so forged means
+        # must not steer a tie: a report whose means do not match its
+        # pairs is refused at construction.
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        with pytest.raises(ValueError, match="mean similarity for candidate"):
+            replace(report, mean_similarity_by_candidate=(0.0, 0.0, 0.0, 0.0, 0.0))
+
+    def test_forged_min_diversity_is_refused(self) -> None:
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        with pytest.raises(ValueError, match="min_pair_diversity must match"):
+            replace(report, min_pair_diversity=1.0)
+
+    def test_forged_clusters_are_refused(self) -> None:
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        with pytest.raises(ValueError, match="connected components"):
+            replace(report, clusters=((0, 1), (2,), (3,), (4,)))
+
+    def test_forged_modal_cluster_is_refused(self) -> None:
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        with pytest.raises(ValueError, match="modal_cluster must be the largest"):
+            replace(report, modal_cluster=(4,))
 
     def test_diversity_grade_is_the_weakest_link(self) -> None:
         _, diverge_set = _set()
@@ -267,6 +319,28 @@ class TestPConventional:
         consistent = check_p_conventional(consistent_set, analyze_diversity(consistent_set))
         assert "does not refute" in p_check_summary(consistent)
 
+    def test_a_forged_verdict_is_refused(self) -> None:
+        _, diverge_set = _set(p=0.60)
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        assert check.verdict == "consistent"
+        with pytest.raises(ValueError, match="contradicts the interval"):
+            replace(check, verdict="overconfident")
+
+    def test_a_forged_interval_is_refused(self) -> None:
+        _, diverge_set = _set(p=0.60)
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        with pytest.raises(ValueError, match="must be the Wilson 95% interval"):
+            replace(check, agreement_interval=(0.0, 1.0))
+
+    def test_a_conventional_share_above_the_modal_share_is_refused(self) -> None:
+        _, diverge_set = _set(p=0.60)
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        with pytest.raises(ValueError, match="cannot exceed the modal share"):
+            replace(check, conventional_share=0.99)
+
     def test_conventional_outside_the_modal_cluster_is_a_finding(self) -> None:
         candidates = [
             Candidate(HASHMAP_LONG, 0.70),
@@ -339,6 +413,15 @@ class TestSelection:
         with pytest.raises(ValueError, match="out of range"):
             replace(selection, winner_index=5)
 
+    def test_a_rounded_literal_margin_is_accepted(self) -> None:
+        # Float subtraction is not exact (0.95 - 0.90 is
+        # 0.04999999999999993, not 0.05): a mathematically correct
+        # margin written as a literal must not be refused as forged.
+        _, diverge_set = _set(scores=(0.95, 0.90, 0.60, 0.80, 0.75))
+        report = analyze_diversity(diverge_set)
+        won = select(diverge_set, report, check_p_conventional(diverge_set, report))
+        assert replace(won, margin=0.05).margin == 0.05
+
     def test_selection_refuses_a_paraphrase_set(self) -> None:
         candidates = [
             Candidate(HASHMAP_LONG, 0.70),
@@ -379,6 +462,38 @@ class TestHighStakesGate:
         candidates = [Candidate(HASHMAP, 0.70), Candidate(SORT, 0.90)]
         with pytest.raises(SingleSampleError, match="exactly 5"):
             build_diverge_set(PROMPT, candidates, 0, 0.50, stakes="high", policy=policy)
+
+    def test_gate_refuses_a_short_selection_built_directly(self) -> None:
+        # The gate enforces the count from the selection record: a
+        # 2-candidate set built low-stakes through the public
+        # constructor selects fine, but it must not decide high stakes.
+        policy = DivergePolicy(n_candidates=2)
+        candidates = [Candidate(HASHMAP, 0.70), Candidate(SORT, 0.90)]
+        small = build_diverge_set(PROMPT, candidates, 0, 0.50, stakes="low", policy=policy)
+        report = analyze_diversity(small)
+        selection = select(small, report, check_p_conventional(small, report))
+        assert selection.n == 2
+        assert not may_decide_high_stakes(selection)
+        with pytest.raises(HighStakesRefused, match="exactly 5"):
+            require_high_stakes_decision(selection)
+
+    def test_gate_refuses_a_six_candidate_selection(self) -> None:
+        policy = DivergePolicy(n_candidates=6)
+        candidates = [
+            Candidate(HASHMAP, 0.70),
+            Candidate(SORT, 0.90),
+            Candidate(SCAN, 0.60),
+            Candidate(TRIE, 0.80),
+            Candidate(CACHE, 0.75),
+            Candidate("Restart the service and retry the request", 0.65),
+        ]
+        wide = build_diverge_set(PROMPT, candidates, 0, 0.50, stakes="low", policy=policy)
+        report = analyze_diversity(wide)
+        selection = select(wide, report, check_p_conventional(wide, report))
+        assert selection.n == 6
+        assert not may_decide_high_stakes(selection)
+        with pytest.raises(HighStakesRefused, match="exactly 5"):
+            require_high_stakes_decision(selection)
 
     def test_short_list_on_low_stakes_is_a_shape_error_not_a_sample_error(self) -> None:
         candidates, _ = _set()
@@ -728,6 +843,49 @@ class TestCli:
         assert cmd_diverge(["--candidates", infile, "--json"]) == 0
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["selection"]["winner_index"] == 1
+
+    def test_cli_names_the_token_level_scope(self, tmp_path: Path) -> None:
+        infile = self._write(tmp_path, self._payload())
+        out = str(tmp_path / "report.json")
+        assert cmd_diverge(["--candidates", infile, "--out", out]) == 0
+        written = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+        assert written["diversity_scope"] == "token-level near-duplicate"
+
+    def test_cli_human_output_names_the_token_level_scope(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        infile = self._write(tmp_path, self._payload())
+        assert cmd_diverge(["--candidates", infile]) == 0
+        assert "token-level only" in capsys.readouterr().out
+
+
+class TestFingerprint:
+    def test_fingerprint_is_canonical_across_number_spellings(self) -> None:
+        # Int and float spellings of the same set — score 1 vs 1.0,
+        # p 1 vs 1.0, score -0.0 vs 0.0 — must fingerprint alike, or
+        # a report from one spelling is refused for the other.
+        _, int_set = _set(scores=(1, 0, 0, 0, 0), p=1)
+        _, float_set = _set(scores=(1.0, 0.0, 0.0, 0.0, 0.0), p=1.0)
+        assert int_set.fingerprint() == float_set.fingerprint()
+        _, neg_zero_set = _set(scores=(-0.0, 0.0, 0.0, 0.0, 0.0), p=0.0)
+        _, pos_zero_set = _set(scores=(0.0, 0.0, 0.0, 0.0, 0.0), p=0.0)
+        assert neg_zero_set.fingerprint() == pos_zero_set.fingerprint()
+
+
+def test_verdict_domains_are_exported_at_top_level() -> None:
+    from typing import get_args
+
+    from agenteval_bench import (
+        PCheckVerdict,
+        SelectionOutcome,
+        content_tokens,
+        hard_tokens,
+    )
+
+    assert get_args(PCheckVerdict) == ("consistent", "overconfident", "underconfident")
+    assert get_args(SelectionOutcome) == ("conventional_won", "conventional_lost", "tie")
+    assert "hash" in content_tokens(HASHMAP)
+    assert "60s" in hard_tokens(CACHE)
 
 
 def test_demo_main_runs_end_to_end() -> None:

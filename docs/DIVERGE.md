@@ -18,10 +18,10 @@ selection happens.
 
 ```
 record 5 candidates (with caller-supplied scores)
-  -> score the set for genuine diversity (not paraphrases)
-  -> check declared p_conventional against the measured modal share
+  -> score the set for token-level diversity (near-duplicate detection, not semantic diversity)
+  -> check declared p_conventional against the measured share of the conventional answer's cluster
   -> select on score; the record says why the conventional answer won or lost
-  -> high-stakes decisions need a diverse selection with a non-overconfident p
+  -> high-stakes decisions need a diverse 5-candidate selection with a non-overconfident p
 ```
 
 ### 1. Candidates are recorded, never invented
@@ -43,10 +43,11 @@ by reading them:
   answer changes them.
 - **Hard-token Jaccard**: digit-bearing tokens (numbers, versions,
   identifiers with digits). It applies only when BOTH sides carry at
-  least two hard tokens: a single shared number is coincidence, not
-  paraphrase evidence — Jaccard on singleton sets is 0 or 1, so one
-  shared "30" used to score "Retry after 30 seconds" vs "Delete
-  after 30 days" as identical answers and refuse the set.
+  least three hard tokens: Jaccard on tiny hard-token sets has almost
+  no gradation, so one shared number — or two — is coincidence, not
+  paraphrase evidence. Shared numbers are paraphrase evidence only
+  in bulk. Residual, disclosed here: two genuinely different answers
+  that share three numbers can still be refused.
 
 Pair similarity is the **max** of the two when the hard-token floor
 is met, else the content Jaccard. Max, not mean: either signal can
@@ -114,12 +115,21 @@ selection reason, never smoothed over.
 
 The pipeline is fingerprint-linked: every diversity report, p-check
 and selection carries the SHA-256 fingerprint of the candidate set
-it was computed from, and a step refuses a measurement whose
-fingerprint does not match the set in hand. Every record validates
-its own invariants at construction — a selection whose margin is not
-winner-minus-runner-up, or whose outcome contradicts its scores, is
-refused — so the high-stakes gate trusts a record that cannot be
-forged in an inconsistent state.
+it was computed from (numbers coerced to float, so int and float
+spellings of the same set fingerprint alike), and a step refuses a
+measurement whose fingerprint does not match the set in hand. Every
+record validates its own invariants at construction, recomputed from
+the fields it carries: the report re-derives its near-duplicate
+flags, clusters, modal cluster, diversities and per-candidate means
+from the pairs; the p-check re-derives its interval and verdict from
+the conventional share, n and tolerance; the selection re-derives
+its margin and outcome from the scores. A record that satisfies
+every invariant is indistinguishable from a pipeline-built one —
+the validations catch inconsistent records, not a determined forger
+who builds a consistent one — but no gate-relevant field is a bare
+echo anymore: the tie-break means, the p verdict, and the gate's
+count are all either recomputed or enforced (the gate refuses any
+selection covering anything other than 5 candidates).
 
 ### 4. Selection records why the conventional answer won or lost
 
@@ -144,10 +154,12 @@ prose beside it to drift from it.
   policy must ask for exactly 5 — a policy that shrinks the count
   would let a 2-candidate set through the gate on the library seam.
 - `may_decide_high_stakes(selection)` is True only for a diverse
-  selection with a non-overconfident p; `require_high_stakes_decision`
-  raises typed `HighStakesRefused` otherwise. The gate takes ONLY the
-  selection record: a bare candidate, a single sample, or a score has
-  no path through it.
+  selection covering exactly 5 candidates with a non-overconfident
+  p; `require_high_stakes_decision` raises typed `HighStakesRefused`
+  otherwise. The gate enforces the count itself from the selection
+  record, so a short set built low-stakes cannot decide high stakes.
+  The gate takes ONLY the selection record: a bare candidate, a
+  single sample, or a score has no path through it.
 
 ## CLI
 
