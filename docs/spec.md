@@ -215,6 +215,7 @@ table:
 | `decide` | GATE | ROLLBACK | INVESTIGATE | usage error |
 | `calibrate` | calibrated | bad input | mis/uncalibrated | — |
 | `ship` | SHIP | NO_SHIP / NEEDS_REPLICATION | bad input | — |
+| `register-design` | registered | — | bad input | — |
 
 > The `compare` and `report` subcommands described in earlier drafts are **`planned`**
 > (see §9) and are **not** implemented in v0.1.0; invoking an unknown command exits `1`.

@@ -19,6 +19,22 @@ an interim reject. Verification then checks the looks exactly through
 the stopping look, re-derives the reject from z, and checks n_final
 against n_planned * stopped_at. Stopping early without a reject is
 refused as EARLY_STOP_WITHOUT_REJECT.
+
+Design registration (agenteval-bench#46): the same hash chain also
+carries experiment DESIGN records — which metric is the OEC, the
+guardrail budgets, the expected allocation, the surprise threshold.
+A design record commits to the previous record's digest exactly like
+a plan record, so a design cannot be silently rewritten after data
+arrives either. `register_design` appends one; `find_design` checks
+whether a design was registered. The ship gate (#46) refuses any
+design that is not in the chain. Amendment rule (stated, not hidden):
+the chain is append-only, so correcting a design means registering a
+NEW design record; the old record stays, and the ship verdict records
+which design digest was used, so an audit can check it was the
+current one. Timing is workflow-bound, same as #32: the chain binds
+contents immutably, it does not prove the design was registered
+before data collection — but now there IS a recorded design whose
+precedence could be proven, where before there was none.
 """
 
 from __future__ import annotations
@@ -49,11 +65,19 @@ class RegistryMalformed(RegistryCorrupted):
 
 @dataclass(frozen=True)
 class LookEvidence:
-    """Reported interim result: fraction, z-statistic, claimed decision."""
+    """Reported interim result: fraction, z-statistic, claimed decision.
+
+    ``metric`` names the metric the z-statistic belongs to. Empty
+    means unnamed (pre-#46 evidence): the sequential gate does not
+    need it, and #32 verification ignores it. The #46 ship gate
+    requires every look to name the design's OEC metric — a z with no
+    metric provenance cannot ship as an OEC win.
+    """
 
     fraction: float
     z: float
     rejected: bool
+    metric: str = ""
 
 
 @dataclass(frozen=True)
@@ -102,14 +126,29 @@ def _canonical_plan(plan: ExperimentPlan) -> Mapping[str, object]:
     }
 
 
-def _record_digest(prev_digest: str, canonical: Mapping[str, object]) -> str:
+def _record_digest(
+    prev_digest: str, canonical: Mapping[str, object], kind_key: str = "plan"
+) -> str:
     payload = json.dumps(
-        {"prev": prev_digest, "plan": canonical}, sort_keys=True, separators=(",", ":")
+        {"prev": prev_digest, kind_key: canonical},
+        sort_keys=True,
+        separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _read_records(registry_path: str) -> list[dict]:
+def _record_kind(record: dict[str, object]) -> str:
+    """The record's kind: "plan" or "design"; "" when malformed."""
+    has_plan = isinstance(record.get("plan"), dict)
+    has_design = isinstance(record.get("design"), dict)
+    if has_plan and not has_design:
+        return "plan"
+    if has_design and not has_plan:
+        return "design"
+    return ""
+
+
+def _read_records(registry_path: str) -> list[dict[str, object]]:
     try:
         with open(registry_path, encoding="utf-8") as f:
             lines = [line.strip() for line in f if line.strip()]
@@ -119,12 +158,19 @@ def _read_records(registry_path: str) -> list[dict]:
     prev = "GENESIS"
     try:
         for rec in records:
-            if not isinstance(rec, dict) or not isinstance(rec.get("plan"), dict):
+            if not isinstance(rec, dict):
                 raise RegistryMalformed(f"record has wrong shape: {str(rec)[:80]}")
-            digest = _record_digest(prev, rec["plan"])
+            kind = _record_kind(rec)
+            if not kind:
+                raise RegistryMalformed(f"record has wrong shape: {str(rec)[:80]}")
+            kind_payload = rec[kind]
+            if not isinstance(kind_payload, dict):
+                raise RegistryMalformed(f"record has wrong shape: {str(rec)[:80]}")
+            digest = _record_digest(prev, kind_payload, kind)
             if not isinstance(rec.get("digest"), str) or digest != rec["digest"]:
                 raise RegistryCorrupted(
-                    f"hash chain broken at plan {rec['plan'].get('name')!r}: "
+                    f"hash chain broken at {kind} "
+                    f"{kind_payload.get('name', kind_payload.get('plan_digest', '?'))!r}: "
                     "the registry was rewritten after registration"
                 )
             prev = digest
@@ -133,45 +179,115 @@ def _read_records(registry_path: str) -> list[dict]:
     return records
 
 
-def register_plan(plan: ExperimentPlan, registry_path: str) -> str:
-    """Append a plan to the hash-chained registry; return its digest."""
+def _append_record(
+    kind_key: str, canonical: Mapping[str, object], registry_path: str
+) -> str:
+    """Append one hash-chained record of either kind; return its digest."""
     parent = os.path.dirname(registry_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
     records = _read_records(registry_path)
-    prev = records[-1]["digest"] if records else "GENESIS"
-    canonical = _canonical_plan(plan)
-    digest = _record_digest(prev, canonical)
+    prev = "GENESIS"
+    if records:
+        last_digest = records[-1]["digest"]
+        assert isinstance(last_digest, str)
+        prev = last_digest
+    digest = _record_digest(prev, canonical, kind_key)
     record = {
         "digest": digest,
         "registered_at": datetime.now(UTC).isoformat(),
-        "plan": canonical,
+        kind_key: canonical,
     }
     with open(registry_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, sort_keys=True) + "\n")
     return digest
 
 
-def load_plan(digest: str, registry_path: str) -> ExperimentPlan:
-    """Load a registered plan by digest; unknown digests raise KeyError."""
+def register_plan(plan: ExperimentPlan, registry_path: str) -> str:
+    """Append a plan to the hash-chained registry; return its digest."""
+    return _append_record("plan", _canonical_plan(plan), registry_path)
+
+
+def register_design(
+    canonical_design: Mapping[str, object], registry_path: str
+) -> str:
+    """Append a design to the hash-chained registry; return its digest.
+
+    Takes the canonical design mapping (see
+    ``experiment.oec.ExperimentDesign.to_dict``) rather than the
+    dataclass, so this module stays free of the OEC layer: the caller
+    validates the design before registering it. A design record binds
+    the OEC, the guardrail budgets, the expected allocation, and the
+    surprise threshold to the plan digest it names.
+    """
+    if not isinstance(canonical_design, dict) or not canonical_design:
+        raise ValueError("design record needs a non-empty canonical mapping")
+    return _append_record("design", canonical_design, registry_path)
+
+
+def load_design(digest: str, registry_path: str) -> Mapping[str, object]:
+    """Load a registered design's canonical mapping by digest.
+
+    Unknown digests raise KeyError; a broken chain raises
+    RegistryCorrupted through _read_records.
+    """
     for rec in _read_records(registry_path):
-        if rec["digest"] == digest:
-            p = rec["plan"]
-            cov = p["covariate"]
-            return ExperimentPlan(
-                name=p["name"],
-                n_planned=p["n_planned"],
-                alpha=p["alpha"],
-                sides=p["sides"],
-                looks=tuple(p["looks"]),
-                covariate=(
-                    CovariateSpec(name=cov["name"], source=cov["source"])
-                    if cov is not None
-                    else None
-                ),
-                n_tolerance=p["n_tolerance"],
-                min_n=p["min_n"],
-            )
+        if rec["digest"] == digest and _record_kind(rec) == "design":
+            design = rec["design"]
+            assert isinstance(design, dict)
+            return design
+    raise KeyError(f"no registered design with digest {digest[:12]}...")
+
+
+def find_design(
+    canonical_design: Mapping[str, object], registry_path: str
+) -> str | None:
+    """Digest of a registered design equal to ``canonical_design``.
+
+    Returns None when no design record matches. Equality is on the
+    canonical mapping (dict equality, key order irrelevant), so a
+    design file that round-trips through JSON matches the record it
+    was registered from. A post-hoc rewrite — a different OEC, a
+    wider guardrail budget, a moved surprise threshold — matches
+    nothing and is refused by the ship gate.
+    """
+    for rec in _read_records(registry_path):
+        if _record_kind(rec) != "design":
+            continue
+        if rec["design"] == dict(canonical_design):
+            digest = rec["digest"]
+            assert isinstance(digest, str)
+            return digest
+    return None
+
+
+def load_plan(digest: str, registry_path: str) -> ExperimentPlan:
+    """Load a registered plan by digest; unknown digests raise KeyError.
+
+    Design records in the same chain are skipped: a design digest is
+    not a plan digest, and vice versa.
+    """
+    for rec in _read_records(registry_path):
+        if rec["digest"] != digest or _record_kind(rec) != "plan":
+            continue
+        p = rec["plan"]
+        if not isinstance(p, dict):
+            raise RegistryMalformed(f"plan record has wrong shape: {str(rec)[:80]}")
+        cov = p["covariate"]
+        return ExperimentPlan(
+            name=p["name"],
+            n_planned=p["n_planned"],
+            alpha=p["alpha"],
+            sides=p["sides"],
+            looks=tuple(p["looks"]),
+            covariate=(
+                CovariateSpec(name=cov["name"], source=cov["source"])
+                if cov is not None
+                else None
+            ),
+            n_tolerance=p["n_tolerance"],
+            min_n=p["min_n"],
+        )
     raise KeyError(f"no registered plan with digest {digest[:12]}...")
 
 

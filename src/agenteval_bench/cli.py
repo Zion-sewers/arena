@@ -894,7 +894,11 @@ def cmd_ship(args: list[str]) -> int:
     except (ValueError, TypeError, OSError) as e:
         print(f"Error: unusable evidence: {e}", file=sys.stderr)
         return 2
-    assert registry_path is not None
+    if registry_path is None or not os.path.exists(registry_path):
+        # A missing registry is unusable input, not a NO_SHIP: the
+        # gate cannot grade against a plan it cannot load.
+        print(f"Error: registry not found: {registry_path}", file=sys.stderr)
+        return 2
     try:
         verdict = ship_decision(design, evidence, registry_path)
     except (ValueError, TypeError, KeyError) as e:
@@ -931,6 +935,38 @@ def cmd_ship(args: list[str]) -> int:
             return 2
         print(f"Report: {out}", file=sys.stderr if as_json else sys.stdout)
     return 0 if verdict.status == "ship" else 1
+
+
+def cmd_register_design(args: list[str]) -> int:
+    """Register an OEC ship-gate design in the hash chain (arena#46).
+
+    Reads a design (--design design.json) and appends it to the
+    registry (--registry, default plans/experiments.jsonl). The
+    design's plan must already be registered. Exit 0 = registered
+    (digest printed); exit 2 = unusable design/registry.
+    """
+    from experiment.oec import design_from_json, register_design
+
+    args, design_path = _flag(args, "--design")
+    args, registry_path = _flag(args, "--registry", "plans/experiments.jsonl")
+    if not design_path:
+        print("Error: register-design needs --design <file.json>", file=sys.stderr)
+        return 2
+    try:
+        design = design_from_json(Path(design_path).read_text(encoding="utf-8"))
+    except (ValueError, TypeError, OSError) as e:
+        print(f"Error: unusable design: {e}", file=sys.stderr)
+        return 2
+    if registry_path is None or not os.path.exists(registry_path):
+        print(f"Error: registry not found: {registry_path}", file=sys.stderr)
+        return 2
+    try:
+        digest = register_design(design, registry_path)
+    except (ValueError, TypeError, KeyError) as e:
+        print(f"Error: cannot register design: {e}", file=sys.stderr)
+        return 2
+    print(f"registered design {digest}")
+    return 0
 
 
 def cmd_replay(args: list[str]) -> int:
@@ -1907,6 +1943,9 @@ def main() -> None:
         print("                                [--registry plans/experiments.jsonl]")
         print("                                [--json] [--out report.json]")
         print("                                (exit 0 SHIP, 1 NO_SHIP/NEEDS_REPLICATION, 2 bad input)")
+        print("       agenteval-bench register-design --design <file.json>")
+        print("                                [--registry plans/experiments.jsonl]")
+        print("                                (exit 0 registered, 2 bad input)")
         print("       agenteval-bench bugsmith --repo <dir> --out <dir> [--procedural 8]")
         print("                                [--seed 42] [--local] [--config curation.json]")
         print("                                [--pr-mirror patch:pr-ref]")
@@ -1954,6 +1993,8 @@ def main() -> None:
         sys.exit(cmd_calibrate(rest))
     elif cmd == "ship":
         sys.exit(cmd_ship(rest))
+    elif cmd == "register-design":
+        sys.exit(cmd_register_design(rest))
     elif cmd == "bugsmith":
         sys.exit(cmd_bugsmith(rest))
     elif cmd == "snapshot":

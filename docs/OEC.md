@@ -13,7 +13,7 @@ Before data arrives, write down WHICH metric decides the change and
 which metrics must not regress:
 
 ```python
-from experiment import ExperimentDesign, MetricDeclaration, register_plan
+from experiment import ExperimentDesign, MetricDeclaration, register_design, register_plan
 from experiment.types import ExperimentPlan
 
 plan = ExperimentPlan(name="reranker-v2-vs-v1", n_planned=800,
@@ -30,24 +30,40 @@ design = ExperimentDesign(
     expected_allocation=(0.5, 0.5),
     surprise_z=3.0,
 )
+design_digest = register_design(design, "plans/experiments.jsonl")
 ```
 
-The design binds to the registered plan digest, so the OEC and the
-guardrail budgets are registered alongside the plan, before the
-change. Exactly one metric is the OEC; a guardrail without a
-pre-registered max regression is refused at construction; a decision
-metric carrying a regression budget is refused too. Evidence that
-reports its final z on a different metric is `OEC_MISMATCH` — there
-is no path that ships on a metric the design never named OEC.
+The design binds to the registered plan digest, AND the design itself
+is registered in the same hash chain (`register_design`), before the
+change: the OEC, the guardrail budgets, the expected allocation, and
+the surprise threshold are all committed to the chain. The ship gate
+matches the supplied design against its registered record by
+canonical content, so a design rewritten after results are known —
+a widened guardrail budget, a moved surprise threshold, a relabelled
+OEC — matches no record and is refused (`DESIGN_NOT_REGISTERED`).
+Amendment rule: the chain is append-only, so correcting a design
+means registering a NEW design record; the old record stays, and the
+ship verdict records which design digest was used. Exactly one metric
+is the OEC; a guardrail without a pre-registered max regression is
+refused at construction; a decision metric carrying a regression
+budget is refused too. Evidence that reports its final z on a
+different metric is `OEC_MISMATCH` — there is no path that ships on
+a metric the design never named OEC.
 
 ## 2. Trust gates run before results are read
 
 The ship gate evaluates, in this order, and short-circuits:
 
-1. **Plan binding + discipline** — the evidence replays through
+1. **Design binding** — the supplied design must match a design
+   record in the hash chain (`DESIGN_NOT_REGISTERED` otherwise), then
+   the plan is loaded and the evidence replays through
    `verify_experiment` (#32): unregistered plan, off-schedule peek,
    fabricated decision, sample deviation, or missing CUPED all refuse
-   the ship before anything else is examined.
+   the ship before anything else is examined. A design-validity check
+   runs at gate entry: the design alpha must equal the plan alpha
+   (`ALPHA_MISMATCH`), and the surprise threshold must exceed the
+   plan's final sequential boundary (`SURPRISE_THRESHOLD_INVALID`) —
+   a misconfigured design is refused before any trust test runs.
 2. **SRM** — sample-ratio mismatch: chi-square goodness-of-fit of the
    observed per-arm assignment counts against the registered
    allocation, flagged at p < 0.001 (Kohavi convention). An SRM
@@ -63,10 +79,23 @@ The ship gate evaluates, in this order, and short-circuits:
    non-inferiority check graded on the LOWER bound of the
    good-direction delta (the repo's lower-bound discipline, #43/#45):
    the guardrail holds iff the lower bound clears the pre-registered
-   max regression. A point estimate inside the budget with a lower
-   bound outside it FAILS. A declared guardrail with no observation is
-   UNMEASURED; an observation for an undeclared metric is refused.
-5. **OEC win** — only now is the result read: the final look must
+   max regression. The bound is a Newcombe interval (Wilson score
+   intervals per arm), not Wald: near p = 0/1 the Wald interval
+   collapses to zero width and zero observed events "pass" on one
+   sample, so the gate fails closed on thin data instead. A point
+   estimate inside the budget with a lower bound outside it FAILS. A
+   declared guardrail with no observation is UNMEASURED; an
+   observation for an undeclared metric is refused.
+5. **Secondary metrics** — every goal/driver metric the design
+   declares must be reported (`SECONDARY_UNMEASURED` otherwise); the
+   reported deltas are recorded in the verdict notes and do not gate.
+   An observation for a metric the design never declared as
+   goal/driver is refused.
+6. **Metric provenance** — every reported look names the metric its
+   z is computed on, and the gate refuses a win whose looks do not
+   name the design's OEC metric (`OEC_METRIC_UNPROVEN`). A z with no
+   metric behind it cannot ship as an OEC win.
+7. **OEC win** — only now is the result read: the final look must
    have rejected, in the OEC's declared direction. A non-significant
    final look is `NO_SIGNIFICANT_OEC_WIN`; a significant rejection in
    the wrong direction is `SIGNIFICANT_OEC_HARM`.
@@ -80,17 +109,22 @@ failure, never the win. The order is enforced in code
 A final |z| beyond the pre-registered `surprise_z` (default 3.0) is a
 surprising win: too-exciting results need a second look. The gate
 returns `NEEDS_REPLICATION` — not SHIP — until replication evidence
-arrives: a second run's z, significant one-sided at the registered
-alpha in the same direction, with n >= `min_replication_n` (default
-30) and a run_id distinct from the original run. A replication that
-re-reports the same run, is too small, or does not confirm blocks the
-ship (`REPLICATION_SAME_RUN` / `REPLICATION_TOO_SMALL` /
-`REPLICATION_NOT_CONFIRMED`).
+arrives: a second run's z, significant in the same direction at the
+registered alpha — at the one-sided level for a one-sided plan, the
+two-sided level for a two-sided plan — with n >= `min_replication_n`
+(default 30) and a run_id distinct from the original run. A
+replication that re-reports the same run, is too small, or does not
+confirm blocks the ship (`REPLICATION_SAME_RUN` /
+`REPLICATION_TOO_SMALL` / `REPLICATION_NOT_CONFIRMED`). The
+`NEEDS_REPLICATION` reason carries the recipe: a fresh run,
+significant at alpha in the winning direction, n >= the minimum, a
+different run_id.
 
 The surprise threshold must exceed the plan's final sequential
 boundary (else every significant win would need replication); the gate
 checks this against `group_sequential_boundaries` for the loaded plan
-and refuses the design otherwise (`SURPRISE_THRESHOLD_INVALID`).
+at gate entry — before any trust test runs — and refuses the design
+otherwise (`SURPRISE_THRESHOLD_INVALID`).
 
 ## 4. Shipping on a single exciting number is NOT allowed
 
@@ -100,14 +134,21 @@ from experiment import check_ship
 check_ship(design, evidence, "plans/experiments.jsonl")  # raises ShipRefused otherwise
 ```
 
-SHIP requires all of: registered plan + clean discipline, passing
-SRM and A/A, unregressed guardrails, a significant OEC win in the
-declared direction, and (for surprising wins) confirming replication.
+SHIP requires all of: registered plan + clean discipline, a
+registered design whose alpha matches the plan, passing SRM and A/A,
+unregressed guardrails, reported secondary metrics, metric-proven
+looks, a significant OEC win in the declared direction, and (for
+surprising wins) confirming replication.
 `ship_decision` returns the verdict without raising
 (`ship` / `no_ship` / `needs_replication` + named reasons);
-`check_ship` is the raising CI-gate form. From the command line:
+`check_ship` is the raising CI-gate form. From the command line,
+register the design first, then ship:
 
 ```bash
+agenteval-bench register-design --design examples/ship-design.json \
+    --registry examples/ship-registry.jsonl
+# registered design 8aa462b4...
+
 agenteval-bench ship --design examples/ship-design.json \
     --evidence examples/ship-evidence.json \
     --registry examples/ship-registry.jsonl
@@ -125,8 +166,16 @@ clean, guardrail unregressed) and exit 0. Flip `srm_counts` to
   against reported z's, reported guardrail counts against the
   registered budgets. It does not see raw data, so a
   fabricated-but-internally-consistent report verifies clean. What
-  the registry binds is the *plan* (immutably, via the hash chain),
-  not the data. Same boundary as #32.
+  the registry binds is the *plan and the design* (immutably, via the
+  hash chain), not the data. Same boundary as #32.
+- An early stop is supported: evidence may carry `stopped_at` with
+  the looks truncated at the stopping fraction, and the discipline
+  check re-derives the stopping decision from the z's. Metric
+  provenance is reported, not raw: a look names the metric its z is
+  computed on, and the gate refuses a win whose looks do not name
+  the OEC — but a fabricated look that names the right metric still
+  verifies clean. Same boundary as the plan: the registry binds the
+  design, not the data.
 - Replication independence is **workflow-bound**: the gate checks
   significance, direction, minimum n, and a distinct run_id, but a
   replication run_id minted from the same data verifies clean. The
@@ -151,7 +200,9 @@ clean, guardrail unregressed) and exit 0. Flip `srm_counts` to
   validated against known values (df=1 via erfc, df=2 = exp(-x/2),
   df=3 spot values) and a seeded null-uniformity check in the tests.
 - Evidence levels: the SRM/A/A/guardrail/replication rules are
-  **adaptations** of Kohavi et al. ch. 5; the chi-square p-values and
+  **adaptations** of Kohavi et al. ch. 5; the Newcombe difference
+  interval is **established** (Newcombe 1998, Method 10, built from
+  Wilson score intervals); the chi-square p-values and
   the demo's drill outcomes are **measured** on the repo's own code
   (rerun `python -m experiment.demo_oec`); the Kohavi ch. 5
   conventions (SRM alpha 0.001) are **established** from the book.

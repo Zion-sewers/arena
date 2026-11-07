@@ -9,9 +9,16 @@ ship decision is a pure function over reported evidence.
 Rules (from the issue's acceptance criteria, executable form):
 * OEC + guardrails are pre-registered before the change — the design
   names exactly one OEC metric and every guardrail with its max allowed
-  regression, bound to a registered plan digest; evidence naming a
-  different OEC, or guardrails that moved after registration, cannot
-  ship (OEC_MISMATCH / UNREGISTERED_PLAN).
+  regression, bound to a registered plan digest, AND the design itself
+  is registered in the hash chain (``register_design``) before the run.
+  Evidence naming a different OEC, or a design rewritten after
+  registration, cannot ship (OEC_MISMATCH / DESIGN_NOT_REGISTERED):
+  the ship gate matches the supplied design against its registered
+  record by canonical content, so widening a guardrail budget or
+  moving the surprise threshold after results are known matches no
+  record. Amendment rule: the chain is append-only, so correcting a
+  design means registering a NEW design record; the old record stays,
+  and the ship verdict records which design digest was used.
 * SRM / A/A run before results are read — the ship gate evaluates the
   sample-ratio-mismatch test, the A/A null-split test, and the guardrail
   checks BEFORE it examines the OEC win. Trust-test code is ordered
@@ -25,16 +32,25 @@ Rules (from the issue's acceptance criteria, executable form):
   verdict is NEEDS_REPLICATION, not SHIP.
 * Shipping on a single exciting number is NOT allowed — SHIP requires
   all of: a registered plan whose discipline verification passes, a
-  significant OEC win in the declared direction, passing SRM and A/A,
-  unregressed guardrails, and (for surprising wins) replication.
-  Anything else is NO_SHIP or NEEDS_REPLICATION, with named reasons.
+  registered design, a significant OEC win in the declared direction,
+  passing SRM and A/A, unregressed guardrails, and (for surprising
+  wins) replication. Anything else is NO_SHIP or NEEDS_REPLICATION,
+  with named reasons.
+* Metric provenance — every reported look names the metric its z is
+  computed on, and the gate refuses a win whose looks do not name the
+  design's OEC metric (OEC_METRIC_UNPROVEN). A z with no metric
+  behind it cannot ship as an OEC win.
 
 Measurement discipline (same as validity.py / decision.py / #45): the
 grade rests on interval BOUNDS, never point estimates. A guardrail
 holds only when the LOWER bound of the good-direction delta clears the
 pre-registered max regression; SRM and A/A are p-value tests against
 the registered alpha, not eyeballed counts. A trust test with too
-little data is INSUFFICIENT, never a pass.
+little data is INSUFFICIENT, never a pass. Guardrail bounds are
+Newcombe intervals (Wilson-based, score method), not Wald: near
+p = 0/1 the Wald interval collapses to zero width and a guardrail
+with zero observed events passes on one sample, so the gate uses the
+Newcombe difference interval, which fails closed on thin data.
 
 Everything is stdlib-only and deterministic. The module makes no
 network call: arena has no live experiment transport, so the design
@@ -56,6 +72,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -63,8 +80,15 @@ from experiment.alpha_spend import group_sequential_boundaries, inv_normal_cdf
 from experiment.registry import (
     ExperimentEvidence,
     LookEvidence,
+    RegistryCorrupted,
+    RegistryMalformed,
+    find_design,
+    load_design,
     load_plan,
     verify_experiment,
+)
+from experiment.registry import (
+    register_design as _register_design_record,
 )
 
 #: SRM alert level (Kohavi convention): a sample-ratio mismatch is
@@ -360,7 +384,13 @@ class ShipEvidence:
     gate refuses: an experiment with no A/A ran no trust test).
     ``guardrails`` carries one observation per declared guardrail;
     observations for undeclared metrics are refused, not ignored.
-    ``replication`` is None unless the win was surprising.
+    ``secondary`` carries one observation per declared goal/driver
+    metric: goal and driver metrics do not gate the ship, but a design
+    that declares them must report them — a pre-registered design
+    that never reports its declared metrics is an incomplete report,
+    and the gate refuses it. Their good-direction deltas are reported
+    in the verdict notes. ``replication`` is None unless the win was
+    surprising.
     """
 
     plan_digest: str
@@ -370,6 +400,7 @@ class ShipEvidence:
     srm_counts: tuple[int, ...]
     aa: AAEvidence | None
     guardrails: tuple[MetricObservation, ...] = ()
+    secondary: tuple[MetricObservation, ...] = ()
     replication: ReplicationEvidence | None = None
 
     def __post_init__(self) -> None:
@@ -387,6 +418,16 @@ class ShipEvidence:
         names = [o.name for o in self.guardrails]
         if len(set(names)) != len(names):
             raise ValueError(f"guardrail observations must name each metric once, got {names}")
+        secondary_names = [o.name for o in self.secondary]
+        if len(set(secondary_names)) != len(secondary_names):
+            raise ValueError(
+                f"secondary observations must name each metric once, got {secondary_names}"
+            )
+        if set(names) & set(secondary_names):
+            raise ValueError(
+                "a metric cannot be both a guardrail and a secondary observation: "
+                f"{sorted(set(names) & set(secondary_names))}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +521,59 @@ def two_sided_p(z: float) -> float:
     if not math.isfinite(z):
         raise ValueError(f"z must be finite, got {z!r}")
     return math.erfc(abs(z) / math.sqrt(2.0))
+
+
+def _wilson_interval(successes: int, trials: int, z: float) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion (established).
+
+    A local copy of :func:`agenteval_bench.decision.wilson_interval`:
+    the experiment package stays stdlib-only and must not import the
+    app layer (`agenteval_bench/__init__` eagerly pulls in the engine,
+    scorers, and judges). The formula is identical, and a test pins
+    agreement between the two across a grid, so a drift in either is
+    caught. Returns (lower, upper), clamped to [0, 1].
+    """
+    if trials <= 0:
+        raise ValueError("wilson_interval needs trials >= 1")
+    if not 0 <= successes <= trials:
+        raise ValueError(f"successes {successes} out of range for trials {trials}")
+    p = successes / trials
+    denom = 1.0 + z * z / trials
+    centre = (p + z * z / (2.0 * trials)) / denom
+    half = z * math.sqrt(p * (1.0 - p) / trials + z * z / (4.0 * trials * trials)) / denom
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def newcombe_interval(
+    control_successes: int,
+    control_n: int,
+    treated_successes: int,
+    treated_n: int,
+    alpha: float,
+) -> tuple[float, float]:
+    """Newcombe interval for (treated rate - control rate).
+
+    Method 10 (Newcombe 1998): the difference interval built from the
+    Wilson score interval of each arm,
+    ``lower = delta - sqrt((pt - lt)^2 + (uc - pc)^2)`` and symmetrically
+    for the upper bound. The Wilson intervals are taken at the
+    one-sided (1 - alpha) level, so the lower bound is the one-sided
+    (1 - alpha) bound on the difference. Unlike the Wald interval this
+    one does not collapse to a point at zero events: 0/1 vs 0/1 has a
+    lower bound near -0.73, not exactly 0.0, so a guardrail measured on
+    trivial data fails instead of passing.
+    """
+    if not 0.0 < alpha < 1.0:
+        raise ValueError(f"newcombe alpha must be in (0, 1), got {alpha}")
+    z = inv_normal_cdf(1.0 - alpha)
+    pc = control_successes / control_n
+    pt = treated_successes / treated_n
+    lower_c, upper_c = _wilson_interval(control_successes, control_n, z)
+    lower_t, upper_t = _wilson_interval(treated_successes, treated_n, z)
+    delta = pt - pc
+    lower = delta - math.sqrt((pt - lower_t) ** 2 + (upper_c - pc) ** 2)
+    upper = delta + math.sqrt((upper_t - pt) ** 2 + (pc - lower_c) ** 2)
+    return (lower, upper)
 
 
 # ---------------------------------------------------------------------------
@@ -683,12 +777,18 @@ def check_guardrail(
     """Guardrail non-inferiority check, graded on the LOWER bound.
 
     The good-direction delta is (treated - control) for higher_better
-    metrics, (control - treated) for lower_better ones, with an
-    unpooled standard error. The guardrail holds iff the one-sided
-    (1 - alpha) LOWER bound on that delta clears the pre-registered
-    max regression: ``lower >= -max_regression``. A point estimate
-    above the budget with a lower bound below it FAILS — the repo's
-    lower-bound discipline (#43/#45) applies to guardrails too.
+    metrics, (control - treated) for lower_better ones, and the bound
+    is the Newcombe interval for the difference of two proportions
+    (Wilson score intervals per arm). The guardrail holds iff the
+    one-sided (1 - alpha) LOWER bound on that delta clears the
+    pre-registered max regression: ``lower >= -max_regression``. A
+    point estimate above the budget with a lower bound below it FAILS
+    — the repo's lower-bound discipline (#43/#45) applies to
+    guardrails too, on the repo's own Wilson interval, not a Wald
+    approximation: Wald intervals collapse to a point at zero events
+    (0/1 vs 0/1 "passes" any budget), Newcombe intervals widen
+    exactly when there is nothing to learn from, so thin data fails
+    instead of passing.
     """
     if declaration.role != "guardrail":
         raise ValueError(
@@ -702,17 +802,24 @@ def check_guardrail(
         )
     if not 0.0 < alpha < 1.0:
         raise ValueError(f"guardrail alpha must be in (0, 1), got {alpha}")
-    assert declaration.max_regression is not None  # guardrail invariant
+    if declaration.max_regression is None:
+        raise ValueError(
+            f"guardrail {declaration.name!r} needs a max_regression: "
+            "a guardrail without a budget cannot be checked"
+        )
+    lower_diff, upper_diff = newcombe_interval(
+        observation.control_successes,
+        observation.control_n,
+        observation.treated_successes,
+        observation.treated_n,
+        alpha,
+    )
     if declaration.direction == "higher_better":
         delta = observation.treated_rate - observation.control_rate
+        lower = lower_diff
     else:
         delta = observation.control_rate - observation.treated_rate
-    pc = observation.control_rate
-    pt = observation.treated_rate
-    se = math.sqrt(
-        pc * (1.0 - pc) / observation.control_n + pt * (1.0 - pt) / observation.treated_n
-    )
-    lower = delta - inv_normal_cdf(1.0 - alpha) * se
+        lower = -upper_diff
     passed = lower >= -declaration.max_regression
     reasons: tuple[str, ...] = ()
     if not passed:
@@ -745,7 +852,8 @@ class ShipVerdict:
     ``reasons`` names every failed condition (empty when SHIP);
     ``notes`` carry non-failing observations. The verdict embeds the
     trust-test verdicts so a NO_SHIP can be audited without re-running
-    the gate.
+    the gate. ``design_digest`` is the registered design that was
+    used, so an audit can check it was the current design.
     """
 
     status: ShipStatus
@@ -757,6 +865,7 @@ class ShipVerdict:
     oec_z: float | None = None
     surprising: bool = False
     plan_digest: str = ""
+    design_digest: str = ""
 
     def __post_init__(self) -> None:
         if self.status == "ship" and self.reasons:
@@ -776,30 +885,8 @@ class ShipVerdict:
             "oec_z": self.oec_z,
             "surprising": self.surprising,
             "plan_digest": self.plan_digest,
+            "design_digest": self.design_digest,
         }
-
-
-def _no_ship(
-    reasons: list[str],
-    notes: list[str],
-    design: ExperimentDesign,
-    srm: SrmVerdict | None = None,
-    aa: AaVerdict | None = None,
-    guardrails: tuple[GuardrailVerdict, ...] = (),
-    oec_z: float | None = None,
-    surprising: bool = False,
-) -> ShipVerdict:
-    return ShipVerdict(
-        status="no_ship",
-        reasons=tuple(reasons),
-        notes=tuple(notes),
-        srm=srm,
-        aa=aa,
-        guardrails=guardrails,
-        oec_z=oec_z,
-        surprising=surprising,
-        plan_digest=design.plan_digest,
-    )
 
 
 def ship_decision(
@@ -810,75 +897,155 @@ def ship_decision(
     """Rule SHIP / NO_SHIP / NEEDS_REPLICATION for one agent change.
 
     Order is load-bearing, and is the issue's "trust gates before
-    results are read" criterion in code: plan binding and discipline
-    verification first, then SRM, then A/A, then guardrails — and only
-    after every trust test passes is the OEC win examined, and only
-    after the win is established is the surprise/replication rule
-    applied. A trust failure short-circuits with the trust reason;
-    the OEC z is not even read on that path.
+    results are read" criterion in code:
+
+    1. Design binding — the design itself must be registered in the
+       hash-chained registry (``find_design`` on its canonical form).
+       A caller-supplied design that is not in the chain grades
+       nothing: rewriting a guardrail budget or a surprise threshold
+       after results are known matches no record and is refused as
+       DESIGN_NOT_REGISTERED. Then the plan is loaded and the
+       experiment discipline verified through ``verify_experiment``.
+    2. Design-validity checks at gate entry — the design alpha must
+       equal the plan alpha, and the surprise threshold must exceed
+       the plan's final sequential boundary. A misconfigured design
+       is a design refusal, reported before any trust test runs.
+    3. Trust tests, before results are read — SRM, then A/A, then
+       guardrails, then secondary-metric completeness. A trust
+       failure short-circuits with the trust reason; the OEC z is
+       not even read on that path.
+    4. Metric provenance — every reported look must name the
+       design's OEC metric. A z with no metric behind it cannot ship
+       as an OEC win.
+    5. The OEC win, then Twyman's law — the final look must have
+       rejected in the declared direction, and a surprising win
+       needs confirming replication evidence.
+
+    The verdict records the registered design digest that was used,
+    so an audit can check it was the current design.
     """
     notes: list[str] = []
+    design_digest = ""
+
+    def refuse(
+        reasons: list[str],
+        srm: SrmVerdict | None = None,
+        aa: AaVerdict | None = None,
+        guardrails: tuple[GuardrailVerdict, ...] = (),
+        oec_z: float | None = None,
+        surprising: bool = False,
+    ) -> ShipVerdict:
+        return ShipVerdict(
+            status="no_ship",
+            reasons=tuple(reasons),
+            notes=tuple(notes),
+            srm=srm,
+            aa=aa,
+            guardrails=guardrails,
+            oec_z=oec_z,
+            surprising=surprising,
+            plan_digest=design.plan_digest,
+            design_digest=design_digest,
+        )
+
     if evidence.plan_digest != design.plan_digest:
-        return _no_ship(
+        return refuse(
             [
                 (
                     f"PLAN_DIGEST_MISMATCH: evidence names plan "
                     f"{evidence.plan_digest[:12]}... but the design binds "
                     f"{design.plan_digest[:12]}..."
                 )
-            ],
-            notes,
-            design,
+            ]
         )
+    try:
+        plan = load_plan(design.plan_digest, registry_path)
+    except KeyError:
+        return refuse(
+            [(f"UNREGISTERED_PLAN: no registered plan with digest {design.plan_digest[:12]}...")]
+        )
+    except (RegistryCorrupted, RegistryMalformed) as e:
+        return refuse([f"REGISTRY_UNREADABLE: {type(e).__name__}: {e}"])
+    found = find_design(design.to_dict(), registry_path)
+    if found is None:
+        return refuse(
+            [
+                (
+                    "DESIGN_NOT_REGISTERED: this design (OEC, guardrail "
+                    "budgets, allocation, surprise threshold) matches no "
+                    "design record in the registry — register it with "
+                    "`register-design` before the run, then ship against "
+                    "the registered design. A design rewritten after "
+                    "results are known is not a pre-registration."
+                )
+            ]
+        )
+    design_digest = found
     verdict = verify_experiment(design.plan_digest, registry_path, evidence.experiment)
     if not verdict.valid:
-        return _no_ship(
+        notes.extend(verdict.notes)
+        return refuse(
             [(f"experiment violates its pre-registered plan: {', '.join(verdict.violations)}")],
-            list(verdict.notes),
-            design,
         )
     notes.extend(verdict.notes)
 
+    # --- Design-validity checks at gate entry. ---
+    if design.alpha != plan.alpha:
+        return refuse(
+            [
+                (
+                    f"ALPHA_MISMATCH: design alpha {design.alpha} != plan "
+                    f"alpha {plan.alpha} — one alpha governs the whole "
+                    "experiment; a design that grades at a looser level "
+                    "than the plan it binds to is not a pre-registration"
+                )
+            ]
+        )
+    final_boundary = group_sequential_boundaries(plan.looks, plan.alpha, plan.sides)[-1]
+    if design.surprise_z <= final_boundary:
+        return refuse(
+            [
+                (
+                    f"SURPRISE_THRESHOLD_INVALID: surprise_z={design.surprise_z} "
+                    f"does not exceed the plan's final boundary "
+                    f"{final_boundary:.2f} — every significant win would need "
+                    "replication"
+                )
+            ]
+        )
+
     # --- Trust tests, before results are read. ---
     if len(evidence.srm_counts) != len(design.expected_allocation):
-        return _no_ship(
+        return refuse(
             [
                 (
                     f"SRM_ARMS_MISMATCH: {len(evidence.srm_counts)} SRM counts "
                     f"for {len(design.expected_allocation)} allocated arms"
                 )
-            ],
-            notes,
-            design,
+            ]
         )
     srm = check_srm(evidence.srm_counts, design.expected_allocation)
     if srm.status != "pass":
-        return _no_ship(
+        return refuse(
             [f"SRM_{srm.status.upper()}: " + "; ".join(srm.reasons)],
-            notes,
-            design,
             srm=srm,
         )
     notes.extend(srm.notes)
 
     if evidence.aa is None:
-        return _no_ship(
+        return refuse(
             [
                 (
                     "AA_MISSING: no A/A null split reported — an experiment "
                     "with no A/A ran no trust test"
                 )
             ],
-            notes,
-            design,
             srm=srm,
         )
     aa = check_aa(evidence.aa, design.alpha, design.min_aa_n)
     if aa.status != "pass":
-        return _no_ship(
+        return refuse(
             [f"AA_{aa.status.upper()}: " + "; ".join(aa.reasons)],
-            notes,
-            design,
             srm=srm,
             aa=aa,
         )
@@ -888,29 +1055,25 @@ def ship_decision(
     observed = {o.name: o for o in evidence.guardrails}
     undeclared = sorted(set(observed) - set(declared))
     if undeclared:
-        return _no_ship(
+        return refuse(
             [
                 (
                     f"UNDECLARED_METRIC: guardrail observations for metrics the "
                     f"design never declared: {', '.join(undeclared)}"
                 )
             ],
-            notes,
-            design,
             srm=srm,
             aa=aa,
         )
     missing = sorted(set(declared) - set(observed))
     if missing:
-        return _no_ship(
+        return refuse(
             [
                 (
                     f"GUARDRAIL_UNMEASURED: declared guardrail(s) with no "
                     f"observation: {', '.join(missing)}"
                 )
             ],
-            notes,
-            design,
             srm=srm,
             aa=aa,
         )
@@ -919,19 +1082,60 @@ def ship_decision(
         gv = check_guardrail(declared[name], observed[name], design.alpha)
         guardrail_verdicts.append(gv)
         if not gv.passed:
-            return _no_ship(
+            return refuse(
                 ["GUARDRAIL_REGRESSED: " + "; ".join(gv.reasons)],
-                notes,
-                design,
                 srm=srm,
                 aa=aa,
                 guardrails=tuple(guardrail_verdicts),
             )
     guardrails = tuple(guardrail_verdicts)
 
-    # --- Results are read only now that every trust test passed. ---
+    # --- Secondary metrics: declared means reported. ---
+    secondary_declared = {m.name: m for m in design.metrics if m.role in ("goal", "driver")}
+    secondary_observed = {o.name: o for o in evidence.secondary}
+    secondary_undeclared = sorted(set(secondary_observed) - set(secondary_declared))
+    if secondary_undeclared:
+        return refuse(
+            [
+                (
+                    f"UNDECLARED_METRIC: secondary observations for metrics "
+                    f"the design never declared as goal/driver: "
+                    f"{', '.join(secondary_undeclared)}"
+                )
+            ],
+            srm=srm,
+            aa=aa,
+            guardrails=guardrails,
+        )
+    secondary_missing = sorted(set(secondary_declared) - set(secondary_observed))
+    if secondary_missing:
+        return refuse(
+            [
+                (
+                    f"SECONDARY_UNMEASURED: declared goal/driver metric(s) "
+                    f"with no observation: {', '.join(secondary_missing)} — "
+                    "a design that declares a metric must report it"
+                )
+            ],
+            srm=srm,
+            aa=aa,
+            guardrails=guardrails,
+        )
+    for name in sorted(secondary_declared):
+        decl = secondary_declared[name]
+        obs = secondary_observed[name]
+        if decl.direction == "higher_better":
+            delta = obs.treated_rate - obs.control_rate
+        else:
+            delta = obs.control_rate - obs.treated_rate
+        notes.append(
+            f"secondary {name!r} ({decl.role}): good-direction delta "
+            f"{delta:+.3f} (reported, does not gate)"
+        )
+
+    # --- Metric provenance, before the OEC win is read. ---
     if evidence.oec_metric != design.oec.name:
-        return _no_ship(
+        return refuse(
             [
                 (
                     f"OEC_MISMATCH: evidence reports its final z on "
@@ -940,34 +1144,45 @@ def ship_decision(
                     "never named OEC is not allowed"
                 )
             ],
-            notes,
-            design,
             srm=srm,
             aa=aa,
             guardrails=guardrails,
         )
     looks = evidence.experiment.looks
     if not looks:
-        return _no_ship(
+        return refuse(
             ["NO_LOOKS: the experiment reports no interim looks"],
-            notes,
-            design,
             srm=srm,
             aa=aa,
             guardrails=guardrails,
         )
+    unnamed = [look.fraction for look in looks if look.metric != design.oec.name]
+    if unnamed:
+        return refuse(
+            [
+                (
+                    f"OEC_METRIC_UNPROVEN: look(s) at fraction(s) "
+                    f"{', '.join(str(f) for f in unnamed)} do not name the "
+                    f"OEC metric {design.oec.name!r} — a z with no metric "
+                    "behind it cannot ship as an OEC win"
+                )
+            ],
+            srm=srm,
+            aa=aa,
+            guardrails=guardrails,
+        )
+
+    # --- Results are read only now that every trust test passed. ---
     final = looks[-1]
     oec_z = final.z
     if not final.rejected:
-        return _no_ship(
+        return refuse(
             [
                 (
                     f"NO_SIGNIFICANT_OEC_WIN: final look z={oec_z:.2f} did not "
                     "reject — the OEC did not move"
                 )
             ],
-            notes,
-            design,
             srm=srm,
             aa=aa,
             guardrails=guardrails,
@@ -975,7 +1190,7 @@ def ship_decision(
         )
     won = oec_z > 0 if design.oec.direction == "higher_better" else oec_z < 0
     if not won:
-        return _no_ship(
+        return refuse(
             [
                 (
                     f"SIGNIFICANT_OEC_HARM: final look rejected (z={oec_z:.2f}) "
@@ -983,8 +1198,6 @@ def ship_decision(
                     f"({design.oec.direction}) — the change hurts the OEC"
                 )
             ],
-            notes,
-            design,
             srm=srm,
             aa=aa,
             guardrails=guardrails,
@@ -992,25 +1205,6 @@ def ship_decision(
         )
 
     # --- Twyman's law: surprising wins need replication. ---
-    plan = load_plan(design.plan_digest, registry_path)
-    final_boundary = group_sequential_boundaries(plan.looks, plan.alpha, plan.sides)[-1]
-    if design.surprise_z <= final_boundary:
-        return _no_ship(
-            [
-                (
-                    f"SURPRISE_THRESHOLD_INVALID: surprise_z={design.surprise_z} "
-                    f"does not exceed the plan's final boundary "
-                    f"{final_boundary:.2f} — every significant win would need "
-                    "replication"
-                )
-            ],
-            notes,
-            design,
-            srm=srm,
-            aa=aa,
-            guardrails=guardrails,
-            oec_z=oec_z,
-        )
     surprising = abs(oec_z) > design.surprise_z
     if not surprising:
         return ShipVerdict(
@@ -1030,6 +1224,7 @@ def ship_decision(
             oec_z=oec_z,
             surprising=False,
             plan_digest=design.plan_digest,
+            design_digest=design_digest,
         )
     replication = evidence.replication
     if replication is None:
@@ -1040,7 +1235,12 @@ def ship_decision(
                     f"NEEDS_REPLICATION: surprising win (final z={oec_z:.2f} "
                     f"beyond surprise_z={design.surprise_z}) with no "
                     "replication evidence — Twyman's law: too-exciting "
-                    "results need a second look before they ship"
+                    "results need a second look before they ship. To ship, "
+                    "supply replication evidence: a fresh run with z "
+                    f"significant at alpha={design.alpha} in the winning "
+                    f"direction, n >= {design.min_replication_n}, and a "
+                    f"run_id different from {evidence.run_id!r} "
+                    "(see docs/OEC.md section 3)."
                 ),
             ),
             notes=tuple(notes),
@@ -1050,9 +1250,10 @@ def ship_decision(
             oec_z=oec_z,
             surprising=True,
             plan_digest=design.plan_digest,
+            design_digest=design_digest,
         )
     if replication.run_id == evidence.run_id:
-        return _no_ship(
+        return refuse(
             [
                 (
                     "REPLICATION_SAME_RUN: replication run_id equals the "
@@ -1060,8 +1261,6 @@ def ship_decision(
                     "run is not a replication"
                 )
             ],
-            notes,
-            design,
             srm=srm,
             aa=aa,
             guardrails=guardrails,
@@ -1069,15 +1268,13 @@ def ship_decision(
             surprising=True,
         )
     if replication.n < design.min_replication_n:
-        return _no_ship(
+        return refuse(
             [
                 (
                     f"REPLICATION_TOO_SMALL: replication n={replication.n} below "
                     f"min_replication_n={design.min_replication_n}"
                 )
             ],
-            notes,
-            design,
             srm=srm,
             aa=aa,
             guardrails=guardrails,
@@ -1085,19 +1282,25 @@ def ship_decision(
             surprising=True,
         )
     rep_won = replication.z > 0 if design.oec.direction == "higher_better" else replication.z < 0
-    rep_critical = inv_normal_cdf(1.0 - design.alpha)
+    # The replication is held to the same standard as the original
+    # decision: a two-sided plan confirms at the two-sided level,
+    # a one-sided plan at the one-sided level. The direction was
+    # fixed by the original win before the replication data was
+    # seen, so the test is directional, not post-hoc.
+    if plan.sides == "one":
+        rep_critical = inv_normal_cdf(1.0 - design.alpha)
+    else:
+        rep_critical = inv_normal_cdf(1.0 - design.alpha / 2.0)
     if not rep_won or abs(replication.z) < rep_critical:
-        return _no_ship(
+        return refuse(
             [
                 (
                     "REPLICATION_NOT_CONFIRMED: the replication run did not "
-                    f"confirm the win (z={replication.z:.2f}, one-sided critical "
+                    f"confirm the win (z={replication.z:.2f}, critical "
                     f"{rep_critical:.2f} at alpha={design.alpha}) — the surprise "
                     "does not survive a second look"
                 )
             ],
-            notes,
-            design,
             srm=srm,
             aa=aa,
             guardrails=guardrails,
@@ -1122,6 +1325,7 @@ def ship_decision(
         oec_z=oec_z,
         surprising=True,
         plan_digest=design.plan_digest,
+        design_digest=design_digest,
     )
 
 
@@ -1146,24 +1350,18 @@ def check_ship(
 # ---------------------------------------------------------------------------
 
 
-def design_from_json(text: str) -> ExperimentDesign:
-    """Load an ExperimentDesign from JSON (the ``ship`` CLI input).
+def design_from_dict(data: Mapping[str, object]) -> ExperimentDesign:
+    """Build an ExperimentDesign from its canonical mapping.
 
-    A mapping with ``plan_digest`` (string), ``metrics`` (list of
-    ``name`` / ``role`` / ``direction`` / ``max_regression`` mappings)
-    and ``expected_allocation`` (list of shares); ``surprise_z``,
-    ``alpha``, ``min_aa_n`` and ``min_replication_n`` are optional.
-    The loader fails closed: unknown keys, a missing required field,
-    a duplicate metric name, a wrong-typed field, or an out-of-range
-    value all raise ValueError/TypeError, so a typo cannot silently
-    become a registered design.
+    The same validation the JSON loader applies, shared by the
+    registry path: a design loaded from a registry record goes
+    through this constructor, so a tampered record is refused the
+    same way a tampered file is. The canonical mapping is what
+    ``ExperimentDesign.to_dict`` produces and what the registry
+    stores, so a registered design round-trips exactly.
     """
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"invalid JSON: {e}") from e
     if not isinstance(data, dict):
-        raise TypeError("design JSON must be a mapping")
+        raise TypeError("design must be a mapping")
     unknown = set(data) - {
         "plan_digest",
         "metrics",
@@ -1249,6 +1447,53 @@ def design_from_json(text: str) -> ExperimentDesign:
     )
 
 
+def design_from_json(text: str) -> ExperimentDesign:
+    """Load an ExperimentDesign from JSON (the ``ship`` CLI input).
+
+    A mapping with ``plan_digest`` (string), ``metrics`` (list of
+    ``name`` / ``role`` / ``direction`` / ``max_regression`` mappings)
+    and ``expected_allocation`` (list of shares); ``surprise_z``,
+    ``alpha``, ``min_aa_n`` and ``min_replication_n`` are optional.
+    The loader fails closed: unknown keys, a missing required field,
+    a duplicate metric name, a wrong-typed field, or an out-of-range
+    value all raise ValueError/TypeError, so a typo cannot silently
+    become a registered design.
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invalid JSON: {e}") from e
+    return design_from_dict(data)
+
+
+def register_design(design: ExperimentDesign, registry_path: str) -> str:
+    """Append a design to the hash-chained registry; return its digest.
+
+    The design's plan must already be registered: a design bound to
+    an unregistered plan is refused, so the registration order is
+    plan first, design second. The design record commits to the
+    previous record's digest, so the OEC, the guardrail budgets, the
+    expected allocation, and the surprise threshold cannot be
+    silently rewritten after data arrives. Amendment rule: the chain
+    is append-only, so correcting a design means registering a NEW
+    design record; the old record stays, and the ship verdict records
+    which design digest was used.
+    """
+    try:
+        load_plan(design.plan_digest, registry_path)
+    except KeyError as e:
+        raise ValueError(
+            f"cannot register a design bound to unregistered plan "
+            f"{design.plan_digest[:12]}...: register the plan first"
+        ) from e
+    return _register_design_record(design.to_dict(), registry_path)
+
+
+def load_registered_design(digest: str, registry_path: str) -> ExperimentDesign:
+    """Load a registered design by digest; unknown digests raise KeyError."""
+    return design_from_dict(load_design(digest, registry_path))
+
+
 def _looks_from_json(raw: object) -> tuple[LookEvidence, ...]:
     if not isinstance(raw, list) or not raw:
         raise TypeError("looks must be a non-empty list")
@@ -1256,7 +1501,7 @@ def _looks_from_json(raw: object) -> tuple[LookEvidence, ...]:
     for entry in raw:
         if not isinstance(entry, dict):
             raise TypeError(f"look must be a mapping, got {entry!r}")
-        unknown = set(entry) - {"fraction", "z", "rejected"}
+        unknown = set(entry) - {"fraction", "z", "rejected", "metric"}
         if unknown:
             raise ValueError(f"look has unknown keys: {sorted(unknown)}")
         for key in ("fraction", "z", "rejected"):
@@ -1268,11 +1513,15 @@ def _looks_from_json(raw: object) -> tuple[LookEvidence, ...]:
             raise TypeError(f"look z must be a number, got {entry['z']!r}")
         if not isinstance(entry["rejected"], bool):
             raise TypeError(f"look rejected must be a bool, got {entry['rejected']!r}")
+        metric = entry.get("metric", "")
+        if not isinstance(metric, str):
+            raise TypeError(f"look metric must be a string, got {metric!r}")
         looks.append(
             LookEvidence(
                 fraction=float(entry["fraction"]),
                 z=float(entry["z"]),
                 rejected=entry["rejected"],
+                metric=metric,
             )
         )
     return tuple(looks)
@@ -1342,6 +1591,7 @@ def evidence_from_json(text: str) -> ShipEvidence:
         "srm_counts",
         "aa",
         "guardrails",
+        "secondary",
         "replication",
     }
     if unknown:
@@ -1355,7 +1605,7 @@ def evidence_from_json(text: str) -> ShipEvidence:
     raw_experiment = data["experiment"]
     if not isinstance(raw_experiment, dict):
         raise TypeError(f"experiment must be a mapping, got {raw_experiment!r}")
-    exp_unknown = set(raw_experiment) - {"n_final", "looks"}
+    exp_unknown = set(raw_experiment) - {"n_final", "looks", "stopped_at"}
     if exp_unknown:
         raise ValueError(f"experiment has unknown keys: {sorted(exp_unknown)}")
     for key in ("n_final", "looks"):
@@ -1363,9 +1613,13 @@ def evidence_from_json(text: str) -> ShipEvidence:
             raise ValueError(f"experiment missing required field {key!r}")
     if not _is_int(raw_experiment["n_final"]):
         raise TypeError(f"n_final must be an int, got {raw_experiment['n_final']!r}")
+    stopped_at = raw_experiment.get("stopped_at")
+    if stopped_at is not None and not _is_number(stopped_at):
+        raise TypeError(f"stopped_at must be a number or null, got {stopped_at!r}")
     experiment = ExperimentEvidence(
         n_final=raw_experiment["n_final"],
         looks=_looks_from_json(raw_experiment["looks"]),
+        stopped_at=(float(stopped_at) if stopped_at is not None else None),
     )
     raw_srm = data["srm_counts"]
     if not isinstance(raw_srm, list) or not raw_srm:
@@ -1394,9 +1648,18 @@ def evidence_from_json(text: str) -> ShipEvidence:
             b_successes=raw_aa["b_successes"],
             b_n=raw_aa["b_n"],
         )
+    raw_guardrails = data.get("guardrails", [])
+    if not isinstance(raw_guardrails, list):
+        raise TypeError(f"guardrails must be a list, got {raw_guardrails!r}")
     guardrails: list[MetricObservation] = []
-    for entry in data.get("guardrails", []):
+    for entry in raw_guardrails:
         guardrails.append(_observation_from_json(entry))
+    raw_secondary = data.get("secondary", [])
+    if not isinstance(raw_secondary, list):
+        raise TypeError(f"secondary must be a list, got {raw_secondary!r}")
+    secondary: list[MetricObservation] = []
+    for entry in raw_secondary:
+        secondary.append(_observation_from_json(entry))
     raw_replication = data.get("replication")
     replication: ReplicationEvidence | None = None
     if raw_replication is not None:
@@ -1429,6 +1692,7 @@ def evidence_from_json(text: str) -> ShipEvidence:
         srm_counts=tuple(srm_counts),
         aa=aa,
         guardrails=tuple(guardrails),
+        secondary=tuple(secondary),
         replication=replication,
     )
 
