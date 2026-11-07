@@ -2197,3 +2197,72 @@ def test_is_stale_shared_predicate() -> None:
     assert _is_stale_since(mined_at, "weekly", mined_at + timedelta(days=8))
     assert manifest.is_stale(mined_at + timedelta(days=2)) is False
     assert not _is_stale_since(mined_at, "weekly", mined_at + timedelta(days=2))
+
+
+# ---------------------------------------------------------------------------
+# Fix-forward round 4: the round-3 implementation re-review FAIL.
+# The out-dir preflight proved the directory writable, not the three
+# artifact paths: report.json as a directory raised raw IsADirectoryError
+# AFTER publishing and bricked the chain. The artifact-path preflight
+# closes exactly that hole.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("artifact", ["report.json", "actions.jsonl", "manifest.json"])
+def test_blocked_artifact_path_fails_before_publish_and_retry_succeeds(
+    tmp_path: Path, artifact: str
+) -> None:
+    """The re-review repro: an artifact path blocked by a directory must
+    fail BEFORE publishing, so the version chain is not bricked — and a
+    retry with a good out dir must then succeed."""
+    from agenteval_bench.snapshots import SnapshotError
+
+    store = tmp_path / "store"
+    out_dir = tmp_path / "run1"
+    (out_dir / artifact).mkdir(parents=True)
+    with pytest.raises(
+        TracebenchError, match="run artifact .* is not writable"
+    ):
+        run_scheduled(
+            corpus=_sample_corpus_path(),
+            store=store,
+            suite_name="bench",
+            version_id="1",
+            prev_version_id=None,
+            candidate_outputs={},
+            owner=OWNER,
+            cadence="weekly",
+            out_dir=out_dir,
+            mined_at=MINED_AT,
+        )
+    with pytest.raises(SnapshotError):
+        SnapshotStore(store).load("bench", "1")
+    load = load_corpus(_sample_corpus_path())
+    report = mine_traces(
+        load.records, owner=OWNER, cadence="weekly", mined_at=MINED_AT
+    )
+    result = run_scheduled(
+        corpus=_sample_corpus_path(),
+        store=store,
+        suite_name="bench",
+        version_id="1",
+        prev_version_id=None,
+        candidate_outputs=_oracle_outputs(report),
+        owner=OWNER,
+        cadence="weekly",
+        out_dir=tmp_path / "run1-good",
+        mined_at=MINED_AT,
+    )
+    assert result.verdict == "GATE_PASS"
+    assert result.version_id == "1"
+
+
+def test_artifact_preflight_leaves_no_empty_files(tmp_path: Path) -> None:
+    """The append-probe must not leave empty artifacts behind: a run
+    that fails after the preflight leaves a clean out dir."""
+    from agenteval_bench.tracebench import _check_artifact_paths_writable
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True)
+    _check_artifact_paths_writable(out_dir)
+    assert list(out_dir.iterdir()) == []

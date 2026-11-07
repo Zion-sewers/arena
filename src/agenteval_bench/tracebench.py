@@ -1598,6 +1598,34 @@ def _check_out_dir_writable(out_dir: str | Path) -> None:
         ) from e
 
 
+_ARTIFACT_FILENAMES = ("report.json", "actions.jsonl", "manifest.json")
+
+
+def _check_artifact_paths_writable(out_dir: str | Path) -> None:
+    """Preflight for the three run artifacts (report.json, actions.jsonl,
+    manifest.json): prove each real path writable BEFORE the run
+    publishes anything. Proving only the directory writable is not
+    enough — a path blocked by a directory or a read-only file in its
+    place fails at write time, after publishing, and bricks the version
+    chain exactly like an unwritable out dir. An append-open proves the
+    path without truncating an existing file; a probe-created file is
+    removed again, so a run that fails later leaves no empty artifact
+    behind."""
+    directory = Path(out_dir)
+    for name in _ARTIFACT_FILENAMES:
+        path = directory / name
+        try:
+            existed = path.exists()
+            with open(path, "a", encoding="utf-8"):
+                pass
+        except OSError as e:
+            raise TracebenchError(
+                f"run artifact {path} is not writable: {e}"
+            ) from e
+        if not existed:
+            path.unlink(missing_ok=True)
+
+
 def _mined_case_ids(
     store: SnapshotStore, suite_name: str, version_id: str
 ) -> set[str]:
@@ -1761,7 +1789,9 @@ def run_scheduled(
     Both output locations are preflighted writable before publishing:
     a run that publishes and then cannot write its artifacts or state
     bricks the version chain, so that failure must happen first, with
-    nothing half-done. The written manifest describes the benchmark
+    nothing half-done. The preflight covers the three artifact paths
+    themselves, not just their directory: a blocked report.json,
+    actions.jsonl, or manifest.json fails before publishing. The written manifest describes the benchmark
     actually gated (the effective suite), and a previous version that
     was already past its cadence dispatches an investigation action —
     the run itself is the refresh, so staleness is flagged, not failed.
@@ -1774,6 +1804,7 @@ def run_scheduled(
     if state_dir is not None:
         _check_state_dir_writable(state_dir)
     _check_out_dir_writable(out_dir)
+    _check_artifact_paths_writable(out_dir)
     effective_prev: str | None = (
         prev_version_id
         if prev_version_id is not None
