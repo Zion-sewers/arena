@@ -804,3 +804,475 @@ def test_cli_unknown_subcommand(
     code, _, stderr = _run_cli(["tracebench", "explode"], monkeypatch, capsys)
     assert code == 1
     assert "unknown tracebench subcommand" in stderr
+
+
+# ---------------------------------------------------------------------------
+# Closed loop (fix-forward on the rebased head): state-chained runs,
+# update/retire propagation, staleness observed, malformed state refused.
+# These are the adversarial tests for the architecture/product FAILs:
+# the scheduled deployment must chain versions, carry the failure
+# streak, and publish benchmark changes — with no operator hand-feeding.
+# ---------------------------------------------------------------------------
+
+
+def _corpus_with_modified_t001(tmp_path: Path, *, change_oracle: bool) -> Path:
+    """Sample corpus with t-001's oracle changed (update path) or its
+    repeated-tool-calls pattern removed (retire path)."""
+    lines = [
+        json.loads(line)
+        for line in _sample_corpus_path().read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    for record in lines:
+        if record["trace_id"] == "t-001":
+            if change_oracle:
+                record["expected_output"] = "escalated with the docs link (fixed)"
+            else:
+                record["tool_calls"] = [
+                    {"name": "search_docs"},
+                    {"name": "fetch_page"},
+                    {"name": "summarize"},
+                    {"name": "reply"},
+                ]
+    path = tmp_path / "modified.jsonl"
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in lines), encoding="utf-8"
+    )
+    return path
+
+
+def _first_run(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """Publish v1 from the sample corpus with the oracle candidate."""
+    corpus = _sample_corpus_path()
+    store = tmp_path / "store"
+    load = load_corpus(corpus)
+    report = mine_traces(
+        load.records, owner=OWNER, cadence="weekly", mined_at=MINED_AT
+    )
+    oracle = _oracle_outputs(report)
+    first = run_scheduled(
+        corpus=corpus,
+        store=store,
+        suite_name="bench",
+        version_id="1",
+        prev_version_id=None,
+        candidate_outputs=oracle,
+        owner=OWNER,
+        cadence="weekly",
+        out_dir=tmp_path / "run1",
+        mined_at=MINED_AT,
+    )
+    assert first.verdict == "GATE_PASS"
+    return store, oracle
+
+
+def test_state_dir_chains_three_weeks_to_rollback(tmp_path: Path) -> None:
+    """No --prev, no --prior-failures, no --version: the state file alone
+    chains the version and the streak, and rollback fires on week 3."""
+    corpus = _sample_corpus_path()
+    store = tmp_path / "store"
+    state_dir = tmp_path / "state"
+    load = load_corpus(corpus)
+    report = mine_traces(
+        load.records, owner=OWNER, cadence="weekly", mined_at=MINED_AT
+    )
+    degraded = {c.case.id: "wrong answer" for c in report.cases}
+    actions_seen: list[list[str]] = []
+    for week in (1, 2, 3):
+        result = run_scheduled(
+            corpus=corpus,
+            store=store,
+            suite_name="bench",
+            version_id="",
+            prev_version_id=None,
+            candidate_outputs=degraded,
+            owner=OWNER,
+            cadence="weekly",
+            out_dir=tmp_path / f"week{week}",
+            mined_at=MINED_AT,
+            state_dir=state_dir,
+        )
+        assert result.verdict == "GATE_FAIL"
+        assert result.version_id == "1"  # steady state after week 1
+        # Week 1 publishes v1 (first run); weeks 2-3 are steady state.
+        assert result.published_new_version is (week == 1)
+        assert result.consecutive_failures == week
+        actions_seen.append([a.action for a in result.actions])
+        state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+        assert state["suite_name"] == "bench"
+        assert state["prev_version_id"] == "1"
+        assert state["consecutive_failures"] == week
+    assert actions_seen[0] == ["gate", "investigation"]
+    assert actions_seen[1] == ["gate", "investigation"]
+    assert actions_seen[2] == ["gate", "investigation", "rollback"]
+    # A passing week resets the streak in the state file.
+    oracle = _oracle_outputs(report)
+    reset = run_scheduled(
+        corpus=corpus,
+        store=store,
+        suite_name="bench",
+        version_id="",
+        prev_version_id=None,
+        candidate_outputs=oracle,
+        owner=OWNER,
+        cadence="weekly",
+        out_dir=tmp_path / "week4",
+        mined_at=MINED_AT,
+        state_dir=state_dir,
+    )
+    assert reset.verdict == "GATE_PASS"
+    assert reset.consecutive_failures == 0
+    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["consecutive_failures"] == 0
+
+
+def test_state_dir_auto_derives_next_version(tmp_path: Path) -> None:
+    """A new case in week 2 publishes version 2 without --version."""
+    corpus = _sample_corpus_path()
+    store = tmp_path / "store"
+    state_dir = tmp_path / "state"
+    load = load_corpus(corpus)
+    report = mine_traces(
+        load.records, owner=OWNER, cadence="weekly", mined_at=MINED_AT
+    )
+    oracle = _oracle_outputs(report)
+    first = run_scheduled(
+        corpus=corpus,
+        store=store,
+        suite_name="bench",
+        version_id="",
+        prev_version_id=None,
+        candidate_outputs=oracle,
+        owner=OWNER,
+        cadence="weekly",
+        out_dir=tmp_path / "run1",
+        mined_at=MINED_AT,
+        state_dir=state_dir,
+    )
+    assert first.version_id == "1"
+    # Append a new failing trace: a 13th case must be mined next run.
+    extra = _trace(
+        trace_id="t-099",
+        incident_id="inc-199",
+        tool_calls=[{"name": "search_docs"}] * 4,
+        outcome="failure",
+        expected_output="escalated to a human",
+    )
+    lines = _sample_corpus_path().read_text(encoding="utf-8")
+    corpus2 = tmp_path / "corpus2.jsonl"
+    corpus2.write_text(lines + json.dumps(extra.to_dict()) + "\n", encoding="utf-8")
+    load2 = load_corpus(corpus2)
+    report2 = mine_traces(
+        load2.records, owner=OWNER, cadence="weekly", mined_at=MINED_AT
+    )
+    oracle2 = _oracle_outputs(report2)
+    assert len(report2.cases) == 13
+    second = run_scheduled(
+        corpus=corpus2,
+        store=store,
+        suite_name="bench",
+        version_id="",
+        prev_version_id=None,
+        candidate_outputs=oracle2,
+        owner=OWNER,
+        cadence="weekly",
+        out_dir=tmp_path / "run2",
+        mined_at=MINED_AT,
+        state_dir=state_dir,
+    )
+    assert second.version_id == "2"
+    assert second.published_new_version is True
+    assert second.new_cases == 1
+    _, suite = SnapshotStore(store).load("bench", "2")
+    assert len(suite.cases) == 13
+
+
+def test_changed_oracle_publishes_update_and_catches_stale_agent(
+    tmp_path: Path,
+) -> None:
+    """A changed expected_output for an existing case id publishes an
+    update — and the previous candidate's outputs then FAIL the new
+    version, so the living benchmark catches a stale agent."""
+    store, oracle = _first_run(tmp_path)
+    changed = _corpus_with_modified_t001(tmp_path, change_oracle=True)
+    load = load_corpus(changed)
+    report = mine_traces(
+        load.records, owner=OWNER, cadence="weekly", mined_at=MINED_AT
+    )
+    assert len(report.cases) == 12
+    new_oracle = _oracle_outputs(report)
+    updated_id = "mined:repeated_tool_calls:t-001"
+    assert new_oracle[updated_id] != oracle[updated_id]
+    second = run_scheduled(
+        corpus=changed,
+        store=store,
+        suite_name="bench",
+        version_id="2",
+        prev_version_id="1",
+        candidate_outputs=new_oracle,
+        owner=OWNER,
+        cadence="weekly",
+        out_dir=tmp_path / "run2",
+        mined_at=MINED_AT,
+    )
+    assert second.verdict == "GATE_PASS"
+    assert second.published_new_version is True
+    assert second.version_id == "2"
+    assert second.updated_cases == 1
+    assert second.updated_case_ids == (updated_id,)
+    assert second.retired_cases == 0
+    # The OLD oracle outputs (stale agent) against the new version fail.
+    third = run_scheduled(
+        corpus=changed,
+        store=store,
+        suite_name="bench",
+        version_id="3",
+        prev_version_id="2",
+        candidate_outputs=oracle,
+        owner=OWNER,
+        cadence="weekly",
+        out_dir=tmp_path / "run3",
+        mined_at=MINED_AT,
+    )
+    assert third.verdict == "GATE_FAIL"
+    assert third.published_new_version is False  # steady state on v2
+    report_doc = json.loads(
+        (tmp_path / "run3" / "report.json").read_text(encoding="utf-8")
+    )
+    assert report_doc["comparison"]["regressed_cases"] == [updated_id]
+
+
+def test_vanished_pattern_retires_case(tmp_path: Path) -> None:
+    """A trace whose pattern left the corpus retires its case from the
+    new version, and the pinned baseline score goes with it."""
+    store, _oracle = _first_run(tmp_path)
+    changed = _corpus_with_modified_t001(tmp_path, change_oracle=False)
+    load = load_corpus(changed)
+    report = mine_traces(
+        load.records, owner=OWNER, cadence="weekly", mined_at=MINED_AT
+    )
+    assert len(report.cases) == 11
+    new_oracle = _oracle_outputs(report)
+    retired_id = "mined:repeated_tool_calls:t-001"
+    assert retired_id not in new_oracle
+    second = run_scheduled(
+        corpus=changed,
+        store=store,
+        suite_name="bench",
+        version_id="2",
+        prev_version_id="1",
+        candidate_outputs=new_oracle,
+        owner=OWNER,
+        cadence="weekly",
+        out_dir=tmp_path / "run2",
+        mined_at=MINED_AT,
+    )
+    assert second.verdict == "GATE_PASS"
+    assert second.published_new_version is True
+    assert second.retired_cases == 1
+    assert second.retired_case_ids == (retired_id,)
+    version, suite = SnapshotStore(store).load("bench", "2")
+    assert len(suite.cases) == 11
+    assert retired_id not in version.baseline.per_case
+    assert retired_id not in {c.id for c in suite.cases}
+
+
+def test_empty_mine_never_retires(tmp_path: Path) -> None:
+    """A corpus that mines nothing must not wipe the benchmark: the run
+    gates the previous version and publishes nothing."""
+    store, oracle = _first_run(tmp_path)
+    clean = tmp_path / "clean.jsonl"
+    clean.write_text(json.dumps(_trace().to_dict()) + "\n", encoding="utf-8")
+    result = run_scheduled(
+        corpus=clean,
+        store=store,
+        suite_name="bench",
+        version_id="2",
+        prev_version_id="1",
+        candidate_outputs=oracle,
+        owner=OWNER,
+        cadence="weekly",
+        out_dir=tmp_path / "run2",
+        mined_at=MINED_AT,
+    )
+    assert result.verdict == "GATE_PASS"
+    assert result.published_new_version is False
+    assert result.retired_cases == 0
+    assert result.version_id == "1"
+
+
+def test_previous_stale_is_observed(tmp_path: Path) -> None:
+    """A previous version older than its cadence is reported stale on
+    the next run instead of living only in the manifest type."""
+    store, oracle = _first_run(tmp_path)
+    eight_days_later = "2026-11-14T19:00:00+00:00"
+    result = run_scheduled(
+        corpus=_sample_corpus_path(),
+        store=store,
+        suite_name="bench",
+        version_id="2",
+        prev_version_id="1",
+        candidate_outputs=oracle,
+        owner=OWNER,
+        cadence="weekly",
+        out_dir=tmp_path / "run2",
+        mined_at=eight_days_later,
+    )
+    assert result.previous_stale is True
+    report_doc = json.loads(
+        (tmp_path / "run2" / "report.json").read_text(encoding="utf-8")
+    )
+    assert report_doc["previous_stale"] is True
+
+
+def test_malformed_run_state_fails_closed(tmp_path: Path) -> None:
+    """A corrupt, cross-suite, or negative-streak state file must never
+    silently restart the version chain or the failure streak."""
+    corpus = _sample_corpus_path()
+    store = tmp_path / "store"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    base_kwargs = {
+        "corpus": corpus,
+        "store": store,
+        "suite_name": "bench",
+        "version_id": "",
+        "prev_version_id": None,
+        "candidate_outputs": {},
+        "owner": OWNER,
+        "cadence": "weekly",
+        "out_dir": tmp_path / "out",
+        "mined_at": MINED_AT,
+        "state_dir": state_dir,
+    }
+    (state_dir / "state.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(TracebenchError, match="cannot read run state"):
+        run_scheduled(**base_kwargs)
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "other-suite",
+                "prev_version_id": "1",
+                "consecutive_failures": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TracebenchError, match="not .bench."):
+        run_scheduled(**base_kwargs)
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "bench",
+                "prev_version_id": "1",
+                "consecutive_failures": -1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TracebenchError, match="consecutive_failures"):
+        run_scheduled(**base_kwargs)
+
+
+def test_non_numeric_prev_refuses_auto_version(tmp_path: Path) -> None:
+    """Auto-deriving the next version from a non-numeric previous id
+    fails closed instead of guessing a version scheme."""
+    corpus = _sample_corpus_path()
+    store = tmp_path / "store"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "suite_name": "bench",
+                "prev_version_id": "v1.2",
+                "consecutive_failures": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(TracebenchError, match="cannot auto-derive"):
+        run_scheduled(
+            corpus=corpus,
+            store=store,
+            suite_name="bench",
+            version_id="",
+            prev_version_id=None,
+            candidate_outputs={},
+            owner=OWNER,
+            cadence="weekly",
+            out_dir=tmp_path / "out",
+            mined_at=MINED_AT,
+            state_dir=state_dir,
+        )
+
+
+def test_cli_regress_state_dir_closes_loop_without_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The CLI wires --state-dir through: three weekly regress calls with
+    no --version and no --prior-failures end in rollback on week 3."""
+    mine_out = tmp_path / "mine-out"
+    code, _, _ = _run_cli(
+        [
+            "tracebench", "mine",
+            "--corpus", str(_sample_corpus_path()),
+            "--owner", OWNER,
+            "--cadence", "weekly",
+            "--out", str(mine_out),
+        ],
+        monkeypatch,
+        capsys,
+    )
+    assert code == 0
+    oracle = json.loads(
+        (mine_out / "oracle-outputs.json").read_text(encoding="utf-8")
+    )
+    degraded_path = tmp_path / "degraded.json"
+    degraded_path.write_text(
+        json.dumps({k: "wrong answer" for k in oracle}), encoding="utf-8"
+    )
+    store = tmp_path / "store"
+    state_dir = tmp_path / "state"
+    for week in (1, 2, 3):
+        code, stdout, _ = _run_cli(
+            [
+                "tracebench", "regress",
+                "--corpus", str(_sample_corpus_path()),
+                "--store", str(store),
+                "--suite", "bench",
+                "--candidate-outputs", str(degraded_path),
+                "--owner", OWNER,
+                "--cadence", "weekly",
+                "--state-dir", str(state_dir),
+                "--out", str(tmp_path / f"run{week}"),
+            ],
+            monkeypatch,
+            capsys,
+        )
+        assert code == 2
+        assert "verdict: GATE_FAIL" in stdout
+        assert f"consecutive failures: {week}" in stdout
+    assert "action: rollback" in stdout
+    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["consecutive_failures"] == 3
+
+
+def test_cli_regress_needs_version_without_state_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    code, _, stderr = _run_cli(
+        [
+            "tracebench", "regress",
+            "--corpus", str(_sample_corpus_path()),
+            "--store", str(tmp_path / "store"),
+            "--suite", "bench",
+            "--candidate-outputs", str(tmp_path / "none.json"),
+            "--owner", OWNER,
+            "--out", str(tmp_path / "out"),
+        ],
+        monkeypatch,
+        capsys,
+    )
+    assert code == 1
+    assert "--version" in stderr

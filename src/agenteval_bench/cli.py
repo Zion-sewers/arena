@@ -1341,11 +1341,15 @@ def cmd_tracebench(args: list[str]) -> int:
         print("Usage: agenteval-bench tracebench mine --corpus <jsonl> --owner <name>")
         print("                                --cadence <daily|weekly|monthly> --out <dir>")
         print("       agenteval-bench tracebench regress --corpus <jsonl> --store <dir>")
-        print("                                --suite <name> --version <new-id> [--prev <id>]")
+        print("                                --suite <name> [--version <new-id>] [--prev <id>]")
         print("                                --candidate-outputs <json> --owner <name>")
         print("                                --cadence <daily|weekly|monthly> --out <dir>")
         print("                                [--candidate-name <name>] [--seed 42]")
-        print("                                [--prior-failures 0]")
+        print("                                [--prior-failures 0] [--state-dir <dir>]")
+        print("       --state-dir closes the loop across runs: it supplies --prev,")
+        print("       the failure streak, and the next --version from the previous")
+        print("       run's state.json, so versions chain and rollback is reachable")
+        print("       without an operator hand-feeding the streak.")
         return 0
     sub, rest = args[0], args[1:]
     if sub == "mine":
@@ -1433,21 +1437,27 @@ def _tracebench_regress(args: list[str]) -> int:
     args, cadence = _flag(args, "--cadence", "weekly")
     args, out = _flag(args, "--out")
     args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
-    args, prior_s = _flag(args, "--prior-failures", "0")
+    args, prior_s = _flag(args, "--prior-failures")
+    args, state_dir = _flag(args, "--state-dir")
     if args:
         print(f"Error: unknown argument(s): {' '.join(args)}", file=sys.stderr)
         return 1
     missing = [n for n, v in (("--corpus", corpus), ("--store", store),
-                               ("--suite", suite), ("--version", version),
+                               ("--suite", suite),
                                ("--candidate-outputs", cand_path),
                                ("--owner", owner), ("--out", out)) if not v]
+    if not version and not state_dir:
+        missing.append("--version (or --state-dir to auto-derive it)")
     if missing:
         print(f"Error: tracebench regress needs {' '.join(missing)}", file=sys.stderr)
         return 1
     try:
         seed = int(seed_s or str(DEFAULT_SEED))
-        prior_failures = int(prior_s or "0")
-        if prior_failures < 0:
+        # Absent --prior-failures means None: the run state supplies the
+        # streak. Defaulting to 0 here would silently reset a chained
+        # streak on every scheduled run.
+        prior_failures = int(prior_s) if prior_s is not None else None
+        if prior_failures is not None and prior_failures < 0:
             raise ValueError("negative")
     except ValueError:
         print("Error: --seed/--prior-failures must be integers (>= 0 for prior)",
@@ -1480,13 +1490,19 @@ def _tracebench_regress(args: list[str]) -> int:
             seed=seed,
             candidate_name=cand_name or "candidate",
             prior_consecutive_failures=prior_failures,
+            state_dir=state_dir,
         )
     except (TracebenchError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     print(f"Tracebench regression: {suite}/{result.version_id} "
-          f"(mined {result.mined_cases}, new {result.new_cases})")
+          f"(mined {result.mined_cases}, new {result.new_cases}, "
+          f"updated {result.updated_cases}, retired {result.retired_cases})")
     print(f"verdict: {result.verdict}")
+    if result.previous_stale is not None:
+        print(f"previous version stale: {result.previous_stale}")
+    if result.version_ignored:
+        print("note: requested --version ignored (steady state: no new version)")
     for action in result.actions:
         print(f"  action: {action.action} — {action.reason}")
     print(f"consecutive failures: {result.consecutive_failures}")

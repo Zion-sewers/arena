@@ -27,6 +27,14 @@ A **generator** plus a **scheduled regression runner**:
    dispatches :class:`RegressionAction` values (gate / rollback /
    investigation) written to a machine-readable action ledger. The runner
    exits non-zero on gate failure, so a scheduler consumes the verdict.
+   The loop is closed across runs, not per run: with ``state_dir`` the
+   runner reads the previous run's state (previous version id + consecutive
+   failure streak) and writes the new one back, so versions chain and the
+   rollback arm is reachable on the 3rd consecutive failure without any
+   operator hand-feeding a streak. A mined case whose content changed is
+   published as an update (same id, new content) and a case whose trace
+   left the corpus is retired from the new version — the frozen benchmark
+   is addition-only no longer; both are reported per run.
 
 Real-incidents boundary (read this before claiming otherwise)
 -------------------------------------------------------------
@@ -47,8 +55,10 @@ no observability surface.
 
 Cadence is a closed set (``daily`` / ``weekly`` / ``monthly``). A benchmark
 whose last mine is older than its cadence is stale
-(:meth:`BenchmarkManifest.is_stale`); staleness is a report field, not a
-silent default.
+(:meth:`BenchmarkManifest.is_stale`); :func:`run_scheduled` reports whether
+the previous version was already stale when the run started
+(``previous_stale`` in the run report), so staleness is observed by a
+consumer on every run instead of living only in the manifest type.
 """
 
 from __future__ import annotations
@@ -58,7 +68,7 @@ import json
 import statistics
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -1235,6 +1245,11 @@ def required_baseline(
     per_case: dict[str, float] = dict(base.per_case) if base is not None else {}
     for mined in mined_cases:
         per_case[mined.case.id] = 1.0
+    # A retired case leaves no pinned score behind: scores are for suite
+    # cases only, so a case the current mine dropped cannot linger in the
+    # baseline of the version that drops it.
+    suite_ids = {c.id for c in suite_cases}
+    per_case = {cid: score for cid, score in per_case.items() if cid in suite_ids}
     scored = [c for c in suite_cases if not c.skip]
     for case in scored:
         if case.id not in per_case:
@@ -1270,18 +1285,35 @@ def publish_mined_version(
     baseline: BaselineRecord,
     prev_version_id: str | None = None,
     promoted_at: str | None = None,
+    suite_cases: Sequence[EvalCase] | None = None,
 ) -> tuple[BenchmarkVersion, EvalSuite]:
     """Publish a new frozen version holding the mined cases.
 
     The mined cases are appended to a copy of the base suite (the caller's
-    suite is not mutated); promotion records carry full provenance. The
-    store's own validation applies unchanged: duplicate case ids and
-    non-canonical suites are refused at publish.
+    suite is not mutated); promotion records carry full provenance. When
+    ``suite_cases`` is given it IS the new suite — the update/retire path,
+    where the caller already replaced updated cases and dropped retired
+    ones — and ``mined_cases`` then only sources the promotion records
+    (every mined case must appear in ``suite_cases``). The store's own
+    validation applies unchanged: duplicate case ids and non-canonical
+    suites are refused at publish.
     """
+    if suite_cases is None:
+        new_cases = [*base_suite.cases, *[m.case for m in mined_cases]]
+    else:
+        new_cases = list(suite_cases)
+        suite_ids = {c.id for c in new_cases}
+        missing = {m.case.id for m in mined_cases} - suite_ids
+        if missing:
+            raise TracebenchError(
+                "publish_mined_version: mined case(s) "
+                f"{sorted(missing)} missing from suite_cases — refusing to "
+                "publish promotion records for cases the version does not hold"
+            )
     new_suite = EvalSuite(
         name=base_suite.name,
         version=base_suite.version,
-        cases=[*base_suite.cases, *[m.case for m in mined_cases]],
+        cases=new_cases,
         cost_bound=base_suite.cost_bound,
     )
     records = [
@@ -1314,6 +1346,12 @@ class ScheduledRunResult:
     report_path: str
     actions_path: str
     manifest_path: str
+    updated_cases: int = 0
+    retired_cases: int = 0
+    updated_case_ids: tuple[str, ...] = ()
+    retired_case_ids: tuple[str, ...] = ()
+    previous_stale: bool | None = None
+    version_ignored: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1324,6 +1362,12 @@ class ScheduledRunResult:
             "published_new_version": self.published_new_version,
             "mined_cases": self.mined_cases,
             "new_cases": self.new_cases,
+            "updated_cases": self.updated_cases,
+            "retired_cases": self.retired_cases,
+            "updated_case_ids": list(self.updated_case_ids),
+            "retired_case_ids": list(self.retired_case_ids),
+            "previous_stale": self.previous_stale,
+            "version_ignored": self.version_ignored,
             "manifest": self.manifest.to_dict(),
             "actions": [a.to_dict() for a in self.actions],
             "consecutive_failures": self.consecutive_failures,
@@ -1331,6 +1375,90 @@ class ScheduledRunResult:
             "actions_path": self.actions_path,
             "manifest_path": self.manifest_path,
         }
+
+
+def _case_content(case: EvalCase) -> dict[str, Any]:
+    """Canonical content of a case for update detection: two cases with the
+    same id but different content are an update, not the same case."""
+    return asdict(case)
+
+
+_RUN_STATE_FILENAME = "state.json"
+
+
+def _load_run_state(
+    state_dir: str | Path, suite_name: str
+) -> dict[str, Any] | None:
+    """Read the previous run's state (previous version + failure streak).
+
+    Returns None when no state file exists yet (first run). A present but
+    malformed file, or state recorded for a different suite, fails closed —
+    a scheduler must never silently restart the streak or the version chain
+    because its state was corrupted.
+    """
+    path = Path(state_dir) / _RUN_STATE_FILENAME
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise TracebenchError(f"cannot read run state {path}: {e}") from e
+    if not isinstance(raw, Mapping):
+        raise TracebenchError(f"run state {path} must be a JSON object")
+    if raw.get("suite_name") != suite_name:
+        raise TracebenchError(
+            f"run state {path} is for suite {raw.get('suite_name')!r}, "
+            f"not {suite_name!r} — refusing to chain across suites"
+        )
+    prev = raw.get("prev_version_id")
+    if prev is not None and not isinstance(prev, str):
+        raise TracebenchError(
+            f"run state {path}: prev_version_id must be a string or null"
+        )
+    streak = raw.get("consecutive_failures")
+    if isinstance(streak, bool) or not isinstance(streak, int) or streak < 0:
+        raise TracebenchError(
+            f"run state {path}: consecutive_failures must be an integer >= 0"
+        )
+    return {"prev_version_id": prev, "consecutive_failures": streak}
+
+
+def _write_run_state(
+    state_dir: str | Path,
+    *,
+    suite_name: str,
+    prev_version_id: str,
+    consecutive_failures: int,
+    updated_at: str,
+) -> None:
+    """Persist the run's state atomically (temp file + replace)."""
+    directory = Path(state_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    doc = {
+        "tool": "agenteval-bench",
+        "kind": "tracebench-run-state",
+        "suite_name": suite_name,
+        "prev_version_id": prev_version_id,
+        "consecutive_failures": consecutive_failures,
+        "updated_at": updated_at,
+    }
+    tmp = directory / (_RUN_STATE_FILENAME + ".tmp")
+    tmp.write_text(_canonical_json(doc), encoding="utf-8")
+    tmp.replace(directory / _RUN_STATE_FILENAME)
+
+
+def _derive_next_version_id(prev_version_id: str | None) -> str:
+    """Next version id when the caller passes none: ``"1"`` for a first
+    run, otherwise the previous numeric id + 1. A non-numeric previous id
+    fails closed — the runner must never guess how a human versions."""
+    if prev_version_id is None:
+        return "1"
+    if not prev_version_id.isdigit():
+        raise TracebenchError(
+            "cannot auto-derive the next version id from non-numeric "
+            f"previous version {prev_version_id!r} — pass --version"
+        )
+    return str(int(prev_version_id) + 1)
 
 
 def run_scheduled(
@@ -1346,22 +1474,52 @@ def run_scheduled(
     out_dir: str | Path,
     seed: int = DEFAULT_SEED,
     candidate_name: str = "candidate",
-    prior_consecutive_failures: int = 0,
+    prior_consecutive_failures: int | None = None,
     mined_at: str | None = None,
+    state_dir: str | Path | None = None,
 ) -> ScheduledRunResult:
-    """One scheduled regression run: mine -> publish (when new cases exist)
-    -> gate against the frozen version -> dispatch actions -> write the
-    run's artifacts (report, action ledger, manifest) to ``out_dir``.
+    """One scheduled regression run: mine -> publish (when the benchmark
+    changed) -> gate against the frozen version -> dispatch actions ->
+    write the run's artifacts (report, action ledger, manifest) to
+    ``out_dir``.
 
     Steady state: when the corpus yields no cases the store does not yet
     hold, no new version is published — the candidate is gated against the
     previous version instead. A run with no mined cases at all and no
     previous version has nothing to regress and fails closed.
+
+    ``state_dir`` closes the loop across runs: the runner reads the
+    previous run's state (previous version id + consecutive failure
+    streak) and writes the new one back, so versions chain and the
+    rollback arm is reachable on the 3rd consecutive failure without any
+    operator hand-feeding. Explicit ``prev_version_id`` /
+    ``prior_consecutive_failures`` override the state; with no state dir
+    and no explicit values the run behaves exactly as before (previous
+    version None, streak 0). A changed case (same id, new content) is
+    published as an update and a case whose trace left the corpus is
+    retired from the new version — except when the mine yields no cases
+    at all, which never retires anything (an unreadable corpus must not
+    wipe the benchmark). An empty ``version_id`` auto-derives the next
+    id from the chained previous version (``"1"`` first run).
     """
-    if prior_consecutive_failures < 0:
-        raise ValueError("prior_consecutive_failures must be >= 0")
     parsed_cadence = parse_cadence(cadence)
     stamp = _parse_instant(mined_at or _utcnow_iso(), "run_scheduled.mined_at")
+    state = (
+        _load_run_state(state_dir, suite_name) if state_dir is not None else None
+    )
+    effective_prev = (
+        prev_version_id
+        if prev_version_id is not None
+        else (state["prev_version_id"] if state is not None else None)
+    )
+    effective_prior = (
+        prior_consecutive_failures
+        if prior_consecutive_failures is not None
+        else (state["consecutive_failures"] if state is not None else 0)
+    )
+    if effective_prior < 0:
+        raise ValueError("prior_consecutive_failures must be >= 0")
+    requested_version = version_id or _derive_next_version_id(effective_prev)
 
     load = load_corpus(corpus)
     report = mine_traces(
@@ -1382,16 +1540,23 @@ def run_scheduled(
     )
 
     store_obj = SnapshotStore(store)
-    if prev_version_id is not None:
+    previous_stale: bool | None = None
+    if effective_prev is not None:
         try:
-            _prev_version, prev_suite = store_obj.load(suite_name, prev_version_id)
+            _prev_version, prev_suite = store_obj.load(suite_name, effective_prev)
         except SnapshotError as e:
             raise TracebenchError(
-                f"cannot load previous version {suite_name}/{prev_version_id}: {e}"
+                f"cannot load previous version {suite_name}/{effective_prev}: {e}"
             ) from e
         base_baseline = _prev_version.baseline
         present = {c.id for c in prev_suite.cases}
         base_suite = prev_suite
+        prev_created = _parse_instant(
+            _prev_version.created_at, "previous version created_at"
+        )
+        previous_stale = (stamp - prev_created) > timedelta(
+            days=CADENCE_DAYS[parsed_cadence]
+        )
     else:
         _prev_version = None
         base_baseline = None
@@ -1400,14 +1565,41 @@ def run_scheduled(
             name=suite_name, version=1, cases=[], cost_bound=CostBound()
         )
     new_mined = [m for m in report.cases if m.case.id not in present]
+    updated: list[MinedCase] = []
+    retired_ids: list[str] = []
+    if _prev_version is not None and report.cases:
+        prev_by_id = {c.id: c for c in base_suite.cases}
+        mined_ids = {m.case.id for m in report.cases}
+        updated = [
+            m
+            for m in report.cases
+            if m.case.id in prev_by_id
+            and _case_content(prev_by_id[m.case.id]) != _case_content(m.case)
+        ]
+        retired_ids = [c.id for c in base_suite.cases if c.id not in mined_ids]
 
-    if new_mined:
+    if new_mined or updated or retired_ids:
+        updated_by_id = {m.case.id: m for m in updated}
+        effective_cases: list[EvalCase] = []
+        for prev_case in base_suite.cases:
+            if prev_case.id in retired_ids:
+                continue
+            if prev_case.id in updated_by_id:
+                effective_cases.append(updated_by_id[prev_case.id].case)
+            else:
+                effective_cases.append(prev_case)
+        effective_cases.extend(m.case for m in new_mined)
         baseline = required_baseline(
             base_baseline,
-            suite_cases=[*base_suite.cases, *[m.case for m in new_mined]],
-            mined_cases=new_mined,
+            suite_cases=effective_cases,
+            mined_cases=[*new_mined, *updated],
             seed=seed,
         )
+        change_parts = [
+            f"+{len(new_mined)} new" if new_mined else "",
+            f"~{len(updated)} updated" if updated else "",
+            f"-{len(retired_ids)} retired" if retired_ids else "",
+        ]
         meta = VersionMeta(
             owner=owner,
             why=(
@@ -1416,7 +1608,9 @@ def run_scheduled(
                 f"corpus {report.corpus_digest[:19]}"
             ),
             changed_from_prev=(
-                f"+{len(new_mined)} mined case(s)" if prev_version_id else ""
+                ", ".join(p for p in change_parts if p)
+                if effective_prev
+                else ""
             ),
             cadence=parsed_cadence,
             regression_set=suite_name,
@@ -1426,28 +1620,31 @@ def run_scheduled(
             _version, effective_suite = publish_mined_version(
                 store_obj,
                 base_suite,
-                version_id,
+                requested_version,
                 meta,
-                mined_cases=new_mined,
+                mined_cases=[*new_mined, *updated],
                 baseline=baseline,
-                prev_version_id=prev_version_id,
+                prev_version_id=effective_prev,
                 promoted_at=stamp.isoformat(),
+                suite_cases=effective_cases,
             )
         except SnapshotError as e:
             raise TracebenchError(
-                f"cannot publish mined version {suite_name}/{version_id}: {e}"
+                "cannot publish mined version "
+                f"{suite_name}/{requested_version}: {e}"
             ) from e
-        effective_version = version_id
+        effective_version = requested_version
         published = True
     else:
-        if prev_version_id is None:
+        if effective_prev is None:
             raise TracebenchError(
                 "nothing to regress: the corpus mined no cases and no "
                 "previous version was given"
             )
         effective_suite = base_suite
-        effective_version = prev_version_id
+        effective_version = effective_prev
         published = False
+    version_ignored = not published and requested_version != effective_version
 
     # Candidate agent with call-order attribution (same contract as the
     # snapshot-compare CLI): any divergence between the engine's call order
@@ -1490,11 +1687,11 @@ def run_scheduled(
         comparison,
         benchmark_id=benchmark_id,
         run_id=effective_version,
-        prior_consecutive_failures=prior_consecutive_failures,
+        prior_consecutive_failures=effective_prior,
         recorded_at=stamp.isoformat(),
     )
     consecutive = (
-        prior_consecutive_failures + 1 if comparison.verdict == "GATE_FAIL" else 0
+        effective_prior + 1 if comparison.verdict == "GATE_FAIL" else 0
     )
 
     out_path = Path(out_dir)
@@ -1508,6 +1705,12 @@ def run_scheduled(
         published_new_version=published,
         mined_cases=len(report.cases),
         new_cases=len(new_mined),
+        updated_cases=len(updated),
+        retired_cases=len(retired_ids),
+        updated_case_ids=tuple(m.case.id for m in updated),
+        retired_case_ids=tuple(retired_ids),
+        previous_stale=previous_stale,
+        version_ignored=version_ignored,
         manifest=manifest,
         actions=actions,
         consecutive_failures=consecutive,
@@ -1534,4 +1737,12 @@ def run_scheduled(
         "".join(a.to_json() + "\n" for a in actions), encoding="utf-8"
     )
     manifest_path.write_text(manifest.to_json(), encoding="utf-8")
+    if state_dir is not None:
+        _write_run_state(
+            state_dir,
+            suite_name=suite_name,
+            prev_version_id=effective_version,
+            consecutive_failures=consecutive,
+            updated_at=stamp.isoformat(),
+        )
     return result

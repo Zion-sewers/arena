@@ -2,24 +2,38 @@ name: Tracebench regression
 
 # Scheduled regression runner for trace-mined benchmarks (arena#41).
 # Mines the checked-in SAMPLE corpus on a weekly cadence (the cadence the
-# sample benchmark declares) and gates the oracle candidate against the
-# frozen version it publishes. The sample corpus is recorded-format
-# fixtures, not real incidents — this workflow proves the runner on
-# schedule, it does not claim real mining. A production deployment points
-# --corpus at its real trace export, persists the store across runs, and
-# chains --prev with a date-based --version so newly mined cases extend
-# the benchmark instead of re-publishing version 1.
+# sample benchmark declares) and gates a candidate against the frozen
+# version it publishes. The loop is closed across runs: the snapshot store
+# and the run state (previous version + consecutive-failure streak) are
+# restored from the actions cache, so versions chain, changed oracles
+# publish as updates, vanished patterns retire, and the rollback arm is
+# reachable on the 3rd consecutive failure with no operator hand-feeding.
 #
-# Rollback wiring: this workflow passes no --prior-failures (default 0),
-# so a failing run dispatches gate + investigation. An operator tracking
-# the streak feeds the previous run's consecutive-failures count via
-# --prior-failures; at 2 prior failures the run also dispatches rollback
-# (proven by the demo and tests/test_tracebench.py).
+# The candidate: by default the run regresses the oracle outputs mined in
+# the same run — a smoke test proving the runner executes and the frozen
+# benchmark gates, not a regression of a real agent. A real regression
+# supplies a candidate: dispatch this workflow with `candidate-artifact`
+# set to an uploaded artifact holding candidate-outputs.json (a JSON
+# object mapping case_id -> output string), and the schedule gates THAT
+# candidate against the frozen benchmark instead. The sample corpus is
+# recorded-format fixtures, not real incidents; a production deployment
+# points --corpus at its real trace export.
+#
+# Rollback wiring: the runner reads the streak from tracebench-state/
+# (written back every run); at 2 prior failures a failing run also
+# dispatches rollback (proven by tests/test_tracebench.py, which
+# simulates three consecutive failing weeks through the real state file).
 
 on:
   schedule:
     - cron: "0 3 * * 1" # weekly, Mondays 03:00 UTC
   workflow_dispatch:
+    inputs:
+      candidate-artifact:
+        description: "Artifact holding candidate-outputs.json (case_id -> output). Empty runs the oracle smoke test."
+        required: false
+        default: ""
+        type: string
 
 jobs:
   regress:
@@ -36,10 +50,33 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: uv pip install -e ".[dev]" --system
-      - name: Mine sample corpus + regress oracle candidate
+      - name: Restore tracebench store + run state
+        uses: actions/cache@v4
+        with:
+          path: |
+            tracebench-store
+            tracebench-state
+          key: tracebench-${{ github.ref_name }}-${{ github.run_number }}
+          restore-keys: |
+            tracebench-${{ github.ref_name }}-
+      - name: Download candidate outputs (when supplied)
+        if: inputs.candidate-artifact != ''
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ inputs.candidate-artifact }}
+          path: candidate-out
+      - name: Select candidate outputs
+        id: candidate
+        run: |
+          if [ -n "${{ inputs.candidate-artifact }}" ]; then
+            echo "path=candidate-out/candidate-outputs.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=tracebench-out/oracle-outputs.json" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Mine sample corpus + regress candidate
         run: |
           agenteval-bench tracebench mine --corpus examples/traces/production-traces.sample.jsonl --owner arena-maintainers --cadence weekly --out tracebench-out
-          agenteval-bench tracebench regress --corpus examples/traces/production-traces.sample.jsonl --store tracebench-store --suite tracebench-sample --version 1 --candidate-outputs tracebench-out/oracle-outputs.json --owner arena-maintainers --cadence weekly --out tracebench-out/regress
+          agenteval-bench tracebench regress --corpus examples/traces/production-traces.sample.jsonl --store tracebench-store --suite tracebench-sample --candidate-outputs ${{ steps.candidate.outputs.path }} --owner arena-maintainers --cadence weekly --state-dir tracebench-state --out tracebench-out/regress
       - name: Upload tracebench run artifacts
         if: always()
         uses: actions/upload-artifact@v4

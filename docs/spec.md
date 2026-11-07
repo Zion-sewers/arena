@@ -63,9 +63,13 @@ src/agenteval_bench/
   tiered.py       # Tiered eval pipeline (gate -> smoke -> expanded -> nightly)
   tracebench.py   # Trace-mined benchmarks: mine traces -> living benchmark
                   #   (owner + cadence per benchmark) -> scheduled regression
-                  #   runner with gate/rollback/investigation actions
+                  #   runner with gate/rollback/investigation actions; the
+                  #   loop is closed across runs via --state-dir (previous
+                  #   version + failure streak chained, changed oracles
+                  #   published as updates, vanished patterns retired)
   tracebench_demo.py  # Demo: mine the sample corpus, regress oracle +
-                  #   degraded candidates (gate -> investigation -> rollback)
+                  #   degraded candidates (gate -> investigation -> rollback),
+                  #   then the closed loop: three state-chained weeks
   cli.py          # CLI entry point (run --suite --ci --threshold; decide --suite --policy)
 tests/            # pytest suite (engine + CLI gateway)
 examples/         # Golden replay suites (YAML)
