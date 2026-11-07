@@ -26,6 +26,7 @@ from agenteval_bench.validity import (
     assess_decision,
     assess_scorer,
     default_validity_policy,
+    validate_matcher_labels,
     validate_proxy,
 )
 
@@ -56,5 +57,6 @@ __all__ = [
     "default_policy",
     "default_validity_policy",
     "policy_fingerprint",
+    "validate_matcher_labels",
     "validate_proxy",
 ]

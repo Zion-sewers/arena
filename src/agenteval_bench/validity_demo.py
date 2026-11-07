@@ -20,7 +20,15 @@ holds:
   omits a metric refuses to be built at all;
 - a flaky live agent whose verdict varies with the seed (20/40 cross-run
   agreement) does NOT get a trusted reliability grade: the policy bar
-  applies on the live path too.
+  applies on the live path too;
+- a REAL validation, not a staged one: the `contains` matcher validated
+  against human truth labels in examples/contains-truth-labels.yaml
+  (outputs quoted from the adversarial suite) agrees 1/4 times and stays
+  UNVALIDATED_PROXY with the measured interval carried.
+
+The IVR pairs in expectation 2 are ILLUSTRATIVE, not measured: hand-built
+literals showing what the mechanism does with a failing proxy. The real
+validation is expectation 9.
 
 Any failure raises, so CI can gate on this demo directly.
 """
@@ -43,6 +51,7 @@ from agenteval_bench.validity import (
     ValidityReport,
     assess_decision,
     assess_scorer,
+    validate_matcher_labels,
     validate_proxy,
 )
 
@@ -100,6 +109,8 @@ def main() -> int:
 
     # 2. IVR example: the proxy measures silence after the word; ground
     # truth is whether the consonant clipped. They coincide 12/20 times.
+    # ILLUSTRATIVE pairs, not a measured validation — the real validation
+    # is expectation 9 (labeled data from the adversarial suite).
     ivr = validate_proxy(
         metric="silence_after_word",
         phenomenon="whether the consonant clipped",
@@ -203,7 +214,28 @@ def main() -> int:
     assert not flaky.all_trusted
     assert flaky.assessments[Dimension.RELIABILITY.value].agreement_n == 40
 
-    print("validity demo: all 8 expectations hold")
+    # 9. Real validation: `contains` against human truth labels for the
+    # refund phenomenon, run through the real scorer on recorded outputs
+    # (examples/contains-truth-labels.yaml). Agreement 1/4 — the matcher
+    # fails the phenomenon, and the interval says so honestly.
+    from pathlib import Path
+
+    labels_path = (
+        Path(__file__).resolve().parents[2]
+        / "examples"
+        / "contains-truth-labels.yaml"
+    )
+    measured = validate_matcher_labels(str(labels_path))
+    print(
+        f"labels validation: {measured.metric} grade={measured.grade.value} "
+        f"trusted={measured.trusted} agreement={measured.agreement}"
+    )
+    assert measured.grade is ValidityGrade.UNVALIDATED_PROXY
+    assert not measured.trusted
+    assert measured.agreement is not None and measured.agreement_n == 4
+    assert measured.agreement[0] < 0.80
+
+    print("validity demo: all 9 expectations hold")
     return 0
 
 

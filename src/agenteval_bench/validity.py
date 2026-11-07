@@ -2,7 +2,12 @@
 
 "Test the test" (arena#43). An eval score is not evidence until the
 measurement instrument behind it has been assessed. This module attaches
-a validity assessment to every metric in an eval report:
+a validity assessment to the metrics this repo reports: the four decision
+dimensions (quality, safety, cost, reliability) and the deterministic
+scorer's four matchers (exact_match, contains, regex, json_schema).
+Other numeric reports in the repo (tiered mutation scores, regression
+aggregates, alt-test alignment scores, novelty-oracle scores) carry no
+validity assessment yet — see docs/VALIDITY.md for the coverage boundary.
 
 * every metric names the phenomenon it claims to measure — a metric that
   measures silence after the word, not whether the consonant clipped,
@@ -52,6 +57,8 @@ from agenteval_bench.decision import (
     UnmeasuredEvidence,
     wilson_interval,
 )
+from agenteval_bench.models import EvalCase, ExpectedOutput
+from agenteval_bench.scoring import DeterministicScorer
 
 DEFAULT_MIN_AGREEMENT_LOWER = 0.80
 
@@ -249,6 +256,140 @@ def validate_proxy(
         ),
         agreement=(lower, upper),
         agreement_n=n,
+    )
+
+
+def _parse_label_expected(expected: object, case_id: str) -> ExpectedOutput:
+    """One labeled case's expected block, validated at the YAML boundary.
+
+    Same matcher fields as EvalSuite.from_yaml; unknown keys, a
+    non-list ``contains``, or a non-string needle raise. The expected
+    block is the proxy's input, never the truth: truth comes from the
+    case's ``truth`` label.
+    """
+    if not isinstance(expected, dict):
+        raise TypeError(
+            f"labels case {case_id!r}: expected must be a mapping, "
+            f"got {type(expected).__name__}"
+        )
+    unknown = sorted(set(expected) - {"exact", "contains", "regex", "json_schema"})
+    if unknown:
+        raise ValueError(f"labels case {case_id!r}: unknown expected keys {unknown}")
+    contains = expected.get("contains", [])
+    if not isinstance(contains, list) or not all(
+        isinstance(needle, str) for needle in contains
+    ):
+        raise TypeError(
+            f"labels case {case_id!r}: contains must be a list of strings"
+        )
+    exact = expected.get("exact")
+    if exact is not None and not isinstance(exact, str):
+        raise TypeError(f"labels case {case_id!r}: exact must be a string")
+    regex = expected.get("regex")
+    if regex is not None and not isinstance(regex, str):
+        raise TypeError(f"labels case {case_id!r}: regex must be a string")
+    json_schema = expected.get("json_schema")
+    if json_schema is not None and not isinstance(json_schema, dict):
+        raise TypeError(f"labels case {case_id!r}: json_schema must be a mapping")
+    return ExpectedOutput(
+        exact=exact,
+        contains=contains,
+        regex=regex,
+        json_schema=json_schema,
+    )
+
+
+def validate_matcher_labels(
+    path: str, *, policy: ValidityPolicy | None = None
+) -> MetricValidity:
+    """Validate one matcher against ground truth from a labels file.
+
+    The file names one matcher and its phenomenon, plus labeled cases:
+    each case carries a recorded ``output``, the ``expected`` block the
+    scorer runs, a human ``truth`` label (does the output state the
+    phenomenon?), and a ``reason`` for the label. The proxy verdicts come
+    from running the real DeterministicScorer on the recorded outputs —
+    never from hand-written bools — and the agreement is graded by
+    :func:`validate_proxy`. A labels file is ground truth the way it
+    always is: human judgments, inspectable and disputable, recorded as
+    data; see examples/contains-truth-labels.yaml.
+
+    Raises OSError when the file cannot be read, ValueError/TypeError on
+    a malformed file (unknown metric or keys, duplicate ids, non-bool
+    truth, empty reason, empty case list).
+    """
+    import yaml
+
+    with open(path) as f:
+        try:
+            data = yaml.safe_load(f)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"labels file {path!r}: invalid YAML: {exc}") from exc
+    if not isinstance(data, dict):
+        raise TypeError(
+            f"labels file {path!r}: expected a mapping, got {type(data).__name__}"
+        )
+    unknown = sorted(set(data) - {"metric", "phenomenon", "cases"})
+    if unknown:
+        raise ValueError(f"labels file {path!r}: unknown top-level keys {unknown}")
+    metric = data.get("metric")
+    if not isinstance(metric, str) or metric not in SCORER_METRICS:
+        raise ValueError(
+            f"labels file {path!r}: unknown metric {metric!r}, expected one of "
+            f"{sorted(SCORER_METRICS)}"
+        )
+    phenomenon = data.get("phenomenon")
+    if not isinstance(phenomenon, str) or not phenomenon:
+        raise ValueError(f"labels file {path!r}: phenomenon must be a non-empty string")
+    cases = data.get("cases")
+    if not isinstance(cases, list) or not cases:
+        raise ValueError(f"labels file {path!r}: cases must be a non-empty list")
+    scorer = DeterministicScorer()
+    proxy: list[bool] = []
+    truth: list[bool] = []
+    seen_ids: set[str] = set()
+    for case_data in cases:
+        if not isinstance(case_data, dict):
+            raise TypeError(
+                f"labels file {path!r}: each case must be a mapping, "
+                f"got {type(case_data).__name__}"
+            )
+        unknown = sorted(
+            set(case_data) - {"id", "output", "expected", "truth", "reason"}
+        )
+        if unknown:
+            raise ValueError(
+                f"labels file {path!r}: unknown case keys {unknown}"
+            )
+        case_id = case_data.get("id")
+        if not isinstance(case_id, str) or not case_id:
+            raise ValueError(f"labels file {path!r}: each case needs a non-empty id")
+        if case_id in seen_ids:
+            raise ValueError(f"labels file {path!r}: duplicate case id {case_id!r}")
+        seen_ids.add(case_id)
+        output = case_data.get("output")
+        if not isinstance(output, str):
+            raise TypeError(f"labels case {case_id!r}: output must be a string")
+        case_truth = case_data.get("truth")
+        if not isinstance(case_truth, bool):
+            raise TypeError(
+                f"labels case {case_id!r}: truth must be a bool, got {case_truth!r}"
+            )
+        reason = case_data.get("reason")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError(
+                f"labels case {case_id!r}: reason must be a non-empty string"
+            )
+        expected = _parse_label_expected(case_data.get("expected", {}), case_id)
+        case = EvalCase(id=case_id, input="", expected=expected)
+        proxy.append(scorer.score(case, output).passed)
+        truth.append(case_truth)
+    return validate_proxy(
+        metric=metric,
+        phenomenon=phenomenon,
+        proxy=proxy,
+        truth=truth,
+        policy=policy,
     )
 
 

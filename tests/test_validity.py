@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agenteval_bench.cli import cmd_decide
+from agenteval_bench.cli import cmd_decide, cmd_run
 from agenteval_bench.decision import (
     CostEvidence,
     Decision,
@@ -34,6 +34,7 @@ from agenteval_bench.validity import (
     assess_decision,
     assess_scorer,
     default_validity_policy,
+    validate_matcher_labels,
     validate_proxy,
 )
 
@@ -513,6 +514,75 @@ def test_assess_decision_end_to_end_live_run():
     assert reliability.agreement_n == 60
 
 
+# ------------------------------------------------------- validate_matcher_labels
+
+
+def _labels_path() -> str:
+    return str(
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "contains-truth-labels.yaml"
+    )
+
+
+def test_validate_matcher_labels_real_run():
+    # The shipped labels file: real scorer verdicts on recorded outputs
+    # vs human truth labels. contains agrees 1/4 — it fails the phenomenon.
+    validity = validate_matcher_labels(_labels_path())
+    assert validity.metric == "contains"
+    assert validity.grade is ValidityGrade.UNVALIDATED_PROXY
+    assert not validity.trusted
+    assert validity.agreement is not None and validity.agreement_n == 4
+    assert validity.agreement[0] < 0.80
+    assert 0.04 < validity.agreement[0] < 0.05  # 1/4 Wilson lower bound
+    assert 0.69 < validity.agreement[1] < 0.71
+
+
+def test_validate_matcher_labels_rejects_malformed_files(tmp_path):
+    base = (
+        "metric: contains\n"
+        "phenomenon: output states the required fact\n"
+        "cases:\n"
+        "  - id: a\n"
+        '    output: "You can request a refund within 14 days."\n'
+        "    expected:\n"
+        '      contains: ["14 days"]\n'
+        "    truth: true\n"
+        '    reason: "states the fact"\n'
+    )
+
+    def write(content: str) -> str:
+        path = tmp_path / "labels.yaml"
+        path.write_text(content)
+        return str(path)
+
+    with pytest.raises(ValueError, match="unknown metric"):
+        validate_matcher_labels(write(base.replace("contains", "containz", 1)))
+    with pytest.raises(TypeError, match="truth must be a bool"):
+        validate_matcher_labels(write(base.replace("truth: true", "truth: 1")))
+    with pytest.raises(ValueError, match="reason must be a non-empty string"):
+        validate_matcher_labels(write(base.replace('"states the fact"', '""')))
+    with pytest.raises(ValueError, match="duplicate case id"):
+        validate_matcher_labels(
+            write(
+                base
+                + '  - id: a\n    output: "x"\n    expected:\n'
+                + '      contains: ["x"]\n    truth: true\n    reason: "dup"\n'
+            )
+        )
+    with pytest.raises(ValueError, match="cases must be a non-empty list"):
+        validate_matcher_labels(write("metric: contains\nphenomenon: p\ncases: []\n"))
+    with pytest.raises(ValueError, match="unknown top-level keys"):
+        validate_matcher_labels(write(base + "surprise: 1\n"))
+    with pytest.raises(ValueError, match="invalid YAML"):
+        validate_matcher_labels(write("metric: [unclosed\n"))
+
+
+def test_validate_matcher_labels_missing_file_raises_oserror():
+    with pytest.raises(OSError):
+        validate_matcher_labels("/nonexistent/labels.yaml")
+
+
 # ------------------------------------------------------- CLI seam
 
 
@@ -548,4 +618,96 @@ def test_cmd_decide_report_carries_the_validity_section(tmp_path, capsys):
     assert report["validity"]["metrics"]["quality"]["grade"] == "direct"
     assert report["validity"]["metrics"]["quality"]["trusted"] is True
     assert report["validity"]["all_trusted"] is False
+    assert report["validity"]["untrusted"] == ["reliability"]
+    # The scorer report travels with the decision report: the DIRECT
+    # quality/safety grades are never read apart from the matcher grades.
+    assert set(report["scorer_validity"]["metrics"]) == {
+        "exact_match",
+        "contains",
+        "regex",
+        "json_schema",
+    }
+    assert report["scorer_validity"]["metrics"]["contains"]["grade"] == (
+        "unvalidated_proxy"
+    )
+    assert "Validity: 1/4 metrics trusted" in captured.out
+
+
+def _examples_path(name: str) -> str:
+    return str(Path(__file__).resolve().parents[1] / "examples" / name)
+
+
+def test_cmd_run_prints_the_scorer_validity_table(capsys):
+    code = cmd_run(["--suite", _examples_path("adversarial-scorer.yaml")])
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "Pass rate: 100.0%" in captured.out
+    assert "Validity: 1/4 metrics trusted" in captured.out
+    assert "contains" in captured.out and "UNTRUSTED" in captured.out
+    assert "exact_match" in captured.out and "TRUSTED" in captured.out
+
+
+def test_cmd_run_validity_labels_measures_the_matcher(capsys):
+    code = cmd_run(
+        [
+            "--suite",
+            _examples_path("adversarial-scorer.yaml"),
+            "--validity-labels",
+            _labels_path(),
+        ]
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "Validity labels:" in captured.out
+    assert "agreement 1/4 = 0.250" in captured.out
+    assert "agreement 95% CI=[0.046, 0.699] (n=4)" in captured.out
+
+
+def test_cmd_run_validity_labels_missing_file_exits_1(capsys):
+    code = cmd_run(
+        [
+            "--suite",
+            _examples_path("adversarial-scorer.yaml"),
+            "--validity-labels",
+            "/nonexistent/labels.yaml",
+        ]
+    )
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "cannot load validity labels" in captured.err
+
+
+def test_cmd_decide_strict_validity_downgrades_gate(tmp_path, capsys):
+    # decision-suite-gate.yaml GATEs at low risk by evidence; with
+    # --strict-validity the untrusted replay reliability downgrades it.
+    out_path = str(tmp_path / "report.json")
+    code = cmd_decide(
+        [
+            "--suite",
+            _examples_path("decision-suite-gate.yaml"),
+            "--risk",
+            "low",
+            "--out",
+            out_path,
+        ]
+    )
+    assert code == 0  # default: validity does not change the action
+    strict_path = str(tmp_path / "strict-report.json")
+    code = cmd_decide(
+        [
+            "--suite",
+            _examples_path("decision-suite-gate.yaml"),
+            "--risk",
+            "low",
+            "--strict-validity",
+            "--out",
+            strict_path,
+        ]
+    )
+    assert code == 2  # INVESTIGATE after the downgrade
+    captured = capsys.readouterr()
+    assert "Validity gate (strict): GATE downgraded to INVESTIGATE" in captured.out
+    report = json.loads(Path(strict_path).read_text())
+    assert report["action"] == "investigate"
+    assert report["evidence_action"] == "gate"
     assert report["validity"]["untrusted"] == ["reliability"]

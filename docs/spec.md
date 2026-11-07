@@ -229,7 +229,7 @@ print(result.summary())
 | Feature                | Status      | Est. milestone |
 |------------------------|-------------|----------------|
 | Deterministic scoring  | ✅ shipped  | v0.1.0         |
-| Measurement-validity column (`validity.py`) | ✅ shipped | v0.1.0  |
+| Measurement-validity column (decide + scorer) | ✅ shipped | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |

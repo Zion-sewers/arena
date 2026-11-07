@@ -93,6 +93,7 @@ def cmd_run(args: list[str]) -> int:
     args, threshold_s = _flag(args, "--threshold", "1.0")
     args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
     args, replay_log = _flag(args, "--replay-log")
+    args, labels_path = _flag(args, "--validity-labels")
 
     if not suite_path:
         print("Error: --suite <file> is required", file=sys.stderr)
@@ -120,6 +121,27 @@ def cmd_run(args: list[str]) -> int:
     print(result.summary())
     if missing:
         print(f"Note: {len(missing)} case(s) had no recorded output and were skipped.")
+
+    # Every metric carries a measurement-reliability column (arena#43):
+    # the run report prints the scorer's validity table next to the pass
+    # rate, so a 100% pass rate never reads as trusted on its own. With
+    # --validity-labels, the printed grade for that matcher is a measured
+    # validation against ground truth, not the built-in note.
+    from agenteval_bench.validity import assess_scorer, validate_matcher_labels
+
+    scorer_report = assess_scorer()
+    if labels_path:
+        try:
+            measured = validate_matcher_labels(labels_path)
+        except (OSError, ValueError, TypeError) as exc:
+            print(
+                f"Error: cannot load validity labels {labels_path}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        scorer_report = assess_scorer(notes={measured.metric: measured})
+        print(f"Validity labels: {labels_path} — {measured.metric} measured: {measured.basis}")
+    print(scorer_report.summary())
 
     if replay_log:
         log = _build_log(suite, suite_path, digest, result, outputs, seed)
@@ -243,6 +265,11 @@ def cmd_decide(args: list[str]) -> int:
     are re-scored across runs, so the runs cannot disagree the way a
     live stochastic agent's runs can. The summary and the report label
     it as such; it must not be read as live-agent reliability.
+
+    --strict-validity downgrades a GATE to INVESTIGATE when any metric in
+    the validity report is untrusted. Default off: replay mode cannot
+    trust reliability by construction, so a strict default would make
+    `decide` unable to gate at all.
     """
     from agenteval_bench.decision import (
         CostEvidence,
@@ -253,7 +280,7 @@ def cmd_decide(args: list[str]) -> int:
         UnmeasuredEvidence,
         policy_fingerprint,
     )
-    from agenteval_bench.validity import assess_decision
+    from agenteval_bench.validity import assess_decision, assess_scorer
 
     args, suite_path = _flag(args, "--suite")
     args, policy_path = _flag(args, "--policy")
@@ -261,6 +288,7 @@ def cmd_decide(args: list[str]) -> int:
     args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
     args, reliability_runs_s = _flag(args, "--reliability-runs", "2")
     args, out = _flag(args, "--out")
+    args, strict_validity = _has(args, "--strict-validity")
     if not suite_path:
         print("Error: decide needs --suite <file>", file=sys.stderr)
         return 3
@@ -338,13 +366,33 @@ def cmd_decide(args: list[str]) -> int:
     # replay-agreement, graded UNVALIDATED_PROXY — never as live stability.
     validity = assess_decision(decision, reliability_kind="replay")
     print(validity.summary())
+    # The decision grades quality/safety DIRECT for the proportion, but the
+    # verdicts underneath rest on the scorer's matchers: the scorer report
+    # is printed in the same output, so the two grades are never read apart.
+    scorer_report = assess_scorer()
+    print(scorer_report.summary())
+    # --strict-validity is the enforcement switch: a GATE that rests on an
+    # untrusted metric is downgraded to INVESTIGATE. Default off, because
+    # replay mode structurally cannot trust reliability (see above), so a
+    # strict default would make `decide` unable to gate at all; the switch
+    # exists for live-assessed decisions and for callers that want the
+    # validity gate to bite. The evidence action is recorded, never hidden.
+    action = decision.action
+    evidence_action = None
+    if strict_validity and action is DecisionAction.GATE and not validity.all_trusted:
+        evidence_action = action
+        action = DecisionAction.INVESTIGATE
+        print(
+            "Validity gate (strict): GATE downgraded to INVESTIGATE — "
+            f"untrusted: {', '.join(validity.untrusted_metrics())}"
+        )
     print(
         "Note: reliability here is replay-agreement (recorded outputs "
         "re-scored across runs); it cannot detect live-agent flakiness."
     )
     if out:
         report: dict[str, Any] = {
-            "action": decision.action.value,
+            "action": action.value,
             "risk": decision.risk.value,
             "suite": suite.name,
             "suite_digest": digest,
@@ -352,8 +400,11 @@ def cmd_decide(args: list[str]) -> int:
             "reliability_runs": reliability_runs,
             "policy_fingerprint": policy_fingerprint(policy),
             "validity": validity.to_dict(),
+            "scorer_validity": scorer_report.to_dict(),
             "dimensions": {},
         }
+        if evidence_action is not None:
+            report["evidence_action"] = evidence_action.value
         for dimension, verdict in decision.verdicts.items():
             evidence = verdict.evidence
             if isinstance(evidence, UnmeasuredEvidence):
@@ -408,9 +459,9 @@ def cmd_decide(args: list[str]) -> int:
             print(f"Error: cannot write report {out}: {exc}", file=sys.stderr)
             return 3
         print(f"Decision report: {out}")
-    if decision.action is DecisionAction.GATE:
+    if action is DecisionAction.GATE:
         return 0
-    if decision.action is DecisionAction.ROLLBACK:
+    if action is DecisionAction.ROLLBACK:
         return 1
     return 2
 
