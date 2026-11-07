@@ -1,0 +1,56 @@
+# Ground-truth labels for the `contains` matcher (arena#43).
+#
+# Phenomenon: "output states the required fact" — here, that a refund can be
+# requested within 14 days of purchase. The proxy verdict comes from running
+# the real DeterministicScorer on each output; the truth label is a human
+# judgment recorded here, with its reason. That is what ground truth is:
+# judgments, inspectable and disputable, not derived from the matcher.
+#
+# Provenance: every output string below is quoted from
+# examples/adversarial-scorer.yaml or its comments — no invented outputs.
+# - "You can request a refund within 14 days of purchase." is the recorded
+#   output of the anchored-regex and case-sensitive-needles cases.
+# - "refund refund 14 days 14 days!!!" and "You can NEVER get a refund, 14
+#   days or not." are the would-pass outputs named in those cases' comments.
+# - "You can request a refund within 14 DAYS of purchase." is the
+#   case-variant named in the case-sensitive-needles comment.
+#
+# Adjudication: the negation-blind-spot case's recorded output ("You cannot
+# request a refund after 14 days have passed, but you can within 14 days of
+# purchase.") is EXCLUDED: it asserts the fact in a subordinate clause while
+# its main clause negates the surrounding claim, so a truth label either way
+# is defensible and it would make the set worse, not better. A validation set
+# with an ambiguous item is a worse instrument than a smaller clean one.
+#
+# Measured result: contains agrees with truth 1/4 times on this set
+# (Wilson 95% CI [0.046, 0.699]) — it stays UNVALIDATED_PROXY.
+# The set is small on purpose: four adversarial cases are enough to show the
+# matcher fails the phenomenon, and the wide interval says so honestly.
+# Run: agenteval-bench run --suite examples/adversarial-scorer.yaml --validity-labels examples/contains-truth-labels.yaml
+metric: contains
+phenomenon: output states the required fact
+cases:
+  - id: refund-states-fact
+    output: "You can request a refund within 14 days of purchase."
+    expected:
+      contains: ["14 days", "refund"]
+    truth: true
+    reason: "States the fact directly; both needles present and asserted."
+  - id: refund-keyword-salad
+    output: "refund refund 14 days 14 days!!!"
+    expected:
+      contains: ["14 days", "refund"]
+    truth: false
+    reason: "Word salad: the needles are present but no claim is made."
+  - id: refund-never
+    output: "You can NEVER get a refund, 14 days or not."
+    expected:
+      contains: ["14 days", "refund"]
+    truth: false
+    reason: "Explicitly denies the fact while containing both needles."
+  - id: refund-case-trap
+    output: "You can request a refund within 14 DAYS of purchase."
+    expected:
+      contains: ["14 days"]
+    truth: true
+    reason: "States the fact; contains is case-sensitive so the needle misses."
