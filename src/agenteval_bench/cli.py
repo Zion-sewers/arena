@@ -507,12 +507,22 @@ def cmd_alt_test(args: list[str]) -> int:
 
     Judge labels are recorded data (like replay outputs), never live LLM
     calls. Prints the winning-rate leaderboard; --out writes the JSON report.
+
+    Coverage gate (arena#49): the leaderboard is ranked only when every
+    ranked judge's (judge, annotator) cells meet the per-cell floor
+    (--min-cell-n, default 50) and the dataset meets --min-total
+    (default 50). Sparse cells are masked, never silently dropped, and a
+    judge with any sparse cell is shown as MASKED, not ranked. When no
+    judge is rankable the leaderboard is refused (exit 1): a leaderboard
+    over tiny samples is not a ranking.
     """
     args, data_path = _flag(args, "--data")
     args, epsilon_s = _flag(args, "--epsilon", "0.1")
     args, q_s = _flag(args, "--q", "0.05")
     args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
     args, out = _flag(args, "--out")
+    args, min_cell_n_s = _flag(args, "--min-cell-n", "50")
+    args, min_total_s = _flag(args, "--min-total", "50")
 
     if not data_path:
         print("Error: --data <file.jsonl> is required", file=sys.stderr)
@@ -525,6 +535,13 @@ def cmd_alt_test(args: list[str]) -> int:
         print("Error: --epsilon/--q must be numbers, --seed an integer", file=sys.stderr)
         return 1
 
+    from agenteval_bench.coverage import (
+        CoveragePolicy,
+        RankingRefused,
+        assess_ranking,
+        render_ranked,
+        require_ranking,
+    )
     from alt_test.runner import (
         InsufficientCoverage,
         dataset_digest,
@@ -534,6 +551,14 @@ def cmd_alt_test(args: list[str]) -> int:
     )
     from alt_test.types import AltTestConfig
 
+    try:
+        policy = CoveragePolicy(
+            min_per_cell=int(min_cell_n_s or "50"),
+            min_total=int(min_total_s or "50"),
+        )
+    except (ValueError, TypeError) as e:
+        print(f"Error: unusable coverage policy: {e}", file=sys.stderr)
+        return 1
     try:
         config = AltTestConfig(epsilon=epsilon, q=q, seed=seed)
     except ValueError as e:
@@ -556,11 +581,24 @@ def cmd_alt_test(args: list[str]) -> int:
     except (OSError, ValueError, TypeError, InsufficientCoverage) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+    try:
+        board = assess_ranking(report, policy)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
     print(render_text(report))
+    print(render_ranked(board))
     if out:
+        doc = report.to_dict()
+        doc["coverage"] = board.to_dict()
         with open(out, "w", encoding="utf-8") as f:
-            f.write(json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n")
+            f.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
         print(f"Report: {out}")
+    try:
+        require_ranking(board)
+    except RankingRefused as e:
+        print(f"Refused: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -2193,6 +2231,8 @@ def main() -> None:
         print("       agenteval-bench replay --log replay.json --suite <file> [--check]")
         print("       agenteval-bench alt-test --data annotations.jsonl [--epsilon 0.1]")
         print("                                [--q 0.05] [--seed 42] [--out report.json]")
+        print("                                [--min-cell-n 50] [--min-total 50]")
+        print("                                (exit 1 = ranking refused: sparse cells)")
         print("       agenteval-bench simpson --slices slices.json")
         print("                                [--allocation-tolerance 0.05] [--out report.json]")
         print("       agenteval-bench judges --registry <file.json> [--want 2]")

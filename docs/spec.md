@@ -69,6 +69,12 @@ src/agenteval_bench/
                   #   First agenteval_bench -> alt_test import (types only):
                   #   the bridge reads recorded AltTestItem labels.
   calibration_demo.py # Seeded end-to-end demo of judge calibration
+  coverage.py     # Coverage requirements before learning or ranking
+                  #   (CoveragePolicy, CellCoverage, JudgeCoverage,
+                  #   RankedLeaderboard; per-cell floor 50, sparse cells
+                  #   masked, Wilson-lower-bound conservative fallback;
+                  #   alt-test bridge: (judge, annotator) cells)
+  coverage_demo.py # Seeded end-to-end demo of coverage-gated ranking
   diverge.py      # Anti-mode-collapse: /diverge with 5 candidates +
                   #   p_conventional (Candidate, DivergeSet, DiversityReport,
                   #   check_p_conventional, select, require_high_stakes_decision;
@@ -286,6 +292,7 @@ print(result.summary())
 | Measurement-validity column (decide + scorer) | ✅ shipped | v0.1.0  |
 | Judge decorrelation (HOST != FAMILY) | ✅ shipped | v0.1.0  |
 | Judge calibration (confidence is not evidence) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
+| Coverage requirements before learning or ranking (mask sparse cells) | ✅ shipped  | v0.1.0         |
 | OEC ship gate (OEC + guardrails + trust gates) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Analysis pre-specification (10-question review gate) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Anti-mode-collapse /diverge (5 candidates + p_conventional) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
