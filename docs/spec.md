@@ -69,6 +69,15 @@ src/agenteval_bench/
                   #   First agenteval_bench -> alt_test import (types only):
                   #   the bridge reads recorded AltTestItem labels.
   calibration_demo.py # Seeded end-to-end demo of judge calibration
+  diverge.py      # Anti-mode-collapse: /diverge with 5 candidates +
+                  #   p_conventional (Candidate, DivergeSet, DiversityReport,
+                  #   check_p_conventional, select, require_high_stakes_decision;
+                  #   pair similarity = max(content-token, hard-token) Jaccard
+                  #   (hard-token signal only with >= 3 hard tokens per side),
+                  #   weakest-link grade, Wilson interval on the conventional
+                  #   cluster's share; single-sample generation refused on
+                  #   high stakes; the high-stakes gate requires exactly 5)
+  diverge_demo.py # Seeded end-to-end demo of /diverge
   regression.py   # Production failures -> frozen versions -> release gate
   snapshots.py    # Immutable benchmark snapshots (hash-verified store)
   replay.py       # Deterministic seeded replay logs (bit-exact re-runs)
@@ -111,6 +120,7 @@ docs/             # Specifications, archive, roadmap references
 | `AllocationReport`   | Family-decorrelated judge allocation; unreachable judges are holes, never dropped. |
 | `JudgeCalibration`   | Per-bin stated confidence vs measured agreement; only CALIBRATED may gate. |
 | `ShipVerdict`        | OEC + guardrails + trust gates (SRM, A/A, replication); SHIP only when all pass. |
+| `Selection`          | /diverge selection record: winner vs conventional scores, margin, closed outcome, reason from measured facts; only a token-level-diverse selection graded under the canonical policy with a non-overconfident p may decide on high stakes. |
 | `cli.main`           | Parse argv, load suite, build replay `agent_fn`, print summary + gate. |
 
 ### 4.3 Data-flow diagram
@@ -215,6 +225,7 @@ table:
 | `decide` | GATE | ROLLBACK | INVESTIGATE | usage error |
 | `calibrate` | calibrated | bad input | mis/uncalibrated | — |
 | `ship` | SHIP | NO_SHIP / NEEDS_REPLICATION | bad input | — |
+| `diverge` | selection made | bad input | refused (paraphrase set / overconfident p / single sample on high stakes) | — |
 | `register-design` | registered | — | bad input | — |
 
 > The `compare` and `report` subcommands described in earlier drafts are **`planned`**
@@ -275,6 +286,7 @@ print(result.summary())
 | Judge decorrelation (HOST != FAMILY) | ✅ shipped | v0.1.0  |
 | Judge calibration (confidence is not evidence) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | OEC ship gate (OEC + guardrails + trust gates) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
+| Anti-mode-collapse /diverge (5 candidates + p_conventional) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |

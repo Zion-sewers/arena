@@ -858,6 +858,135 @@ def cmd_calibrate(args: list[str]) -> int:
     return 0 if record.status == "calibrated" else 2
 
 
+def cmd_diverge(args: list[str]) -> int:
+    """Run /diverge on a recorded candidate set (arena#47).
+
+    Reads a candidates file (--candidates file.json: prompt, 5
+    candidates with scores, conventional_index, p_conventional, and
+    optional stakes), scores the set for token-level diversity
+    (near-duplicate detection, not semantic diversity), checks the
+    declared p_conventional against the measured share of the
+    conventional answer's cluster, and selects on score — recording
+    why the conventional answer won or lost. Exit 0 = a selection was
+    made and it may decide on the declared stakes; exit 2 = refused
+    (paraphrase set, overconfident p on high stakes, too few
+    candidates on high stakes, or a selection covering anything other
+    than 5 candidates); exit 1 = unusable candidates file or policy.
+    """
+    from agenteval_bench.diverge import (
+        DivergePolicy,
+        HighStakesRefused,
+        NotDiverseError,
+        SingleSampleError,
+        analyze_diversity,
+        build_diverge_set,
+        candidates_from_json,
+        check_p_conventional,
+        may_decide_high_stakes,
+        p_check_summary,
+        require_high_stakes_decision,
+        select,
+    )
+
+    args, cand_path = _flag(args, "--candidates")
+    args, out = _flag(args, "--out")
+    args, as_json = _has(args, "--json")
+    args, max_sim_s = _flag(args, "--max-pair-similarity")
+    args, tolerance_s = _flag(args, "--p-tolerance")
+    if not cand_path:
+        print("Error: diverge needs --candidates <file.json>", file=sys.stderr)
+        return 1
+    try:
+        policy = DivergePolicy(
+            max_pair_similarity=float(max_sim_s) if max_sim_s is not None else 0.80,
+            p_conventional_tolerance=float(tolerance_s) if tolerance_s is not None else 0.15,
+        )
+    except (ValueError, TypeError) as e:
+        print(f"Error: unusable diverge policy: {e}", file=sys.stderr)
+        return 1
+    try:
+        text = Path(cand_path).read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"Error: cannot read candidates: {e}", file=sys.stderr)
+        return 1
+    try:
+        prompt, candidates, conv_index, p_conv, stakes = candidates_from_json(text)
+        diverge_set = build_diverge_set(
+            prompt, candidates, conv_index, p_conv, stakes=stakes, policy=policy
+        )
+    except SingleSampleError as e:
+        print(f"Refused: {e}", file=sys.stderr)
+        return 2
+    except (ValueError, TypeError) as e:
+        print(f"Error: unusable candidates: {e}", file=sys.stderr)
+        return 1
+    report = analyze_diversity(diverge_set)
+    p_check = check_p_conventional(diverge_set, report)
+    try:
+        selection = select(diverge_set, report, p_check)
+    except NotDiverseError as e:
+        print(f"Refused: {e}", file=sys.stderr)
+        return 2
+    if stakes == "high":
+        try:
+            require_high_stakes_decision(selection)
+        except HighStakesRefused as e:
+            print(f"Refused: {e}", file=sys.stderr)
+            return 2
+    payload = {
+        "prompt": diverge_set.prompt,
+        "stakes": stakes,
+        "diversity_scope": "token-level near-duplicate",
+        "report": report.to_dict(),
+        "p_conventional": p_check.to_dict(),
+        "selection": selection.to_dict(),
+        "may_decide_high_stakes": may_decide_high_stakes(selection),
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(
+            f"diverge: {'diverse' if report.diverse else 'NOT diverse'} "
+            f"(min pairwise diversity {report.min_pair_diversity:.2f}, "
+            f"conventional share {p_check.conventional_share:.2f})"
+        )
+        print(
+            "  note: diversity is token-level only — 'diverse' means no "
+            "near-verbatim pair, not semantic diversity"
+        )
+        print(
+            f"  p_conventional {p_check.declared_p:.2f} is {p_check.verdict} "
+            f"(Wilson 95% [{p_check.agreement_interval[0]:.2f}, "
+            f"{p_check.agreement_interval[1]:.2f}] on the conventional "
+            f"answer's cluster share {p_check.conventional_share:.2f})"
+        )
+        print(f"  -> {p_check_summary(p_check)}")
+        for note in p_check.notes:
+            print(f"  ! {note}")
+        for pair in report.pairs:
+            if pair.near_duplicate:
+                print(
+                    f"  ! candidates {pair.i}/{pair.j} are near-duplicates "
+                    f"(similarity {pair.similarity:.2f})"
+                )
+        print(f"  selection: {selection.outcome} (winner candidate {selection.winner_index})")
+        print(f"  reason: {selection.reason}")
+        if stakes == "high":
+            print(
+                "  high-stakes decision: "
+                + ("allowed" if may_decide_high_stakes(selection) else "refused")
+            )
+    if out:
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload, indent=2) + "\n")
+        except OSError as e:
+            print(f"Error: cannot write report: {e}", file=sys.stderr)
+            return 1
+        print(f"Report: {out}", file=sys.stderr if as_json else sys.stdout)
+    return 0
+
+
 def cmd_ship(args: list[str]) -> int:
     """Rule SHIP / NO_SHIP / NEEDS_REPLICATION for one agent change (arena#46).
 
@@ -1939,6 +2068,11 @@ def main() -> None:
         print("                                [--min-bin-n 5] [--tolerance 0.10]")
         print("                                [--json] [--out report.json]")
         print("                                (exit 0 calibrated, 2 mis/uncalibrated, 1 bad input)")
+        print("       agenteval-bench diverge --candidates <file.json>")
+        print("                                [--max-pair-similarity 0.80]")
+        print("                                [--p-tolerance 0.15]")
+        print("                                [--json] [--out report.json]")
+        print("                                (exit 0 selection made, 2 refused, 1 bad input)")
         print("       agenteval-bench ship --design <file.json> --evidence <file.json>")
         print("                                [--registry plans/experiments.jsonl]")
         print("                                [--json] [--out report.json]")
@@ -1991,6 +2125,8 @@ def main() -> None:
         sys.exit(cmd_judges(rest))
     elif cmd == "calibrate":
         sys.exit(cmd_calibrate(rest))
+    elif cmd == "diverge":
+        sys.exit(cmd_diverge(rest))
     elif cmd == "ship":
         sys.exit(cmd_ship(rest))
     elif cmd == "register-design":
