@@ -287,7 +287,8 @@ def main() -> int:
 
         # 3g. A finding naming a different digest than the one under
         # review is refused as DIGEST_MISMATCH — even when the named
-        # digest is unregistered, the binding field is checked first.
+        # digest is unregistered: the plan under review loads first, then
+        # the binding is checked against the finding's digest.
         mismatch = review_analysis(
             digest2,
             registry2,

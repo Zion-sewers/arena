@@ -3,6 +3,8 @@
 import os
 import tempfile
 
+import pytest
+
 from agenteval_bench import cli
 
 REPLAY_SUITE = """
@@ -248,3 +250,42 @@ def test_prespec_cli_bad_interval_exit_2(monkeypatch, capsys, tmp_path):
     )
     assert code == 2
     assert "invalid finding doc" in err
+
+
+@pytest.mark.parametrize("doc", ['["x"]', '"abc"', "42", "null"])
+def test_prespec_cli_non_object_doc_exit_2(monkeypatch, capsys, tmp_path, doc):
+    """A non-object JSON doc is unusable input (exit 2) at every CLI
+    entry point that reads one — never a traceback with exit 1."""
+    _plan, finding, registry = _prespec_files(
+        tmp_path,
+        "reranker v2 cuts hallucinated citations by at least 10pp vs v1",
+    )
+    bad_finding = tmp_path / "finding-list.json"
+    bad_finding.write_text(doc, encoding="utf-8")
+    code, _, err = _run(
+        ["prespec", "--finding", str(bad_finding), "--registry", registry],
+        monkeypatch, capsys,
+    )
+    assert code == 2, err
+    assert "invalid finding doc" in err
+    assert "Traceback" not in err
+
+    bad_plan = tmp_path / "plan-list.json"
+    bad_plan.write_text(doc, encoding="utf-8")
+    code, _, err = _run(
+        ["prespec", "--finding", finding, "--plan", str(bad_plan),
+         "--registry", registry],
+        monkeypatch, capsys,
+    )
+    assert code == 2, err
+    assert "invalid plan doc" in err
+    assert "Traceback" not in err
+
+    code, _, err = _run(
+        ["register-analysis-plan", "--plan", str(bad_plan),
+         "--registry", registry],
+        monkeypatch, capsys,
+    )
+    assert code == 2, err
+    assert "unusable plan" in err
+    assert "Traceback" not in err

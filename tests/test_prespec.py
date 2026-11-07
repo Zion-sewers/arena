@@ -542,3 +542,14 @@ def test_finding_from_dict_rejects_bad_doc() -> None:
 def test_plan_from_dict_rejects_bad_doc() -> None:
     with pytest.raises(ValueError, match="invalid analysis plan doc"):
         plan_from_dict({"name": "no fields at all"})
+
+
+@pytest.mark.parametrize("doc", [["x"], "abc", 42, None, True])
+def test_from_dict_rejects_non_object_json_doc(doc: object) -> None:
+    """A JSON doc that is not an object is unusable input (exit 2 via the
+    CLI), never a crash: .get on a list/str/int raises AttributeError,
+    which no catch tuple covers, so the guard must fire first."""
+    with pytest.raises(TypeError, match="invalid analysis plan doc"):
+        plan_from_dict(doc)
+    with pytest.raises(TypeError, match="invalid analysis finding doc"):
+        finding_from_dict(doc)

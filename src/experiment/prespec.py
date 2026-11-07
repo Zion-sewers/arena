@@ -339,9 +339,10 @@ def _record_digest(
     """Chain digest over the previous digest, the plan, AND its timestamp.
 
     registered_at is part of the hashed payload: backdating a plan's
-    registration breaks the chain exactly like rewriting the plan, so
-    Q2's "plan written before data touched" rests on a tamper-evident
-    timestamp, not an unprotected field.
+    registration breaks the chain exactly like rewriting the plan. That
+    covers only registered_at — data_accessed_at is a free-text field in
+    the finding, so Q2's "plan written before data touched" still rests
+    on reported timestamps, not on this chain.
     """
     payload = json.dumps(
         {"prev": prev_digest, "analysis_plan": canonical, "registered_at": registered_at},
@@ -558,8 +559,19 @@ def _as_interval(value: object) -> tuple[float, float] | None:
     return (lo, hi)
 
 
-def plan_from_dict(doc: Mapping[str, object]) -> AnalysisPlan:
-    """Build a plan from a JSON doc (field names match plan_to_dict)."""
+def plan_from_dict(doc: object) -> AnalysisPlan:
+    """Build a plan from a JSON doc (field names match plan_to_dict).
+
+    A non-object JSON doc (list, string, number, null) is invalid input,
+    not a plan missing fields: it is refused with TypeError before any
+    field is read, so the CLI maps it to exit 2 instead of crashing on
+    a missing .get with AttributeError.
+    """
+    if not isinstance(doc, Mapping):
+        raise TypeError(
+            f"invalid analysis plan doc: expected a JSON object, "
+            f"got {type(doc).__name__}"
+        )
     try:
         return AnalysisPlan(
             name=_as_str(doc.get("name"), "name"),
@@ -593,8 +605,18 @@ def finding_to_dict(finding: AnalysisFinding) -> dict[str, object]:
     }
 
 
-def finding_from_dict(doc: Mapping[str, object]) -> AnalysisFinding:
-    """Build a finding from a JSON doc (field names match finding_to_dict)."""
+def finding_from_dict(doc: object) -> AnalysisFinding:
+    """Build a finding from a JSON doc (field names match finding_to_dict).
+
+    A non-object JSON doc (list, string, number, null) is invalid input:
+    refused with TypeError before any field is read, so the CLI maps it
+    to exit 2 instead of crashing on a missing .get with AttributeError.
+    """
+    if not isinstance(doc, Mapping):
+        raise TypeError(
+            f"invalid analysis finding doc: expected a JSON object, "
+            f"got {type(doc).__name__}"
+        )
     try:
         return AnalysisFinding(
             plan_digest=_as_str(doc.get("plan_digest"), "plan_digest"),
@@ -632,6 +654,14 @@ def _question(
     )
 
 
+# Standing note on every ReviewGateReport, pass or refusal: the gate is
+# a consistency check over reported evidence, not an audit of raw data.
+_HONESTY_NOTE = (
+    "consistency check over reported evidence only — see "
+    "docs/PRESPECIFICATION.md honesty boundaries"
+)
+
+
 def review_analysis(
     plan_digest: str, registry_path: str, finding: AnalysisFinding
 ) -> ReviewGateReport:
@@ -650,7 +680,10 @@ def review_analysis(
             verdict="REFUSED",
             questions=(),
             violations=("REGISTRY_UNREADABLE",),
-            notes=(f"{type(e).__name__}: {e}",),
+            notes=(
+                f"{type(e).__name__}: {e}",
+                _HONESTY_NOTE,
+            ),
             plan_digest=plan_digest,
         )
     except (KeyError, AnalysisRegistryCorrupted):
@@ -658,7 +691,7 @@ def review_analysis(
             verdict="REFUSED",
             questions=(),
             violations=("UNREGISTERED_PLAN",),
-            notes=(),
+            notes=(_HONESTY_NOTE,),
             plan_digest=plan_digest,
         )
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
@@ -666,7 +699,10 @@ def review_analysis(
             verdict="REFUSED",
             questions=(),
             violations=("REGISTRY_UNREADABLE",),
-            notes=(f"{type(e).__name__}: {e}",),
+            notes=(
+                f"{type(e).__name__}: {e}",
+                _HONESTY_NOTE,
+            ),
             plan_digest=plan_digest,
         )
 
@@ -681,15 +717,13 @@ def review_analysis(
             notes=(
                 (f"finding names plan {finding.plan_digest[:12]}... "
                 f"but was reviewed against {plan_digest[:12]}..."),
+                _HONESTY_NOTE,
             ),
             plan_digest=plan_digest,
         )
 
     violations: list[str] = []
-    notes: list[str] = [
-        ("consistency check over reported evidence only — see "
-        "docs/PRESPECIFICATION.md honesty boundaries")
-    ]
+    notes: list[str] = [_HONESTY_NOTE]
     questions: list[QuestionResult] = []
 
     # Q1 — registered: load_analysis_plan already proved it.

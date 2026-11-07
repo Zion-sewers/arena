@@ -1384,6 +1384,12 @@ def publish_mined_version(
         mined_promotion_record(m, promoted_at=promoted_at).to_dict()
         for m in mined_cases
     ]
+    # The published version's created_at is the run's logical clock
+    # (mined_at, carried here as promoted_at), never the wall clock: the
+    # staleness predicate compares created_at against the next run's
+    # mined_at, so a wall-clock creation time makes staleness depend on
+    # when the process happened to run instead of on the cadence. When
+    # promoted_at is None the store keeps its wall-clock default.
     version = store.publish(
         new_suite,
         version_id,
@@ -1391,6 +1397,7 @@ def publish_mined_version(
         baseline,
         prev_version_id=prev_version_id,
         promotions=records,
+        created_at=promoted_at,
     )
     return version, new_suite
 

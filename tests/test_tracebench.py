@@ -1132,6 +1132,19 @@ def test_previous_stale_is_observed(tmp_path: Path) -> None:
     assert report_doc["previous_stale"] is True
 
 
+def test_published_version_created_at_is_the_run_clock(tmp_path: Path) -> None:
+    """A published version's created_at is the run's mined_at, not the
+    wall clock: the staleness predicate compares created_at against the
+    next run's mined_at, so a wall-clock creation time makes staleness
+    depend on when the process happened to run. Regression: with the
+    wall clock, test_previous_stale_is_observed passed only while the
+    wall clock was within one cadence of MINED_AT + 8 days, and went
+    red on both CI Pythons once 2026-11-07T19:00Z passed."""
+    store, _oracle = _first_run(tmp_path)
+    version, _suite = SnapshotStore(store).load("bench", "1")
+    assert version.created_at == MINED_AT
+
+
 def test_malformed_run_state_fails_closed(tmp_path: Path) -> None:
     """A corrupt, cross-suite, or negative-streak state file must never
     silently restart the version chain or the failure streak."""

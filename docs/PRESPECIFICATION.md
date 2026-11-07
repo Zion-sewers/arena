@@ -87,7 +87,9 @@ report = check_analysis(digest, "plans/analyses.jsonl", AnalysisFinding(
     n_observed=200,
     interval=(0.08, 0.20),
     data_digest="sha256:golden-suite-seed42",
-    data_accessed_at="2026-11-07T19:00:00+00:00",
+    # Far-future placeholder: use the real access time for a real
+    # analysis. It must be at or after the plan's registered_at (Q2).
+    data_accessed_at="2099-01-01T00:00:00+00:00",
     code_version="arena@dbf6909",
 ))  # raises AnalysisViolation naming the violation otherwise
 ```
@@ -146,10 +148,10 @@ a plan edited after registration is unusable input, never a refused
 finding.
 
 The two JSON files, with the register-printed digest pasted into the
-finding as `plan_digest`:
+finding as `plan_digest`. `plan.json` — register this FIRST, before the
+data is touched:
 
 ```json
-// plan.json — register this FIRST, before the data is touched
 {
   "name": "reranker-v2-failure-modes",
   "mode": "confirmatory",
@@ -165,8 +167,9 @@ finding as `plan_digest`:
 }
 ```
 
+`finding.json` — `plan_digest` is the digest `register-analysis-plan` printed:
+
 ```json
-// finding.json — plan_digest is the digest register-analysis-plan printed
 {
   "plan_digest": "<digest from register-analysis-plan>",
   "mode": "confirmatory",
@@ -175,16 +178,20 @@ finding as `plan_digest`:
   "n_observed": 200,
   "interval": [0.08, 0.20],
   "data_digest": "sha256:golden-suite-seed42",
-  "data_accessed_at": "2026-11-07T19:00:00+00:00",
+  "data_accessed_at": "2099-01-01T00:00:00+00:00",
   "code_version": "arena@dbf6909"
 }
 ```
 
 `data_accessed_at` must be at or after the plan's `registered_at`
-(Q2); the example timestamp above passes only if the plan was
-registered before then. The finding's `plan_digest` must be the digest
-under review — naming any other digest is refused as `DIGEST_MISMATCH`,
-even when that digest is itself registered.
+(Q2). The example uses a far-future timestamp so it passes whenever
+the plan was registered; a real analysis uses the real access time.
+The finding's `plan_digest` must be the digest under review — naming
+any other digest is refused as `DIGEST_MISMATCH` through
+`review_analysis`, even when that digest is itself registered. Via the
+CLI there is no separate digest under review: `prespec` passes the
+finding's digest as the digest, so a wrong digest surfaces as
+`UNREGISTERED_PLAN` there instead.
 
 ## 5. Violations fail CI
 
@@ -239,6 +246,9 @@ that run.
   registry (`registry.py`): the same construction, but a separate file,
   so this change cannot regress the #32/#46 seams. `find_analysis_plan`
   is the equality check against that chain.
+- Digest scheme: `registered_at` joined the hashed payload with this
+  change, so a registry written by earlier code fails chain
+  verification and must be re-created, not carried forward.
 - Evidence levels: the ten questions and the mode-split enforcement are
   **adaptations** of the book's themes; the gate mechanics are
   **established** repo patterns (hash-chained registry, exact-match
