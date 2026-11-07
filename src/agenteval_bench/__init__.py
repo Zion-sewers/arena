@@ -1,5 +1,18 @@
 """agenteval-bench — Production-grade CLI for evaluating LLM agent outputs."""
 
+from agenteval_bench.calibration import (
+    CalibrationBin,
+    CalibrationPolicy,
+    ConfidenceObservation,
+    JudgeCalibration,
+    UncalibratedJudgeError,
+    calibrate,
+    default_calibration_policy,
+    may_gate,
+    observations_from_alt_test,
+    observations_from_json,
+    require_calibrated,
+)
 from agenteval_bench.decision import (
     CostEvidence,
     Decision,
@@ -43,6 +56,9 @@ from agenteval_bench.validity import (
 __all__ = [
     "UNKNOWN_FAMILY",
     "AllocationReport",
+    "CalibrationBin",
+    "CalibrationPolicy",
+    "ConfidenceObservation",
     "CostEvidence",
     "Decision",
     "DecisionAction",
@@ -55,6 +71,7 @@ __all__ = [
     "EvalRunner",
     "EvalSuite",
     "Judge",
+    "JudgeCalibration",
     "JudgeHole",
     "MetricValidity",
     "ProportionEvidence",
@@ -62,6 +79,7 @@ __all__ = [
     "RiskLevel",
     "RiskThresholds",
     "RunResult",
+    "UncalibratedJudgeError",
     "UnmeasuredEvidence",
     "ValidityGrade",
     "ValidityPolicy",
@@ -69,12 +87,18 @@ __all__ = [
     "allocate",
     "assess_decision",
     "assess_scorer",
+    "calibrate",
     "decide",
+    "default_calibration_policy",
     "default_policy",
     "default_validity_policy",
     "load_registry",
+    "may_gate",
+    "observations_from_alt_test",
+    "observations_from_json",
     "policy_fingerprint",
     "registry_from_json",
+    "require_calibrated",
     "validate_matcher_labels",
     "validate_proxy",
 ]

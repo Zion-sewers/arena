@@ -43,3 +43,5 @@ jobs:
         run: PYTHONPATH=src python -m agenteval_bench.validity_demo
       - name: Judge-decorrelation demo (HOST != FAMILY; holes reported, never dropped)
         run: PYTHONPATH=src python -m agenteval_bench.judges_demo
+      - name: Judge-calibration demo (confidence is not evidence; only CALIBRATED gates)
+        run: PYTHONPATH=src python -m agenteval_bench.calibration_demo
