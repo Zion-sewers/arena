@@ -75,6 +75,17 @@ src/agenteval_bench/
                   #   masked, Wilson-lower-bound conservative fallback;
                   #   alt-test bridge: (judge, annotator) cells)
   coverage_demo.py # Seeded end-to-end demo of coverage-gated ranking
+  code_length.py  # Model/version selection by code length; capacity meter
+                  #   (ModelVersion, SelectionReport, select_version,
+                  #   select_by_total_length, CapacityReading,
+                  #   CapacityVerdict, assess_capacity; two-part code
+                  #   length = measured description bits under one fixed
+                  #   compressor + held-out log-loss; parameter count is
+                  #   diagnostic only, never a complexity argument; the
+                  #   meter stops training on capacity growth without
+                  #   generalisation improvement over a patience window)
+  code_length_demo.py # Seeded end-to-end demo of code-length selection
+                  #   and the capacity meter
   diverge.py      # Anti-mode-collapse: /diverge with 5 candidates +
                   #   p_conventional (Candidate, DivergeSet, DiversityReport,
                   #   check_p_conventional, select, require_high_stakes_decision;
