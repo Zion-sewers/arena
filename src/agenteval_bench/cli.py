@@ -688,6 +688,78 @@ def cmd_simpson(args: list[str]) -> int:
     return 0 if verdict.accepted else 1
 
 
+def cmd_judges(args: list[str]) -> int:
+    """Allocate decorrelated judges from a registry file (arena#44).
+
+    Reads a judge registry (JSON: a mapping with a ``judges`` list, or a
+    bare list; each entry carries ``id``, ``host``, ``model_family``,
+    optional ``model`` and ``reachable``), allocates up to ``--want``
+    judges with pairwise-distinct model families, and prints the picks
+    with the unreachable judges as explicit holes. Exit 0 = the
+    allocation satisfied the request; exit 2 = thin allocation (the
+    registry does not supply ``--want`` distinct reachable families);
+    exit 1 = unusable registry.
+    """
+    from agenteval_bench.judges import allocate, registry_from_json
+
+    args, registry_path = _flag(args, "--registry")
+    args, want_s = _flag(args, "--want", "2")
+    args, out = _flag(args, "--out")
+    args, as_json = _has(args, "--json")
+    if not registry_path:
+        print("Error: judges needs --registry <file.json>", file=sys.stderr)
+        return 1
+    try:
+        want = int(want_s) if want_s is not None else 2
+    except ValueError:
+        print(f"Error: --want must be an integer, got {want_s!r}", file=sys.stderr)
+        return 1
+    if want < 1:
+        print("Error: --want must be >= 1", file=sys.stderr)
+        return 1
+    try:
+        text = Path(registry_path).read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"Error: cannot read registry: {e}", file=sys.stderr)
+        return 1
+    try:
+        judges = registry_from_json(text)
+    except (ValueError, TypeError) as e:
+        print(f"Error: unusable registry: {e}", file=sys.stderr)
+        return 1
+    report = allocate(judges, want=want)
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        picked = ", ".join(f"{j.id} [{j.model_family}]" for j in report.picked)
+        print(f"picked ({len(report.picked)}/{want}): {picked or '(nobody)'}")
+        if report.holes:
+            print("HOLES — unreachable, reported never dropped:")
+            for hole in report.holes:
+                print(
+                    f"  ! {hole.judge} [{hole.model_family}] ({hole.host}): "
+                    f"{hole.reason}"
+                )
+        for rejected in report.rejected:
+            print(f"  ! rejected {rejected.judge}: {rejected.reason}")
+        for note in report.notes:
+            print(f"  ! {note}")
+        print("Decorrelation is on model_family, never on host.")
+        print(
+            "Reachability as declared in the registry; no probe was run, "
+            "so a 'measured' label here is a claim, not a measurement."
+        )
+    if out:
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(json.dumps(report.to_dict(), indent=2) + "\n")
+        except OSError as e:
+            print(f"Error: cannot write report: {e}", file=sys.stderr)
+            return 1
+        print(f"Report: {out}")
+    return 0 if report.satisfied else 2
+
+
 def cmd_replay(args: list[str]) -> int:
     """Verify a replay log is bit-exact: re-run and byte-compare."""
     args, log_path = _flag(args, "--log")
@@ -1650,6 +1722,9 @@ def main() -> None:
         print("                                [--q 0.05] [--seed 42] [--out report.json]")
         print("       agenteval-bench simpson --slices slices.json")
         print("                                [--allocation-tolerance 0.05] [--out report.json]")
+        print("       agenteval-bench judges --registry <file.json> [--want 2]")
+        print("                                [--json] [--out report.json]")
+        print("                                (exit 0 satisfied, 2 thin allocation, 1 bad registry)")
         print("       agenteval-bench bugsmith --repo <dir> --out <dir> [--procedural 8]")
         print("                                [--seed 42] [--local] [--config curation.json]")
         print("                                [--pr-mirror patch:pr-ref]")
@@ -1691,6 +1766,8 @@ def main() -> None:
         sys.exit(cmd_alt_test(rest))
     elif cmd == "simpson":
         sys.exit(cmd_simpson(rest))
+    elif cmd == "judges":
+        sys.exit(cmd_judges(rest))
     elif cmd == "bugsmith":
         sys.exit(cmd_bugsmith(rest))
     elif cmd == "snapshot":

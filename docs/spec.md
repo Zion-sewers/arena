@@ -57,6 +57,11 @@ src/agenteval_bench/
   validity.py     # Measurement validity: every metric carries a reliability
                   #   column (ValidityGrade, validate_proxy, ValidityReport)
   validity_demo.py # Seeded end-to-end demo of measurement validity
+  judges.py       # Judge decorrelation: HOST != FAMILY (Judge, allocate,
+                  #   AllocationReport; family-keyed allocation, unreachable
+                  #   judges reported as holes, VARIES-BY-MODEL never a
+                  #   second slot)
+  judges_demo.py  # Seeded end-to-end demo of judge decorrelation
   regression.py   # Production failures -> frozen versions -> release gate
   snapshots.py    # Immutable benchmark snapshots (hash-verified store)
   replay.py       # Deterministic seeded replay logs (bit-exact re-runs)
@@ -96,6 +101,7 @@ docs/             # Specifications, archive, roadmap references
 | `DeterministicScorer`| Apply configured matchers; return `EvalResult` with details.          |
 | `EvalRunner`         | Iterate cases, invoke `agent_fn`, collect `EvalResult`s into `RunResult`. |
 | `ValidityReport`     | Validity assessment per metric; a metric without a note is UNASSESSED and untrusted. |
+| `AllocationReport`   | Family-decorrelated judge allocation; unreachable judges are holes, never dropped. |
 | `cli.main`           | Parse argv, load suite, build replay `agent_fn`, print summary + gate. |
 
 ### 4.3 Data-flow diagram
@@ -254,6 +260,7 @@ print(result.summary())
 |------------------------|-------------|----------------|
 | Deterministic scoring  | ✅ shipped  | v0.1.0         |
 | Measurement-validity column (decide + scorer) | ✅ shipped | v0.1.0  |
+| Judge decorrelation (HOST != FAMILY) | ✅ shipped | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |
