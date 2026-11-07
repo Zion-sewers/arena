@@ -1025,6 +1025,14 @@ def mine_traces(
 # ---------------------------------------------------------------------------
 
 
+def _is_stale_since(last: datetime, cadence: Cadence, now: datetime) -> bool:
+    """The one staleness predicate: stale when ``now`` is more than one
+    cadence past ``last``. Both :meth:`BenchmarkManifest.is_stale` and
+    :func:`run_scheduled` call this, so the manifest type and the
+    production path can never drift into two definitions of stale."""
+    return (now - last) > timedelta(days=CADENCE_DAYS[cadence])
+
+
 @dataclass(frozen=True)
 class BenchmarkManifest:
     """One benchmark's identity: which cases it holds, where they came
@@ -1050,11 +1058,13 @@ class BenchmarkManifest:
     def is_stale(self, now: datetime) -> bool:
         """True when the last mine is older than the cadence. A naive
         ``now`` is refused — staleness must never be computed on an
-        ambiguous clock."""
+        ambiguous clock. Delegates to :func:`_is_stale_since`, the one
+        predicate the scheduled runner also calls, so the manifest and
+        the production path can never disagree about staleness."""
         if now.tzinfo is None:
             raise ValueError("is_stale: 'now' must carry a timezone")
         last = _parse_instant(self.last_mined_at, "BenchmarkManifest.last_mined_at")
-        return (now - last) > timedelta(days=CADENCE_DAYS[self.cadence])
+        return _is_stale_since(last, self.cadence, now)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1408,6 +1418,9 @@ class ScheduledRunResult:
     version_ignored: bool = False
     drift_detected: bool = False
     drifted_case_ids: tuple[str, ...] = ()
+    corpus_total_lines: int = 0
+    corpus_skipped: int = 0
+    previous_corpus_total_lines: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1426,6 +1439,9 @@ class ScheduledRunResult:
             "version_ignored": self.version_ignored,
             "drift_detected": self.drift_detected,
             "drifted_case_ids": list(self.drifted_case_ids),
+            "corpus_total_lines": self.corpus_total_lines,
+            "corpus_skipped": self.corpus_skipped,
+            "previous_corpus_total_lines": self.previous_corpus_total_lines,
             "manifest": self.manifest.to_dict(),
             "actions": [a.to_dict() for a in self.actions],
             "consecutive_failures": self.consecutive_failures,
@@ -1483,7 +1499,18 @@ def _load_run_state(
         raise TracebenchError(
             f"run state {path}: consecutive_failures must be an integer >= 0"
         )
-    return {"prev_version_id": prev, "consecutive_failures": streak}
+    total = raw.get("corpus_total_lines")
+    if total is not None and (
+        isinstance(total, bool) or not isinstance(total, int) or total < 0
+    ):
+        raise TracebenchError(
+            f"run state {path}: corpus_total_lines must be an integer >= 0"
+        )
+    return {
+        "prev_version_id": prev,
+        "consecutive_failures": streak,
+        "corpus_total_lines": total,
+    }
 
 
 def _write_run_state(
@@ -1493,6 +1520,7 @@ def _write_run_state(
     prev_version_id: str,
     consecutive_failures: int,
     updated_at: str,
+    corpus_total_lines: int | None = None,
 ) -> None:
     """Persist the run's state atomically (unique temp file + replace).
     Any I/O failure is a TracebenchError, never a raw traceback: the CLI
@@ -1506,6 +1534,7 @@ def _write_run_state(
             "suite_name": suite_name,
             "prev_version_id": prev_version_id,
             "consecutive_failures": consecutive_failures,
+            "corpus_total_lines": corpus_total_lines,
             "updated_at": updated_at,
         }
         fd, tmp_name = tempfile.mkstemp(
@@ -1546,6 +1575,29 @@ def _check_state_dir_writable(state_dir: str | Path) -> None:
         ) from e
 
 
+def _check_out_dir_writable(out_dir: str | Path) -> None:
+    """Preflight for ``--out``: prove the output directory can be
+    created and written BEFORE the run publishes anything. The
+    publish-then-write order means an out_dir failure after publishing
+    leaves a published version with no artifacts and no state, and the
+    next run re-derives the same version id and dies on the duplicate —
+    the chain is bricked and needs manual recovery. Fail here, with
+    nothing half-done, instead. Mirrors :func:`_check_state_dir_writable`."""
+    directory = Path(out_dir)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".writable-probe.")
+        try:
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write("ok")
+        finally:
+            Path(tmp_name).unlink(missing_ok=True)
+    except OSError as e:
+        raise TracebenchError(
+            f"out dir {directory} is not writable: {e}"
+        ) from e
+
+
 def _mined_case_ids(
     store: SnapshotStore, suite_name: str, version_id: str
 ) -> set[str]:
@@ -1581,6 +1633,45 @@ def _mined_case_ids(
                 mined.add(case_id)
         current = version.prev_version_id
     return mined
+
+
+def _suite_source_incidents(
+    store: SnapshotStore, suite_name: str, version_id: str, case_ids: set[str]
+) -> tuple[str, ...]:
+    """Incident ids behind the mined cases in a suite version, read from
+    promotion provenance down the version chain. A case the mine once
+    produced carries its incident id in its promotion record; a
+    hand-seeded base case has no promotion and contributes no incident.
+    This is what lets the run manifest describe the benchmark actually
+    gated (the effective suite) instead of only the cases this run mined.
+    A broken chain fails closed, like :func:`_mined_case_ids`."""
+    incidents: set[str] = set()
+    current: str | None = version_id
+    seen: set[str] = set()
+    while current is not None:
+        if current in seen:
+            raise TracebenchError(
+                f"version chain for {suite_name} loops at {current!r} — "
+                "refusing to describe the gated suite from a corrupt chain"
+            )
+        seen.add(current)
+        try:
+            version, _suite = store.load(suite_name, current)
+        except SnapshotError as e:
+            raise TracebenchError(
+                f"cannot walk the version chain for {suite_name}: {e}"
+            ) from e
+        for promotion in version.promotions:
+            if promotion.get("promoted_case_id") not in case_ids:
+                continue
+            provenance = promotion.get("provenance")
+            if not isinstance(provenance, Mapping):
+                continue
+            incident = provenance.get("incident_id")
+            if isinstance(incident, str) and incident:
+                incidents.add(incident)
+        current = version.prev_version_id
+    return tuple(sorted(incidents))
 
 
 def _derive_next_version_id(prev_version_id: str | None) -> str:
@@ -1661,6 +1752,19 @@ def run_scheduled(
     run a regression instead of a smoke test: with a static corpus it
     passes, correctly, but a corpus change fails it with no operator
     in the loop.
+
+    The corpus input boundary fails closed: a corpus with malformed
+    lines is refused before anything is mined or published, because a
+    corrupt export is indistinguishable from traces legitimately
+    leaving the corpus. Corpus totals ride in the report (current and
+    previous run) so a shrink is visible at the consumption surface.
+    Both output locations are preflighted writable before publishing:
+    a run that publishes and then cannot write its artifacts or state
+    bricks the version chain, so that failure must happen first, with
+    nothing half-done. The written manifest describes the benchmark
+    actually gated (the effective suite), and a previous version that
+    was already past its cadence dispatches an investigation action —
+    the run itself is the refresh, so staleness is flagged, not failed.
     """
     parsed_cadence = parse_cadence(cadence)
     stamp = _parse_instant(mined_at or _utcnow_iso(), "run_scheduled.mined_at")
@@ -1669,6 +1773,7 @@ def run_scheduled(
     )
     if state_dir is not None:
         _check_state_dir_writable(state_dir)
+    _check_out_dir_writable(out_dir)
     effective_prev: str | None = (
         prev_version_id
         if prev_version_id is not None
@@ -1684,6 +1789,14 @@ def run_scheduled(
     requested_version = version_id or _derive_next_version_id(effective_prev)
 
     load = load_corpus(corpus)
+    if load.skipped > 0:
+        raise TracebenchError(
+            f"corpus {corpus} has {load.skipped} malformed line(s) out of "
+            f"{load.total_lines} — refusing to mine a corrupt export: a "
+            "truncated or corrupt export is indistinguishable from traces "
+            "legitimately leaving the corpus, so mining it would silently "
+            "shrink the benchmark. Fix the export instead."
+        )
     report = mine_traces(
         load.records,
         owner=owner,
@@ -1693,18 +1806,11 @@ def run_scheduled(
         skipped_records=load.skipped,
         corpus_kind=corpus_kind,
     )
-    manifest = build_manifest(
-        report.cases,
-        benchmark_id=suite_name,
-        owner=owner,
-        cadence=parsed_cadence,
-        created_at=stamp.isoformat(),
-        last_mined_at=stamp.isoformat(),
-        corpus_kind=corpus_kind,
-    )
 
     store_obj = SnapshotStore(store)
     previous_stale: bool | None = None
+    prev_created: datetime | None = None
+    prev_cadence: Cadence | None = None
     if effective_prev is not None:
         try:
             _prev_version, prev_suite = store_obj.load(suite_name, effective_prev)
@@ -1720,15 +1826,15 @@ def run_scheduled(
         )
         # Staleness is judged by the benchmark's own recorded cadence, not
         # the flag this run happened to pass: the same version must not
-        # flip stale/not-stale with the caller's flag.
+        # flip stale/not-stale with the caller's flag. The predicate is
+        # the shared _is_stale_since, the same one
+        # BenchmarkManifest.is_stale calls.
         prev_cadence = (
             parse_cadence(_prev_version.meta.cadence)
             if _prev_version.meta.cadence
             else parsed_cadence
         )
-        previous_stale = (stamp - prev_created) > timedelta(
-            days=CADENCE_DAYS[prev_cadence]
-        )
+        previous_stale = _is_stale_since(prev_created, prev_cadence, stamp)
     else:
         _prev_version = None
         base_baseline = None
@@ -1786,7 +1892,7 @@ def run_scheduled(
             owner=owner,
             why=(
                 f"tracebench: mined {len(new_mined)} case(s) from "
-                f"{len(manifest.source_incidents)} incident(s), "
+                f"{len({m.incident_id for m in report.cases})} incident(s), "
                 f"corpus {report.corpus_digest[:19]}"
             ),
             changed_from_prev=(
@@ -1896,8 +2002,56 @@ def run_scheduled(
         prior_consecutive_failures=effective_prior,
         recorded_at=stamp.isoformat(),
     )
+    if previous_stale:
+        # A past-cadence benchmark is flagged, not just recorded: the
+        # run itself is the refresh, so staleness is an investigation
+        # action, not a failure — but it is a dispatched action in the
+        # ledger and the workflow summary, never an inert boolean in an
+        # artifact nobody is woken by.
+        assert effective_prev is not None and prev_cadence is not None
+        assert prev_created is not None
+        actions = (
+            *actions,
+            ActionRecord(
+                action="investigation",
+                benchmark_id=benchmark_id,
+                run_id=effective_version,
+                case_ids=(),
+                reason=(
+                    f"previous version {suite_name}/{effective_prev} was "
+                    f"past its {prev_cadence} cadence when this run "
+                    f"started (created {prev_created.isoformat()}); this "
+                    "run re-mined it — verify the refresh"
+                ),
+                recorded_at=stamp.isoformat(),
+            ),
+        )
     consecutive = (
         effective_prior + 1 if effective_comparison.verdict == "GATE_FAIL" else 0
+    )
+
+    # The manifest describes the benchmark actually gated — the effective
+    # suite — not only the cases this run mined. A steady-state run that
+    # mined nothing gates the previous version, so its manifest must list
+    # that version's cases; a publishing run's manifest lists the new
+    # version's cases. Incident ids come from promotion provenance down
+    # the gated version's chain; hand-seeded base cases carry none.
+    gated_case_ids = {c.id for c in effective_suite.cases}
+    manifest = BenchmarkManifest(
+        benchmark_id=suite_name,
+        owner=owner,
+        cadence=parsed_cadence,
+        case_ids=tuple(sorted(gated_case_ids)),
+        source_incidents=_suite_source_incidents(
+            store_obj, suite_name, effective_version, gated_case_ids
+        ),
+        created_at=(
+            prev_created.isoformat()
+            if not published and prev_created is not None
+            else stamp.isoformat()
+        ),
+        last_mined_at=stamp.isoformat(),
+        corpus_kind=parse_corpus_kind(corpus_kind),
     )
 
     out_path = Path(out_dir)
@@ -1919,6 +2073,11 @@ def run_scheduled(
         version_ignored=version_ignored,
         drift_detected=bool(drifted_ids),
         drifted_case_ids=tuple(drifted_ids),
+        corpus_total_lines=load.total_lines,
+        corpus_skipped=load.skipped,
+        previous_corpus_total_lines=(
+            state["corpus_total_lines"] if state is not None else None
+        ),
         manifest=manifest,
         actions=actions,
         consecutive_failures=consecutive,
@@ -1957,5 +2116,6 @@ def run_scheduled(
             prev_version_id=effective_version,
             consecutive_failures=consecutive,
             updated_at=stamp.isoformat(),
+            corpus_total_lines=load.total_lines,
         )
     return result

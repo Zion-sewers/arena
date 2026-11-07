@@ -1505,6 +1505,11 @@ def _tracebench_regress(args: list[str]) -> int:
           f"(mined {result.mined_cases}, new {result.new_cases}, "
           f"updated {result.updated_cases}, retired {result.retired_cases})")
     print(f"verdict: {result.verdict}")
+    if result.previous_corpus_total_lines is not None:
+        print(f"corpus: {result.corpus_total_lines} trace(s) "
+              f"(previous run: {result.previous_corpus_total_lines})")
+    else:
+        print(f"corpus: {result.corpus_total_lines} trace(s)")
     if result.drift_detected:
         print(f"benchmark drift: {', '.join(result.drifted_case_ids)} — "
               "the benchmark moved since the previous version; "

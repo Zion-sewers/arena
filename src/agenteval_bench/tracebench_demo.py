@@ -23,6 +23,11 @@ scheduled run must fail even though the candidate is the oracle:
    published with the updated case, gate + investigation;
 9. same changed corpus again -> GATE_PASS, flag self-cleared.
 
+The scheduled workflow (``.github/workflows/tracebench-regression.yml``)
+runs this demo as its canary: the job exercises the GATE_FAIL, rollback,
+and drift paths every week, so a broken gate fails the schedule instead
+of passing the oracle against itself forever.
+
 Run: ``PYTHONPATH=src python -m agenteval_bench.tracebench_demo``.
 """
 

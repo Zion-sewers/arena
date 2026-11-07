@@ -69,11 +69,18 @@ src/agenteval_bench/
                   #   failure streak chained, changed oracles published as
                   #   updates, mined cases retired, base cases carried
                   #   forward) and the drift gate fails the run when the
-                  #   benchmark moves under the candidate
+                  #   benchmark moves under the candidate; the corpus
+                  #   boundary fails closed on malformed lines, both output
+                  #   locations are preflighted writable before publishing,
+                  #   the manifest describes the benchmark actually gated,
+                  #   and a stale previous version dispatches an
+                  #   investigation action
   tracebench_demo.py  # Demo: mine the sample corpus, regress oracle +
                   #   degraded candidates (gate -> investigation -> rollback),
                   #   then the closed loop (three state-chained weeks) and
-                  #   the drift gate (oracle change fails, clears next week)
+                  #   the drift gate (oracle change fails, clears next week);
+                  #   also the scheduled workflow's canary — it runs there
+                  #   so the schedule exercises the red path every week
   cli.py          # CLI entry point (run --suite --ci --threshold; decide --suite --policy)
 tests/            # pytest suite (engine + CLI gateway)
 examples/         # Golden replay suites (YAML)

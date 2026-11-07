@@ -16,6 +16,19 @@ name: Tracebench regression
 # candidate passes the new version. A static corpus passes, correctly —
 # nothing changed — but the run can now fail on its own.
 #
+# Canary: the demo runs in this job (not only in CI) and asserts the
+# GATE_FAIL, rollback, and drift paths end to end. If the gate logic
+# regresses so a degraded candidate passes, the demo fails and the
+# schedule goes red — the job exercises the red path every week instead
+# of only ever passing the oracle against itself.
+#
+# Staleness: a previous version already past its cadence when the run
+# starts dispatches an investigation action (the run itself is the
+# refresh, so staleness is flagged, not failed) and is surfaced in the
+# job summary. A corrupt corpus fails the run before anything is mined:
+# malformed lines are refused, and corpus totals (this run vs the
+# previous run) are surfaced so a shrink is visible.
+#
 # The corpus: by default the checked-in SAMPLE corpus (recorded-format
 # fixtures, not real incidents — the artifacts carry corpus_kind=sample,
 # so no consumer mistakes inc-101..inc-114 for real incidents). A real
@@ -66,6 +79,8 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: uv pip install -e ".[dev]" --system
+      - name: Canary — prove the gate can go red
+        run: PYTHONPATH=src python -m agenteval_bench.tracebench_demo
       - name: Restore tracebench store + run state
         uses: actions/cache@v4
         with:
@@ -150,6 +165,13 @@ jobs:
                                + ", ".join(report["drifted_case_ids"]))
               lines.append(f"- consecutive failures: {report['consecutive_failures']}")
               lines.append(f"- corpus kind: {report['manifest']['corpus_kind']}")
+              lines.append(f"- corpus: {report['corpus_total_lines']} trace(s)"
+                           + (f" (previous run: "
+                              f"{report['previous_corpus_total_lines']})"
+                              if report.get('previous_corpus_total_lines')
+                              is not None else ""))
+              if report.get("previous_stale") is not None:
+                  lines.append(f"- previous version stale: {report['previous_stale']}")
               lines.append("")
           else:
               lines.append("No regression report was produced.")
