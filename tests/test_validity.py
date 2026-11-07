@@ -286,7 +286,20 @@ def test_report_refuses_a_misfiled_validity():
         )
 
 
-def test_unassessed_metric_is_never_trusted():
+def test_report_trusted_rejects_an_unknown_metric():
+    report = ValidityReport(
+        assessments={
+            "quality": MetricValidity(
+                metric="quality",
+                grade=ValidityGrade.DIRECT,
+                phenomenon="p",
+                basis="b",
+            )
+        },
+        expected_metrics=frozenset({"quality"}),
+    )
+    with pytest.raises(ValueError, match="unknown metric"):
+        report.trusted("speed")
     report = ValidityReport(
         assessments={
             "quality": MetricValidity(
@@ -389,6 +402,29 @@ def test_assess_decision_live_below_the_bar_is_unvalidated():
     agreement = report.assessments["reliability"].agreement
     assert agreement is not None
     assert agreement[0] < 0.80  # 30/60 Wilson lower bound is 0.377
+
+
+def test_assess_decision_live_twelve_of_twenty_is_unvalidated():
+    # Impl FAIL probe: 12/20 live agreement (Wilson (0.387, 0.781)) must
+    # not grade trusted — the same decision INVESTIGATEs, so the validity
+    # report must not say "4/4 metrics trusted" next to it.
+    decision = _decision(reliability=(12, 20))
+    report = assess_decision(decision, reliability_kind="live")
+    assert report.assessments["reliability"].grade is ValidityGrade.UNVALIDATED_PROXY
+    assert not report.trusted("reliability")
+    assert report.assessments["reliability"].agreement == (
+        pytest.approx(0.387, abs=0.001),
+        pytest.approx(0.781, abs=0.001),
+    )
+
+
+def test_assess_decision_live_five_of_five_is_unvalidated():
+    # Impl FAIL probe: 5/5 is a point estimate of 1.0 with a Wilson
+    # lower bound of 0.566 — it does not clear the bar either.
+    decision = _decision(reliability=(5, 5))
+    report = assess_decision(decision, reliability_kind="live")
+    assert report.assessments["reliability"].grade is ValidityGrade.UNVALIDATED_PROXY
+    assert not report.trusted("reliability")
 
 
 def test_assess_decision_live_two_of_two_is_unvalidated():

@@ -428,6 +428,11 @@ class ValidityReport:
 
     def trusted(self, metric: str) -> bool:
         """Whether one metric in this report may be trusted."""
+        if metric not in self.assessments:
+            raise ValueError(
+                f"unknown metric {metric!r}: expected one of "
+                f"{sorted(self.assessments)}"
+            )
         return self.assessments[metric].trusted
 
     def untrusted_metrics(self) -> list[str]:
@@ -639,7 +644,11 @@ def assess_decision(
                 ),
             )
         elif dimension is Dimension.RELIABILITY:
-            assert isinstance(evidence, ProportionEvidence)
+            if not isinstance(evidence, ProportionEvidence):
+                raise TypeError(
+                    "reliability dimension needs ProportionEvidence, "
+                    f"got {type(evidence).__name__}"
+                )
             if reliability_kind == "replay":
                 built[name] = MetricValidity(
                     metric=name,
@@ -677,7 +686,11 @@ def assess_decision(
                     agreement_n=evidence.trials,
                 )
         else:  # Dimension.COST
-            assert isinstance(evidence, CostEvidence)
+            if not isinstance(evidence, CostEvidence):
+                raise TypeError(
+                    "cost dimension needs CostEvidence, "
+                    f"got {type(evidence).__name__}"
+                )
             if evidence.n < 2:
                 built[name] = MetricValidity(
                     metric=name,

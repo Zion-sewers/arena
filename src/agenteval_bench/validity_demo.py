@@ -120,7 +120,7 @@ def main() -> int:
     print(f"IVR proxy: grade={ivr.grade.value} trusted={ivr.trusted}")
     assert ivr.grade is ValidityGrade.UNVALIDATED_PROXY
     assert not ivr.trusted
-    assert ivr.agreement is not None and ivr.agreement[1] < 0.80
+    assert ivr.agreement is not None and ivr.agreement[0] < 0.80
 
     # 3. A good proxy: 38/40 agreement clears the bar.
     good = validate_proxy(
