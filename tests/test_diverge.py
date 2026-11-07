@@ -353,6 +353,85 @@ class TestLoader:
         with pytest.raises(ValueError, match="invalid diverge JSON"):
             candidates_from_json("{not json")
 
+    def test_loader_refuses_a_non_mapping_document(self) -> None:
+        with pytest.raises(TypeError, match="must be a mapping"):
+            candidates_from_json(json.dumps(["not", "a", "mapping"]))
+
+    def test_loader_refuses_missing_keys(self) -> None:
+        with pytest.raises(ValueError, match="missing required key"):
+            candidates_from_json(json.dumps({"prompt": PROMPT}))
+
+    def test_loader_refuses_a_non_string_prompt(self) -> None:
+        with pytest.raises(TypeError, match="prompt must be a string"):
+            candidates_from_json(
+                json.dumps({"prompt": 42, "candidates": [], "conventional_index": 0,
+                            "p_conventional": 0.5})
+            )
+
+    def test_loader_refuses_bad_stakes(self) -> None:
+        with pytest.raises(ValueError, match="stakes must be 'low' or 'high'"):
+            candidates_from_json(
+                json.dumps({"prompt": PROMPT, "stakes": "critical", "candidates": [],
+                            "conventional_index": 0, "p_conventional": 0.5})
+            )
+
+    def test_loader_refuses_a_bool_conventional_index(self) -> None:
+        with pytest.raises(TypeError, match="conventional_index must be an int"):
+            candidates_from_json(
+                json.dumps({"prompt": PROMPT, "candidates": [],
+                            "conventional_index": True, "p_conventional": 0.5})
+            )
+
+    def test_loader_refuses_a_bool_p_conventional(self) -> None:
+        with pytest.raises(TypeError, match="p_conventional must be a number"):
+            candidates_from_json(
+                json.dumps({"prompt": PROMPT, "candidates": [],
+                            "conventional_index": 0, "p_conventional": False})
+            )
+
+    def test_loader_refuses_non_list_candidates(self) -> None:
+        with pytest.raises(TypeError, match="candidates must be a list"):
+            candidates_from_json(
+                json.dumps({"prompt": PROMPT, "candidates": "five",
+                            "conventional_index": 0, "p_conventional": 0.5})
+            )
+
+    def test_loader_refuses_a_non_mapping_candidate(self) -> None:
+        with pytest.raises(TypeError, match="must be a mapping"):
+            candidates_from_json(
+                json.dumps({"prompt": PROMPT, "candidates": ["five"],
+                            "conventional_index": 0, "p_conventional": 0.5})
+            )
+
+    def test_loader_refuses_unknown_candidate_keys(self) -> None:
+        with pytest.raises(ValueError, match="unknown keys"):
+            candidates_from_json(
+                json.dumps({"prompt": PROMPT,
+                            "candidates": [{"text": HASHMAP, "score": 0.7, "rank": 1}],
+                            "conventional_index": 0, "p_conventional": 0.5})
+            )
+
+    def test_loader_refuses_a_non_string_candidate_text(self) -> None:
+        with pytest.raises(TypeError, match="text must be a string"):
+            candidates_from_json(
+                json.dumps({"prompt": PROMPT,
+                            "candidates": [{"text": 42, "score": 0.7}],
+                            "conventional_index": 0, "p_conventional": 0.5})
+            )
+
+    def test_loader_refuses_a_non_string_candidate_label(self) -> None:
+        with pytest.raises(TypeError, match="label must be a string"):
+            candidates_from_json(
+                json.dumps({"prompt": PROMPT,
+                            "candidates": [{"text": HASHMAP, "score": 0.7, "label": 3}],
+                            "conventional_index": 0, "p_conventional": 0.5})
+            )
+
+    def test_non_finite_p_conventional_is_refused(self) -> None:
+        candidates, _ = _set()
+        with pytest.raises(ValueError, match="finite"):
+            build_diverge_set(PROMPT, candidates, 0, float("inf"), stakes="low")
+
     def test_loader_refuses_a_bool_score(self) -> None:
         with pytest.raises(TypeError, match="must be a number"):
             candidates_from_json(
@@ -422,6 +501,13 @@ class TestCli:
         assert cmd_diverge(["--candidates", infile]) == 1
         assert cmd_diverge([]) == 1
 
+    def test_cli_exits_1_on_a_missing_file(self) -> None:
+        assert cmd_diverge(["--candidates", "/nonexistent/diverge.json"]) == 1
+
+    def test_cli_exits_1_on_a_bad_policy(self, tmp_path: Path) -> None:
+        infile = self._write(tmp_path, self._payload())
+        assert cmd_diverge(["--candidates", infile, "--max-pair-similarity", "2"]) == 1
+
     def test_cli_json_output_is_parseable(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -429,6 +515,17 @@ class TestCli:
         assert cmd_diverge(["--candidates", infile, "--json"]) == 0
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["selection"]["winner_index"] == 1
+
+
+def test_demo_main_runs_end_to_end() -> None:
+    """The demo runs green and returns 0.
+
+    Running it under pytest also covers the demo module, which the
+    tiered coverage floor counts but no test previously executed.
+    """
+    from agenteval_bench.diverge_demo import main
+
+    assert main() == 0
 
 
 # --- Property tests: invariants over every generated candidate set. ---
