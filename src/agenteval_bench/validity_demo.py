@@ -25,7 +25,6 @@ Any failure raises, so CI can gate on this demo directly.
 from __future__ import annotations
 
 import sys
-
 from collections.abc import Callable
 
 from agenteval_bench.decision import (

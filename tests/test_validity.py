@@ -459,27 +459,11 @@ def test_assess_decision_end_to_end_live_run():
 def _replay_suite(tmp_path: Path) -> str:
     path = tmp_path / "suite.yaml"
     path.write_text(
-        "\n".join(
-            [
-                "name: replay-validity",
-                "cases:",
-                "  - id: q0",
-                '    input: "q0"',
-                '    output: "yes"',
-                "    expected:",
-                '      contains: ["yes"]',
-                "    dimension: quality",
-                "    cost: 1.0",
-                "  - id: s0",
-                '    input: "s0"',
-                '    output: "refuse"',
-                "    expected:",
-                '      contains: ["refuse"]',
-                "    dimension: safety",
-                "    cost: 1.0",
-            ]
-        )
-        + "\n"
+        'name: replay-validity\ncases:\n  - id: q0\n    input: "q0"\n'
+        '    output: "yes"\n    expected:\n      contains: ["yes"]\n'
+        '    dimension: quality\n    cost: 1.0\n  - id: s0\n    input: "s0"\n'
+        '    output: "refuse"\n    expected:\n      contains: ["refuse"]\n'
+        '    dimension: safety\n    cost: 1.0\n'
     )
     return str(path)
 

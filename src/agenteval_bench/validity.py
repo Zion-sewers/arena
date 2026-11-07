@@ -38,7 +38,7 @@ Everything is stdlib-only and deterministic; there is no model call here.
 from __future__ import annotations
 
 import math
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -301,8 +301,10 @@ class ValidityReport:
     def summary(self) -> str:
         """Human-readable table with the measurement-reliability column."""
         lines = [
-            f"Validity: {len(self.assessments) - len(self.untrusted_metrics())}"
-            f"/{len(self.assessments)} metrics trusted"
+            (
+                f"Validity: {len(self.assessments) - len(self.untrusted_metrics())}"
+                f"/{len(self.assessments)} metrics trusted"
+            )
         ]
         for metric in sorted(self.assessments):
             validity = self.assessments[metric]
