@@ -51,7 +51,10 @@ src/agenteval_bench/
                   #   ExpectedOutput, RubricCriterion, CostBound
   scoring.py      # DeterministicScorer (exact, contains, regex, json_schema)
   engine.py       # EvalRunner — orchestrates suite execution
-  cli.py          # CLI entry point (run --suite --ci --threshold)
+  decision.py     # Decision system: evidence -> uncertainty -> threshold -> action
+                  #   (Dimension/RiskLevel/DecisionAction, Wilson intervals, decide)
+  decision_demo.py # Seeded end-to-end demo of the decision system
+  cli.py          # CLI entry point (run --suite --ci --threshold; decide --suite --policy)
 tests/            # pytest suite (engine + CLI gateway)
 examples/         # Golden replay suites (YAML)
 docs/             # Specifications, archive, roadmap references
@@ -121,9 +124,17 @@ Matcher rules:
 - `run(suite, agent_fn)`: iterates cases in order; skipped cases contribute a result
   with `details.skipped = True` and are **excluded** from `pass_rate` denominator.
 - `pass_rate = passed / len(scored)` where `scored = results without skipped`.
-- `run_ci(suite, agent_fn, threshold=1.0)`: currently delegates to `run` and returns
-  the `RunResult`; the CLI performs the threshold comparison and `sys.exit(2)` on
-  failure. (Future: move gate logic into `run_ci`.)
+- `run_ci(suite, agent_fn, threshold=1.0)`: DEPRECATED (emits a
+  `DeprecationWarning`). It delegates to `run` and returns the
+  `RunResult`; the CLI performs the threshold comparison and `sys.exit(2)` on
+  failure. It gates on a point-estimate pass rate with no dimensions, no
+  uncertainty, and no unmeasured rule; new gates use `run_decision`.
+- `run_decision(suite, agent_fn, policy, risk, cost_fn=None, reliability_runs=2)`:
+  maps a suite to a typed GATE / ROLLBACK / INVESTIGATE `Decision` over the
+  four dimensions (quality, safety, cost, reliability) with 95% intervals
+  compared against per-risk thresholds; an unmeasured dimension forces
+  INVESTIGATE. Full contract in `docs/DECISION-SYSTEM.md`. This supersedes
+  the `run_ci` threshold path for new gates.
 
 ## 6. API contract
 
@@ -144,6 +155,21 @@ Behavior:
 - Cases without a recorded `output` are **skipped** in CLI mode (the CLI cannot call
   a live agent) and reported with a "Note".
 - Exit codes: `0` clean / gate passed, `1` bad input, `2` gate failed.
+
+```
+agenteval-bench decide --suite <FILE> [--policy <FILE>] [--risk <LEVEL>]
+                       [--seed 42] [--reliability-runs 2] [--out report.json]
+```
+
+Maps a replay suite to a decision (evidence -> uncertainty -> threshold ->
+action) over the four dimensions; see `docs/DECISION-SYSTEM.md`. Exit
+codes are per subcommand and must not be read with the other command's
+table:
+
+| Subcommand | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| `run` | clean / gate passed | bad input | gate failed | — |
+| `decide` | GATE | ROLLBACK | INVESTIGATE | usage error |
 
 > The `compare` and `report` subcommands described in earlier drafts are **`planned`**
 > (see §9) and are **not** implemented in v0.1.0; invoking an unknown command exits `1`.

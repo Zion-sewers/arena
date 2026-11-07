@@ -5,6 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+# Dimensions a single eval case can be tagged with. Reliability is a
+# cross-run property (agreement across repeated runs), and cost comes from
+# a per-case cost function, so neither is a case tag. Lives here, in the
+# model layer, so models never depend on the decision layer for it.
+CASE_DIMENSIONS: frozenset[str] = frozenset({"quality", "safety"})
+
 
 @dataclass
 class ExpectedOutput:
@@ -44,6 +50,55 @@ class EvalCase:
     skip: bool = False
     # Recorded agent output, for replay suites scored in CI without a live agent.
     output: str | None = None
+    # Which decision dimension this case measures ("quality" or "safety").
+    # Reliability is a cross-run property and cost comes from a per-case
+    # cost function, so neither is a case tag (see CASE_DIMENSIONS).
+    dimension: str = "quality"
+    # Recorded per-case cost in the policy's cost units (e.g. dollars).
+    # None means the cost of this case was not measured.
+    cost: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.dimension not in CASE_DIMENSIONS:
+            raise ValueError(
+                f"Invalid case dimension {self.dimension!r} for case {self.id!r}: "
+                f"expected one of {sorted(CASE_DIMENSIONS)}"
+            )
+        if self.cost is not None and self.cost < 0:
+            raise ValueError(
+                f"Invalid cost {self.cost!r} for case {self.id!r}: expected >= 0"
+            )
+
+
+def _parse_dimension(case_data: dict[str, Any]) -> str:
+    """Validate a case's decision dimension at the YAML boundary.
+
+    Only "quality" and "safety" are case tags. A typo must fail loudly
+    here, not silently score as quality downstream.
+    """
+    dimension = case_data.get("dimension", "quality")
+    if not isinstance(dimension, str) or dimension not in CASE_DIMENSIONS:
+        raise ValueError(
+            f"Invalid case dimension {dimension!r} for case "
+            f"{case_data.get('id')!r}: expected one of {sorted(CASE_DIMENSIONS)}"
+        )
+    return dimension
+
+
+def _parse_cost(case_data: dict[str, Any]) -> float | None:
+    """Validate a case's recorded cost at the YAML boundary."""
+    cost = case_data.get("cost")
+    if cost is None:
+        return None
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        raise TypeError(
+            f"Invalid cost {cost!r} for case {case_data.get('id')!r}: expected a number"
+        )
+    if cost < 0:
+        raise ValueError(
+            f"Invalid cost {cost!r} for case {case_data.get('id')!r}: expected >= 0"
+        )
+    return float(cost)
 
 
 @dataclass
@@ -54,7 +109,6 @@ class EvalSuite:
     version: int = 1
     cases: list[EvalCase] = field(default_factory=list)
     cost_bound: CostBound = field(default_factory=CostBound)
-
     @classmethod
     def from_yaml(cls, path: str) -> EvalSuite:
         """Load an eval suite from a YAML file."""
@@ -91,6 +145,8 @@ class EvalSuite:
                     rubric=rubric,
                     skip=case_data.get("skip", False),
                     output=case_data.get("output"),
+                    dimension=_parse_dimension(case_data),
+                    cost=_parse_cost(case_data),
                 )
             )
 
