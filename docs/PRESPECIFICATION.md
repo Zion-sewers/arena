@@ -50,7 +50,9 @@ digest = register_analysis_plan(plan, "plans/analyses.jsonl")
 The registry is hash-chained: each record commits to the previous
 record's digest, so a plan cannot be silently rewritten after data
 arrives. A rewritten registry is detected (`AnalysisRegistryCorrupted`)
-and the finding is refused as `UNREGISTERED_PLAN`.
+and the finding is refused as `UNREGISTERED_PLAN`. The record's
+`registered_at` timestamp is part of the hashed payload, so backdating
+a plan's registration breaks the chain exactly like rewriting the plan.
 
 The mode split is structural, not a label. A confirmatory plan without
 hypotheses or without a decision rule is refused at construction, and
@@ -122,8 +124,11 @@ question texts):
     The finding must carry a data digest and a code version
     (`REPRODUCIBILITY_MISSING`).
 
-The gate prints all ten results with evidence on every path, including
-refusals, so a refusal names exactly which questions failed and why.
+The gate prints all ten results with evidence on every path where a
+plan loads, so a refusal names exactly which questions failed and why.
+An unregistered plan, an unreadable registry, or a finding that names
+a different digest than the one under review (`DIGEST_MISMATCH`) is
+refused before the questions run.
 
 ## 4. The review gate from the command line
 
@@ -140,6 +145,47 @@ first: the finding's digest must load to the same plan as the file, so
 a plan edited after registration is unusable input, never a refused
 finding.
 
+The two JSON files, with the register-printed digest pasted into the
+finding as `plan_digest`:
+
+```json
+// plan.json — register this FIRST, before the data is touched
+{
+  "name": "reranker-v2-failure-modes",
+  "mode": "confirmatory",
+  "question": "Does reranker v2 reduce the hallucinated-citation failure mode?",
+  "hypotheses": ["reranker v2 cuts hallucinated citations by at least 10pp vs v1"],
+  "assumptions": [
+    {"text": "the eval suite's citation cases represent production traffic",
+     "falsifier": "suite citation cases differ from production by >20pp"}
+  ],
+  "n_planned": 200,
+  "decision_rule": "confirm iff the 95% interval on the citation-error delta excludes 0 in v2's favour",
+  "data_source": "golden replay suite, seed 42"
+}
+```
+
+```json
+// finding.json — plan_digest is the digest register-analysis-plan printed
+{
+  "plan_digest": "<digest from register-analysis-plan>",
+  "mode": "confirmatory",
+  "hypothesis": "reranker v2 cuts hallucinated citations by at least 10pp vs v1",
+  "claim": "v2 cuts hallucinated citations by 14pp",
+  "n_observed": 200,
+  "interval": [0.08, 0.20],
+  "data_digest": "sha256:golden-suite-seed42",
+  "data_accessed_at": "2026-11-07T19:00:00+00:00",
+  "code_version": "arena@dbf6909"
+}
+```
+
+`data_accessed_at` must be at or after the plan's `registered_at`
+(Q2); the example timestamp above passes only if the plan was
+registered before then. The finding's `plan_digest` must be the digest
+under review — naming any other digest is refused as `DIGEST_MISMATCH`,
+even when that digest is itself registered.
+
 ## 5. Violations fail CI
 
 ```python
@@ -149,10 +195,13 @@ report = check_analysis(digest, "plans/analyses.jsonl", finding)
 ```
 
 `check_analysis` raises `AnalysisViolation` on any violation; wire it
-into CI and violations fail the build. CI runs the full drill battery
+into CI and violations fail the build. CI today runs the drill battery
 via `python -m experiment.demo_prespec`, which exits non-zero unless
 the compliant paths (confirmatory and exploratory) verify clean and
-every refusal fires.
+every refusal fires — that battery is the CI wiring for the protocol
+itself. `check_analysis` is the seam for gating a real analysis: call
+it at the end of an analysis run and any discipline violation fails
+that run.
 
 ## Honesty boundaries (stated, not hidden)
 
@@ -163,13 +212,19 @@ every refusal fires.
   report verifies clean. What the registry binds is the *plan*
   (immutably, via the hash chain), not the data.
 - The hash chain delivers immutability, not precedence: `registered_at`
-  is recorded but nothing proves the plan was registered *before* data
-  collection except the reported timestamps (Q2) and the workflow rule
-  (require the digest before the run starts). The executable check that
+  is part of the hashed payload, so the timestamp itself cannot be
+  backdated without breaking the chain — but nothing proves the plan
+  was registered *before* data collection except the reported
+  timestamps (Q2) and the workflow rule (require the digest before the
+  run starts). The executable check that
   survives timestamp forgery is Q5: no hypothesis text, no confirmation.
 - A vacuous decision rule ("we will decide somehow") passes Q9: the
   gate checks the rule is present and quotes it verbatim in the report
   for the human reviewer. Presence is enforced; meaning is reviewed.
+  The gate does NOT evaluate the rule against the reported numbers —
+  an interval that includes 0 under an "excludes 0" rule still passes
+  Q9. Evaluating a free-text rule against numbers would need the rule
+  in structured form; that redesign is out of scope for this unit.
 - An absurdly wide or narrow interval passes Q8: the gate checks the
   interval is present and well-formed (finite, lo <= hi). The interval
   is printed in the report for the reviewer.

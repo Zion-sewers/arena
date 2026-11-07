@@ -1131,7 +1131,14 @@ def cmd_prespec(args: list[str]) -> int:
     try:
         with open(finding_path, encoding="utf-8") as f:
             finding = finding_from_dict(json.load(f))
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        IndexError,
+        json.JSONDecodeError,
+    ) as e:
         print(f"Error: invalid finding doc: {e}", file=sys.stderr)
         return 2
     if plan_path:

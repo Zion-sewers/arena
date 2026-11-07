@@ -44,13 +44,19 @@ discipline as #32's exact look fractions.
 
 Enforcement boundary (stated honestly): the reviewer is a consistency
 checker over reported evidence, like #32 — it does not see raw data.
-The hash chain binds the plan contents immutably, and registered_at is
-recorded, but nothing proves the plan was registered before data
-collection except the reported timestamps (Q2) and the workflow rule
-(require the digest before the run starts). A fabricated-but-consistent
-report verifies clean. What the chain guarantees is that a plan cannot
-be silently rewritten after registration, and that a post-hoc hypothesis
-cannot be smuggled into a confirmatory verdict.
+The hash chain binds the plan contents AND its registered_at timestamp
+immutably (the timestamp is part of the hashed payload, so backdating
+a registration breaks the chain exactly like rewriting the plan), but
+nothing proves the plan was registered before data collection except
+the reported timestamps (Q2) and the workflow rule (require the digest
+before the run starts). A fabricated-but-consistent report verifies
+clean. What the chain guarantees is that a plan cannot be silently
+rewritten after registration, and that a post-hoc hypothesis cannot be
+smuggled into a confirmatory verdict. The gate checks that a decision
+rule is present and quotes it for the human reviewer; it does NOT
+evaluate the rule against the reported numbers — an interval that
+includes 0 under an "excludes 0" rule still passes Q9, and the rule's
+meaning is the reviewer's judgment, not the machine's.
 
 Amendment rule: there is no amendment path. Changing a plan means
 registering a NEW plan; the old record stays, and findings on the old
@@ -73,7 +79,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 
 #: Confirmatory: the finding tests a pre-specified hypothesis and may
 #: conclude. Exploratory: the finding describes what was seen and may
@@ -211,7 +217,9 @@ class AnalysisPlan:
 class AnalysisFinding:
     """Everything an analysis reports at the end.
 
-    plan_digest binds the finding to its registered plan. hypothesis is
+    plan_digest binds the finding to its registered plan; review_analysis
+    refuses DIGEST_MISMATCH when the finding names a different digest
+    than the one under review. hypothesis is
     the registered hypothesis quoted verbatim (confirmatory) or ""
     (exploratory — an exploratory finding carries no hypothesis).
     interval is the uncertainty on the headline number as (lo, hi);
@@ -325,9 +333,18 @@ def _canonical_plan(plan: AnalysisPlan) -> Mapping[str, object]:
     }
 
 
-def _record_digest(prev_digest: str, canonical: Mapping[str, object]) -> str:
+def _record_digest(
+    prev_digest: str, canonical: Mapping[str, object], registered_at: str
+) -> str:
+    """Chain digest over the previous digest, the plan, AND its timestamp.
+
+    registered_at is part of the hashed payload: backdating a plan's
+    registration breaks the chain exactly like rewriting the plan, so
+    Q2's "plan written before data touched" rests on a tamper-evident
+    timestamp, not an unprotected field.
+    """
     payload = json.dumps(
-        {"prev": prev_digest, "analysis_plan": canonical},
+        {"prev": prev_digest, "analysis_plan": canonical, "registered_at": registered_at},
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -353,7 +370,12 @@ def _read_records(registry_path: str) -> list[dict[str, object]]:
                 raise AnalysisRegistryMalformed(
                     f"record has wrong shape: {str(rec)[:80]}"
                 )
-            digest = _record_digest(prev, payload)
+            registered_at = rec.get("registered_at")
+            if not isinstance(registered_at, str):
+                raise AnalysisRegistryMalformed(
+                    f"record has no registered_at: {str(rec)[:80]}"
+                )
+            digest = _record_digest(prev, payload, registered_at)
             if not isinstance(rec.get("digest"), str) or digest != rec["digest"]:
                 raise AnalysisRegistryCorrupted(
                     f"hash chain broken at analysis plan "
@@ -377,10 +399,11 @@ def _append_record(canonical: Mapping[str, object], registry_path: str) -> str:
         last_digest = records[-1]["digest"]
         assert isinstance(last_digest, str)
         prev = last_digest
-    digest = _record_digest(prev, canonical)
+    registered_at = datetime.now(UTC).isoformat()
+    digest = _record_digest(prev, canonical, registered_at)
     record = {
         "digest": digest,
-        "registered_at": datetime.now(UTC).isoformat(),
+        "registered_at": registered_at,
         "analysis_plan": canonical,
     }
     with open(registry_path, "a", encoding="utf-8") as f:
@@ -415,7 +438,12 @@ def load_analysis_plan(digest: str, registry_path: str) -> tuple[AnalysisPlan, s
     """Load a registered plan by digest, with its registered_at timestamp.
 
     Unknown digests raise KeyError; a broken chain raises
-    AnalysisRegistryCorrupted through _read_records.
+    AnalysisRegistryCorrupted through _read_records; a record whose
+    plan fails construction (a valid chain carrying an invalid plan —
+    reachable only by recomputing digests) raises
+    AnalysisRegistryMalformed, so callers see a corrupt registry
+    rather than a constructor traceback. KeyError is raised ONLY for
+    an unknown digest.
     """
     for rec in _read_records(registry_path):
         if rec["digest"] != digest:
@@ -430,22 +458,27 @@ def load_analysis_plan(digest: str, registry_path: str) -> tuple[AnalysisPlan, s
             raise AnalysisRegistryMalformed(
                 f"plan record has no registered_at: {str(rec)[:80]}"
             )
-        plan = AnalysisPlan(
-            name=payload["name"],
-            mode=payload["mode"],
-            question=payload["question"],
-            hypotheses=tuple(payload["hypotheses"]),
-            assumptions=tuple(
-                Assumption(text=a["text"], falsifier=a["falsifier"])
-                for a in payload["assumptions"]
-            ),
-            n_planned=payload["n_planned"],
-            decision_rule=payload["decision_rule"],
-            data_source=payload["data_source"],
-            experiment_digest=payload.get("experiment_digest", ""),
-            n_tolerance=payload["n_tolerance"],
-            min_n=payload["min_n"],
-        )
+        try:
+            plan = AnalysisPlan(
+                name=payload["name"],
+                mode=payload["mode"],
+                question=payload["question"],
+                hypotheses=tuple(payload["hypotheses"]),
+                assumptions=tuple(
+                    Assumption(text=a["text"], falsifier=a["falsifier"])
+                    for a in payload["assumptions"]
+                ),
+                n_planned=payload["n_planned"],
+                decision_rule=payload["decision_rule"],
+                data_source=payload["data_source"],
+                experiment_digest=payload.get("experiment_digest", ""),
+                n_tolerance=payload["n_tolerance"],
+                min_n=payload["min_n"],
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            raise AnalysisRegistryMalformed(
+                f"plan record fails construction: {e}"
+            ) from e
         return plan, registered_at
     raise KeyError(f"no registered analysis plan with digest {digest[:12]}...")
 
@@ -455,24 +488,91 @@ def plan_to_dict(plan: AnalysisPlan) -> dict[str, object]:
     return dict(_canonical_plan(plan))
 
 
+def _as_str(value: object, field: str) -> str:
+    """Narrow a JSON value to str; no silent coercion (str(200) is a bug)."""
+    if not isinstance(value, str):
+        raise TypeError(f"field {field!r} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _as_int(value: object, field: str) -> int:
+    """Narrow a JSON value to int; bools, floats, and strings are refused.
+
+    int(200.9) truncates silently and int("200") coerces silently — both
+    are wrong for a pre-registered sample size, so they fail here.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"field {field!r} must be an integer, got {value!r}")
+    return value
+
+
+def _as_float(value: object, field: str) -> float:
+    """Narrow a JSON value to float; bools and strings are refused."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"field {field!r} must be a number, got {value!r}")
+    return float(value)
+
+
+def _as_str_list(value: object, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"field {field!r} must be a list of strings")
+    return tuple(value)
+
+
+def _as_assumptions(value: object) -> tuple[Assumption, ...]:
+    if not isinstance(value, list):
+        raise TypeError("field 'assumptions' must be a list")
+    parsed: list[Assumption] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise TypeError("each assumption must be a mapping")
+        parsed.append(
+            Assumption(
+                text=_as_str(item.get("text"), "assumptions[].text"),
+                falsifier=_as_str(item.get("falsifier"), "assumptions[].falsifier"),
+            )
+        )
+    return tuple(parsed)
+
+
+def _as_mode(value: object, field: str) -> AnalysisMode:
+    text = _as_str(value, field)
+    if text not in ("confirmatory", "exploratory"):
+        raise ValueError(f"field {field!r} must be confirmatory/exploratory, got {text!r}")
+    return cast(AnalysisMode, text)
+
+
+def _as_interval(value: object) -> tuple[float, float] | None:
+    """Narrow a JSON interval to exactly two finite numbers, or None.
+
+    A one-element interval used to crash with IndexError; a three-element
+    interval was silently truncated to its first two values. Both are
+    refused here as invalid input.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"field 'interval' must be [lo, hi] or null, got {value!r}")
+    lo = _as_float(value[0], "interval[0]")
+    hi = _as_float(value[1], "interval[1]")
+    return (lo, hi)
+
+
 def plan_from_dict(doc: Mapping[str, object]) -> AnalysisPlan:
     """Build a plan from a JSON doc (field names match plan_to_dict)."""
     try:
         return AnalysisPlan(
-            name=str(doc["name"]),
-            mode=str(doc["mode"]),  # type: ignore[arg-type]
-            question=str(doc["question"]),
-            hypotheses=tuple(str(h) for h in doc["hypotheses"]),  # type: ignore[union-attr]
-            assumptions=tuple(
-                Assumption(text=str(a["text"]), falsifier=str(a["falsifier"]))
-                for a in doc["assumptions"]  # type: ignore[union-attr]
-            ),
-            n_planned=int(doc["n_planned"]),  # type: ignore[arg-type]
-            decision_rule=str(doc["decision_rule"]),
-            data_source=str(doc["data_source"]),
-            experiment_digest=str(doc.get("experiment_digest", "")),
-            n_tolerance=float(doc.get("n_tolerance", 0.02)),
-            min_n=int(doc.get("min_n", 30)),
+            name=_as_str(doc.get("name"), "name"),
+            mode=_as_mode(doc.get("mode"), "mode"),
+            question=_as_str(doc.get("question"), "question"),
+            hypotheses=_as_str_list(doc.get("hypotheses"), "hypotheses"),
+            assumptions=_as_assumptions(doc.get("assumptions")),
+            n_planned=_as_int(doc.get("n_planned"), "n_planned"),
+            decision_rule=_as_str(doc.get("decision_rule"), "decision_rule"),
+            data_source=_as_str(doc.get("data_source"), "data_source"),
+            experiment_digest=_as_str(doc.get("experiment_digest", ""), "experiment_digest"),
+            n_tolerance=_as_float(doc.get("n_tolerance", 0.02), "n_tolerance"),
+            min_n=_as_int(doc.get("min_n", 30), "min_n"),
         )
     except (KeyError, TypeError, ValueError) as e:
         raise ValueError(f"invalid analysis plan doc: {e}") from e
@@ -496,23 +596,16 @@ def finding_to_dict(finding: AnalysisFinding) -> dict[str, object]:
 def finding_from_dict(doc: Mapping[str, object]) -> AnalysisFinding:
     """Build a finding from a JSON doc (field names match finding_to_dict)."""
     try:
-        raw_interval = doc.get("interval")
-        interval: tuple[float, float] | None
-        if raw_interval is None:
-            interval = None
-        else:
-            pair = (float(raw_interval[0]), float(raw_interval[1]))  # type: ignore[index]
-            interval = pair
         return AnalysisFinding(
-            plan_digest=str(doc["plan_digest"]),
-            mode=str(doc["mode"]),  # type: ignore[arg-type]
-            hypothesis=str(doc.get("hypothesis", "")),
-            claim=str(doc["claim"]),
-            n_observed=int(doc["n_observed"]),  # type: ignore[arg-type]
-            interval=interval,
-            data_digest=str(doc["data_digest"]),
-            data_accessed_at=str(doc["data_accessed_at"]),
-            code_version=str(doc["code_version"]),
+            plan_digest=_as_str(doc.get("plan_digest"), "plan_digest"),
+            mode=_as_mode(doc.get("mode"), "mode"),
+            hypothesis=_as_str(doc.get("hypothesis", ""), "hypothesis"),
+            claim=_as_str(doc.get("claim"), "claim"),
+            n_observed=_as_int(doc.get("n_observed"), "n_observed"),
+            interval=_as_interval(doc.get("interval")),
+            data_digest=_as_str(doc.get("data_digest"), "data_digest"),
+            data_accessed_at=_as_str(doc.get("data_accessed_at"), "data_accessed_at"),
+            code_version=_as_str(doc.get("code_version"), "code_version"),
         )
     except (KeyError, TypeError, ValueError) as e:
         raise ValueError(f"invalid analysis finding doc: {e}") from e
@@ -546,7 +639,9 @@ def review_analysis(
 
     Never raises on violations — it names them. Use check_analysis for
     the raising (CI-gating) form. An unregistered or rewritten plan is
-    UNREGISTERED_PLAN; an unreadable registry is REGISTRY_UNREADABLE.
+    UNREGISTERED_PLAN; an unreadable registry is REGISTRY_UNREADABLE; a
+    finding that names a different digest than the one under review is
+    DIGEST_MISMATCH.
     """
     try:
         plan, registered_at = load_analysis_plan(plan_digest, registry_path)
@@ -575,8 +670,26 @@ def review_analysis(
             plan_digest=plan_digest,
         )
 
+    # The finding must name the plan under review. Without this check a
+    # finding bound to an unregistered digest verifies clean against
+    # any registered plan — the binding field would be decoration.
+    if finding.plan_digest != plan_digest:
+        return ReviewGateReport(
+            verdict="REFUSED",
+            questions=(),
+            violations=("DIGEST_MISMATCH",),
+            notes=(
+                (f"finding names plan {finding.plan_digest[:12]}... "
+                f"but was reviewed against {plan_digest[:12]}..."),
+            ),
+            plan_digest=plan_digest,
+        )
+
     violations: list[str] = []
-    notes: list[str] = []
+    notes: list[str] = [
+        ("consistency check over reported evidence only — see "
+        "docs/PRESPECIFICATION.md honesty boundaries")
+    ]
     questions: list[QuestionResult] = []
 
     # Q1 — registered: load_analysis_plan already proved it.

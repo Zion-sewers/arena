@@ -15,7 +15,9 @@ itself — no randomness, no network:
    registered after the data was touched is refused as PLAN_AFTER_DATA;
    a confirmatory finding without an interval is refused at
    construction; a finding on an unregistered digest is refused as
-   UNREGISTERED_PLAN; a rewritten registry is refused as a broken chain.
+   UNREGISTERED_PLAN; a finding naming a different digest than the one
+   under review is refused as DIGEST_MISMATCH; a rewritten registry is
+   refused as a broken chain, including a backdated registered_at.
 
 Exit 0 only if every expectation holds; any failure raises, so CI can
 gate on this demo directly.
@@ -23,6 +25,7 @@ gate on this demo directly.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -274,12 +277,53 @@ def main() -> int:
         assert rewritten.verdict == "REFUSED", rewritten
         assert "UNREGISTERED_PLAN" in rewritten.violations, rewritten
 
-        # The raising form: check_analysis raises on refusal, returns on pass.
+        # Fresh registry for the raising-form checks below; the 3g drill
+        # runs against it first.
         registry2 = os.path.join(tmp, "plans2.jsonl")
         digest2 = register_analysis_plan(_confirmatory_plan(), registry2)
         from experiment.prespec import load_analysis_plan as _load
 
         _, registered_at2 = _load(digest2, registry2)
+
+        # 3g. A finding naming a different digest than the one under
+        # review is refused as DIGEST_MISMATCH — even when the named
+        # digest is unregistered, the binding field is checked first.
+        mismatch = review_analysis(
+            digest2,
+            registry2,
+            AnalysisFinding(
+                plan_digest="0" * 64,
+                mode="confirmatory",
+                hypothesis="reranker v2 cuts hallucinated citations by at least 10pp vs v1",
+                claim="v2 cuts hallucinated citations by 14pp",
+                n_observed=200,
+                interval=(0.08, 0.20),
+                data_digest="sha256:golden-suite-seed42",
+                data_accessed_at=_after(registered_at2),
+                code_version="arena@dbf6909",
+            ),
+        )
+        assert mismatch.verdict == "REFUSED", mismatch
+        assert "DIGEST_MISMATCH" in mismatch.violations, mismatch
+
+        # 3h. Backdating registered_at breaks the chain: the timestamp
+        # is part of the hashed payload.
+        registry3 = os.path.join(tmp, "plans3.jsonl")
+        digest3 = register_analysis_plan(_confirmatory_plan(), registry3)
+        with open(registry3, encoding="utf-8") as f:
+            lines3 = f.readlines()
+        rec3 = json.loads(lines3[0])
+        rec3["registered_at"] = "2020-01-01T00:00:00+00:00"
+        with open(registry3, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec3, sort_keys=True) + "\n")
+        try:
+            load_analysis_plan(digest3, registry3)
+        except AnalysisRegistryCorrupted:
+            pass
+        else:
+            raise AssertionError("backdated registered_at loaded clean")
+
+        # The raising form: check_analysis raises on refusal, returns on pass.
         ok = check_analysis(
             digest2,
             registry2,
@@ -319,7 +363,7 @@ def main() -> int:
 
     print("prespec demo: CONFIRMED + EXPLORATORY_ONLY paths verify; "
           "all refusal drills fire (POST_HOC_CONFIRMATION, MODE_MISMATCH, "
-          "PLAN_AFTER_DATA, UNREGISTERED_PLAN, broken chain)")
+          "PLAN_AFTER_DATA, UNREGISTERED_PLAN, DIGEST_MISMATCH, broken chain)")
     return 0
 
 

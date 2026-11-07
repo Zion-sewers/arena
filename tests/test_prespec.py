@@ -401,6 +401,122 @@ def test_check_analysis_returns_report_on_pass(tmp_path: Path) -> None:
     assert report.verdict == "CONFIRMED"
 
 
+# --- review gate: fix-forward regressions (round-1 critiques) ---
+
+
+def test_digest_mismatch_refused(tmp_path: Path) -> None:
+    digest, registered_at, registry = _register(_plan(), tmp_path)
+    report = review_analysis(
+        digest,
+        registry,
+        _finding("0" * 64, _after(registered_at)),
+    )
+    assert report.verdict == "REFUSED"
+    assert report.violations == ("DIGEST_MISMATCH",)
+    assert report.questions == ()
+
+
+def test_check_analysis_digest_mismatch(tmp_path: Path) -> None:
+    digest, registered_at, registry = _register(_plan(), tmp_path)
+    with pytest.raises(AnalysisViolation, match="DIGEST_MISMATCH"):
+        check_analysis(
+            digest,
+            registry,
+            _finding("0" * 64, _after(registered_at)),
+        )
+
+
+def test_registered_at_tamper_breaks_chain(tmp_path: Path) -> None:
+    from experiment.prespec import AnalysisRegistryCorrupted
+
+    digest, _, registry = _register(_plan(), tmp_path)
+    path = Path(registry)
+    record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    record["registered_at"] = "2020-01-01T00:00:00+00:00"
+    path.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    with pytest.raises(AnalysisRegistryCorrupted, match="hash chain broken"):
+        load_analysis_plan(digest, registry)
+
+
+def test_invalid_plan_record_is_unreadable_not_a_raise(tmp_path: Path) -> None:
+    from experiment.prespec import _record_digest
+
+    plan = _plan()
+    canonical = dict(plan_to_dict(plan))
+    canonical["mode"] = "bogus"
+    registered_at = "2026-11-07T18:00:00+00:00"
+    digest = _record_digest("GENESIS", canonical, registered_at)
+    registry = str(tmp_path / "analyses.jsonl")
+    record = {
+        "digest": digest,
+        "registered_at": registered_at,
+        "analysis_plan": canonical,
+    }
+    Path(registry).write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    report = review_analysis(
+        digest,
+        registry,
+        _finding(digest, "2026-11-07T19:00:00+00:00"),
+    )
+    assert report.verdict == "REFUSED"
+    assert report.violations == ("REGISTRY_UNREADABLE",)
+
+
+def test_finding_from_dict_rejects_short_interval() -> None:
+    from experiment.prespec import finding_from_dict
+
+    doc = {
+        "plan_digest": "0" * 64,
+        "mode": "confirmatory",
+        "hypothesis": "h",
+        "claim": "c",
+        "n_observed": 200,
+        "interval": [0.08],
+        "data_digest": "sha256:x",
+        "data_accessed_at": "2026-11-07T00:00:00+00:00",
+        "code_version": "arena@dbf6909",
+    }
+    with pytest.raises(ValueError, match="invalid analysis finding doc"):
+        finding_from_dict(doc)
+
+
+def test_finding_from_dict_rejects_long_interval() -> None:
+    from experiment.prespec import finding_from_dict
+
+    doc = {
+        "plan_digest": "0" * 64,
+        "mode": "confirmatory",
+        "hypothesis": "h",
+        "claim": "c",
+        "n_observed": 200,
+        "interval": [0.08, 0.20, 0.30],
+        "data_digest": "sha256:x",
+        "data_accessed_at": "2026-11-07T00:00:00+00:00",
+        "code_version": "arena@dbf6909",
+    }
+    with pytest.raises(ValueError, match="invalid analysis finding doc"):
+        finding_from_dict(doc)
+
+
+def test_finding_from_dict_rejects_coerced_sample_size() -> None:
+    from experiment.prespec import finding_from_dict
+
+    base = {
+        "plan_digest": "0" * 64,
+        "mode": "confirmatory",
+        "hypothesis": "h",
+        "claim": "c",
+        "interval": [0.08, 0.20],
+        "data_digest": "sha256:x",
+        "data_accessed_at": "2026-11-07T00:00:00+00:00",
+        "code_version": "arena@dbf6909",
+    }
+    with pytest.raises(ValueError, match="invalid analysis finding doc"):
+        finding_from_dict({**base, "n_observed": 200.9})
+    with pytest.raises(ValueError, match="invalid analysis finding doc"):
+        finding_from_dict({**base, "n_observed": "200"})
+
+
 # --- JSON round-trips for the CLI ---
 
 

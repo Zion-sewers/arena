@@ -228,3 +228,23 @@ def test_prespec_cli_bad_input(monkeypatch, capsys, tmp_path):
     )
     assert code == 2
     assert "invalid finding doc" in err
+
+
+def test_prespec_cli_bad_interval_exit_2(monkeypatch, capsys, tmp_path):
+    import json
+    from pathlib import Path
+
+    _, finding, registry = _prespec_files(
+        tmp_path,
+        "reranker v2 cuts hallucinated citations by at least 10pp vs v1",
+    )
+    doc = json.loads(Path(finding).read_text(encoding="utf-8"))
+    doc["interval"] = [0.08]
+    bad = tmp_path / "finding-bad-interval.json"
+    bad.write_text(json.dumps(doc), encoding="utf-8")
+    code, _, err = _run(
+        ["prespec", "--finding", str(bad), "--registry", registry],
+        monkeypatch, capsys,
+    )
+    assert code == 2
+    assert "invalid finding doc" in err
