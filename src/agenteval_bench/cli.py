@@ -514,7 +514,9 @@ def cmd_alt_test(args: list[str]) -> int:
     (default 50). Sparse cells are masked, never silently dropped, and a
     judge with any sparse cell is shown as MASKED, not ranked. When no
     judge is rankable the leaderboard is refused (exit 1): a leaderboard
-    over tiny samples is not a ranking.
+    over tiny samples is not a ranking. The gate runs before anything
+    is printed or written, so a refused ranking never reaches stdout
+    or the --out file — only the gated board (masked rows) is shown.
     """
     args, data_path = _flag(args, "--data")
     args, epsilon_s = _flag(args, "--epsilon", "0.1")
@@ -536,6 +538,8 @@ def cmd_alt_test(args: list[str]) -> int:
         return 1
 
     from agenteval_bench.coverage import (
+        DEFAULT_MIN_PER_CELL,
+        DEFAULT_MIN_TOTAL,
         CoveragePolicy,
         RankingRefused,
         assess_ranking,
@@ -559,6 +563,18 @@ def cmd_alt_test(args: list[str]) -> int:
     except (ValueError, TypeError) as e:
         print(f"Error: unusable coverage policy: {e}", file=sys.stderr)
         return 1
+    if (
+        policy.min_per_cell < DEFAULT_MIN_PER_CELL
+        or policy.min_total < DEFAULT_MIN_TOTAL
+    ):
+        print(
+            "Warning: coverage floors below the source defaults "
+            f"(min_per_cell={DEFAULT_MIN_PER_CELL}, "
+            f"min_total={DEFAULT_MIN_TOTAL}) void the ~50-observations-per-cell "
+            "guarantee: a ranking under relaxed floors is not the "
+            "source-floor ranking.",
+            file=sys.stderr,
+        )
     try:
         config = AltTestConfig(epsilon=epsilon, q=q, seed=seed)
     except ValueError as e:
@@ -586,6 +602,18 @@ def cmd_alt_test(args: list[str]) -> int:
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+    try:
+        require_ranking(board)
+    except RankingRefused as e:
+        # The gate runs BEFORE anything is printed or written: on
+        # refusal there is no ungated leaderboard on stdout and no
+        # --out file, because a leaderboard over tiny samples is not a
+        # ranking, and an artifact carrying one would be. The gated
+        # board is still printed, so the masked judges and the fix are
+        # visible in the refusal itself.
+        print(render_ranked(board))
+        print(f"Refused: {e}", file=sys.stderr)
+        return 1
     print(render_text(report))
     print(render_ranked(board))
     if out:
@@ -594,11 +622,6 @@ def cmd_alt_test(args: list[str]) -> int:
         with open(out, "w", encoding="utf-8") as f:
             f.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
         print(f"Report: {out}")
-    try:
-        require_ranking(board)
-    except RankingRefused as e:
-        print(f"Refused: {e}", file=sys.stderr)
-        return 1
     return 0
 
 

@@ -292,7 +292,7 @@ print(result.summary())
 | Measurement-validity column (decide + scorer) | ✅ shipped | v0.1.0  |
 | Judge decorrelation (HOST != FAMILY) | ✅ shipped | v0.1.0  |
 | Judge calibration (confidence is not evidence) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
-| Coverage requirements before learning or ranking (mask sparse cells) | ✅ shipped  | v0.1.0         |
+| Coverage requirements before learning or ranking (mask sparse cells) | ✅ shipped (alt-test ranking live; generic learning gate protocol only) | v0.1.0  |
 | OEC ship gate (OEC + guardrails + trust gates) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Analysis pre-specification (10-question review gate) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Anti-mode-collapse /diverge (5 candidates + p_conventional) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |

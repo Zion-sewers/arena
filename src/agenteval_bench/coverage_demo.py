@@ -5,7 +5,9 @@ adds a thin judge that labels only 20 items — and would win on all of
 them — and shows the coverage gate masking it out of the ranking while
 the fully-covered judges stay ranked. Then shows the refusal: a
 dataset where no judge meets the per-cell floor is not a ranking, and
-the CLI exits 1 naming the thinnest cells.
+the CLI exits 1 naming the thinnest cells. Finally the dropped pair:
+an annotator labelling only 5 items drops every pair against it, and
+the judges are masked on the unreported cells.
 """
 
 from __future__ import annotations
@@ -148,6 +150,36 @@ def main() -> int:
         _write_jsonl(thin_only, thin_path)
         code = cmd_alt_test(["--data", str(thin_path)])
         _expect(code == 1, "CLI refuses the thin-only dataset (exit 1)")
+
+    # 5. The dropped pair: an annotator labelling only 5 items drops
+    # every pair against it, and the judges are masked on the unreported
+    # cells — never ranked on their remaining pairs alone.
+    dropped: list[AltTestItem] = []
+    for i, item in enumerate(make_dataset(n_items=120)):
+        ann = dict(item.annotator_labels)
+        if i >= 5:
+            ann.pop("ann4", None)
+        dropped.append(
+            AltTestItem(
+                id=item.id,
+                task=item.task,
+                annotator_labels=ann,
+                judge_labels=dict(item.judge_labels),
+            )
+        )
+    dropped_report = run_alt_test(dropped, AltTestConfig(epsilon=0.1, q=0.05, seed=7))
+    dropped_board = assess_ranking(dropped_report, CoveragePolicy(min_per_cell=50, min_total=50))
+    _expect(dropped_board.ranked == (), "dropped pairs mask every judge")
+    _expect(
+        all(j.unreported_cells == 1 for j in dropped_board.masked),
+        "each masked judge names 1 unreported pair",
+    )
+    try:
+        require_ranking(dropped_board)
+    except RankingRefused as e:
+        _expect("unreported pair" in str(e), "refusal names the unreported pairs")
+    else:  # pragma: no cover - the refusal is the expectation
+        raise AssertionError("require_ranking must refuse on unreported pairs")
 
     print("demo checks passed: sparse cells masked, fallback conservative, refusal named")
     return 0

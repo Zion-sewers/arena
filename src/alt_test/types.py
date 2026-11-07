@@ -81,7 +81,16 @@ class AltTestConfig:
 
 @dataclass(frozen=True)
 class AnnotatorComparison:
-    """Alt-test outcome of one judge against one left-out annotator."""
+    """Alt-test outcome of one judge against one left-out annotator.
+
+    ``rho_f`` is the mean of ``n`` binary wins (1.0 when the judge's
+    alignment on an item is at least the annotator's, else 0.0), so
+    ``round(rho_f * n)`` recovers the integer win count exactly. The
+    coverage layer (arena#49) relies on this: it reconstructs per-cell
+    wins from (rho_f, n) rather than carrying a second count. A future
+    runner change to graded (non-binary) wins must update this contract
+    first — the reconstruction refuses loudly instead of guessing.
+    """
 
     annotator: str
     n: int  #: shared items used in this comparison

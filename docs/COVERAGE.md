@@ -11,8 +11,9 @@ A judge labels 20 items, wins every comparison it enters, and tops the
 leaderboard at omega 1.0, rho 1.0. It was never measured: 20 shared items
 per (judge, annotator) pair is not a ranking, it is a small sample that
 happened to look perfect. The ungated leaderboard cannot tell the two
-apart — it sorts by the point estimate and drops the sparse cells from
-the denominator without a word. A leaderboard over tiny samples is NOT
+apart — it sorts by the point estimate, and omega's denominator counts
+only the pairs the runner reports, so a pair sharing too few items
+simply never enters the fraction. A leaderboard over tiny samples is NOT
 a ranking.
 
 Source: Perplexity sample-size research (catalog B-47) — INSPIRED. The
@@ -28,6 +29,19 @@ Conservative fallback where data is thin.
   (`AnnotatorComparison.n`). The generic entry point
   `assess_observations` takes raw per-cell counts for learning gates
   that are not alt-test.
+- What "coverage" means here, honestly: a per-pair sample-size floor,
+  not coverage of the state space. The floor counts shared items; it
+  never asks which tasks, difficulties, or categories those items span.
+  A judge can be "covered" with 50 shared items that are all trivial
+  items from one slice. Until a state-space gate exists as its own
+  issue, this module is a sample-size floor, and its name should be
+  read that way.
+- Pairs the runner drops before the report — fewer than
+  `min_pair_items` (10) shared items — never reach the coverage layer
+  as cells. They are not forgotten: a verdict with fewer comparisons
+  than annotators charges the judge one unreported sparse cell per
+  missing pair, and the judge is masked. A masked judge is still
+  shown with its unreported count named, never silently dropped.
 - The per-cell floor is 50 by default (`CoveragePolicy.min_per_cell`),
   the total floor 50 (`min_total`, aligned with
   `AltTestConfig.min_items`). Both are overridable on the CLI
@@ -48,6 +62,10 @@ Conservative fallback where data is thin.
 - A leaderboard with no rankable judge is not a ranking. `require_ranking`
   refuses with a typed `RankingRefused` naming every masked judge and
   its thinnest cell; the `alt-test` CLI prints the refusal and exits 1.
+  The gate runs before anything is printed or written: on refusal there
+  is no ungated leaderboard on stdout and no `--out` file, because an
+  artifact carrying a refused ranking would be one. Only the gated
+  board (masked rows) is shown.
 - The coverage record cannot be forged: `CellCoverage` derives its
   status from n against the floor at construction, and
   `RankedLeaderboard` refuses a `ranked` entry that is not rankable or

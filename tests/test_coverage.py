@@ -26,6 +26,7 @@ from agenteval_bench.coverage import (
     JudgeCoverage,
     RankedLeaderboard,
     RankingRefused,
+    _recover_wins,
     assess_cell,
     assess_observations,
     assess_ranking,
@@ -146,6 +147,15 @@ def test_thin_perfect_cell_falls_back_far_below_covered_perfect_cell() -> None:
 
 def test_empty_cell_conservative_rate_is_zero() -> None:
     assert assess_cell("s", "a", 0, 0, 50).conservative_rate == 0.0
+
+
+def test_zero_wins_conservative_rate_is_exactly_zero() -> None:
+    # Regression (hypothesis found it, CI confirmed it): the Wilson
+    # centre/half-width cancel exactly at 0 wins in real arithmetic,
+    # but in floats the subtraction leaves dust (6.9e-18 at n=47). A
+    # conservative fallback must never exceed the measured rate.
+    for n in (2, 10, 47, 50, 120, 200):
+        assert assess_cell("s", "a", n, 0, 50).conservative_rate == 0.0
 
 
 @settings(max_examples=50, deadline=None)
@@ -274,6 +284,38 @@ def test_ranking_orders_by_conservative_score_not_point_rho() -> None:
     assert len(board.ranked) + len(board.masked) == len(report.verdicts)
 
 
+def test_dropped_pair_masks_the_judge() -> None:
+    # Replicates the implementation reviewer's probe A: annotator ann4
+    # labels only 5 of 120 items, so the runner drops every (judge,
+    # ann4) pair before the report. The gate must not rank on the
+    # remaining pairs alone — each judge carries one unreported sparse
+    # cell and is masked.
+    items: list[AltTestItem] = []
+    for i, item in enumerate(make_dataset(n_items=120)):
+        ann = dict(item.annotator_labels)
+        if i >= 5:
+            ann.pop("ann4", None)
+        items.append(
+            AltTestItem(
+                id=item.id,
+                task=item.task,
+                annotator_labels=ann,
+                judge_labels=dict(item.judge_labels),
+            )
+        )
+    report = run_alt_test(items, AltTestConfig(epsilon=0.1, q=0.05, seed=7))
+    assert all(len(v.comparisons) == 4 for v in report.verdicts)
+    board = assess_ranking(report, POLICY)
+    assert board.ranked == ()
+    assert not board.is_ranking
+    for judge in board.masked:
+        assert judge.unreported_cells == 1
+        assert judge.coverage_fraction == pytest.approx(4 / 5)
+    assert "unreported" in render_ranked(board)
+    with pytest.raises(RankingRefused, match="unreported pair"):
+        require_ranking(board)
+
+
 def test_no_rankable_judge_means_no_ranking() -> None:
     report = _report()
     strict = assess_ranking(report, CoveragePolicy(min_per_cell=200, min_total=50))
@@ -287,7 +329,10 @@ def test_no_rankable_judge_means_no_ranking() -> None:
 def test_total_floor_refuses_even_a_fully_covered_small_dataset() -> None:
     report = _report(n_items=60, n_labelled=60)
     board = assess_ranking(report, CoveragePolicy(min_per_cell=50, min_total=61))
-    assert board.is_ranking  # cells are covered; the refusal is the total
+    # Cells are covered, but the dataset is below the total floor, so
+    # the board is not a ranking either — is_ranking folds the floor in.
+    assert board.is_ranking is False
+    assert board.ranked != ()
     with pytest.raises(RankingRefused, match="below the min_total"):
         require_ranking(board)
 
@@ -310,9 +355,36 @@ def test_board_serializes_to_json() -> None:
     masked = cast(list[dict[str, object]], doc["masked"])
     assert [r["judge"] for r in ranked] == [j.judge for j in board.ranked]
     assert [m["judge"] for m in masked] == ["thin-judge"]
+    assert masked[0]["unreported_cells"] == 0
     thinnest = cast(dict[str, object], masked[0]["thinnest_cell"])
     assert thinnest["n"] == 20
     json.dumps(doc)  # must be JSON-serializable
+
+
+def test_recover_wins_refuses_non_finite_rho() -> None:
+    # A corrupt report carrying rho_f=inf must refuse as a typed
+    # ValueError, not crash the CLI with an OverflowError traceback.
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValueError, match="not finite"):
+            _recover_wins("judge", "ann0", bad, 50)
+
+
+def test_empty_report_refusal_names_the_emptiness() -> None:
+    board = assess_ranking(AltTestReport(verdicts=(), epsilon=0.1, q=0.05, n_items=60), POLICY)
+    assert not board.is_ranking
+    with pytest.raises(RankingRefused, match="no judges at all"):
+        require_ranking(board)
+
+
+def test_judge_cells_must_share_one_floor() -> None:
+    with pytest.raises(ValueError, match="different floors"):
+        JudgeCoverage(
+            "judge",
+            (
+                assess_cell("ann0", "judge", 60, 60, 50),
+                assess_cell("ann1", "judge", 60, 60, 20),
+            ),
+        )
 
 
 def test_generic_observations_gate() -> None:
@@ -355,6 +427,34 @@ def test_cli_ranks_full_dataset_and_refuses_thin_only(tmp_path: Path) -> None:
     assert cmd_alt_test(["--data", str(thin_path)]) == 1
 
 
+def test_cli_refusal_prints_no_ungated_leaderboard_and_writes_no_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The gate runs before anything is printed or written: on refusal
+    # stdout carries only the gated board (masked rows), and no --out
+    # file exists — a refused ranking must not leak as an artifact.
+    thin_path = tmp_path / "thin.jsonl"
+    out_path = tmp_path / "report.json"
+    thin_only = [
+        AltTestItem(
+            id=item.id,
+            task=item.task,
+            annotator_labels=dict(item.annotator_labels),
+            judge_labels=({"thin-judge": item.judge_labels["majority-oracle"]} if i < 20 else {}),
+        )
+        for i, item in enumerate(make_dataset(n_items=60))
+    ]
+    _write_jsonl(thin_only, thin_path)
+    assert cmd_alt_test(["--data", str(thin_path), "--out", str(out_path)]) == 1
+    assert not out_path.exists()
+    stdout = capsys.readouterr().out
+    assert "thin-judge" in stdout  # the masked row is shown, not hidden
+    assert "MASKED" in stdout
+    assert "NOT A RANKING" in stdout
+    assert "alt-test leaderboard" not in stdout
+    assert "omega" not in stdout
+
+
 def test_cli_bad_coverage_policy_exits_one(tmp_path: Path) -> None:
     path = tmp_path / "data.jsonl"
     _write_jsonl(_thin_dataset(), path)
@@ -363,14 +463,19 @@ def test_cli_bad_coverage_policy_exits_one(tmp_path: Path) -> None:
     assert cmd_alt_test(["--data", str(path), "--min-total", "0"]) == 1
 
 
-def test_cli_relaxed_floor_ranks_the_thin_judge(tmp_path: Path) -> None:
+def test_cli_relaxed_floor_ranks_the_thin_judge(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     # The floor is a policy knob, not a hard-coded constant: relaxing it
     # to 20 ranks the thin judge, which pins that the mask follows the
-    # policy rather than the judge's name.
+    # policy rather than the judge's name. Relaxing below the source
+    # default of 50 warns on stderr: the ranking is no longer the
+    # source-floor ranking.
     path = tmp_path / "data.jsonl"
     _write_jsonl(_thin_dataset(), path)
     out_path = tmp_path / "report.json"
     assert cmd_alt_test(["--data", str(path), "--min-cell-n", "20", "--out", str(out_path)]) == 0
+    assert "Warning" in capsys.readouterr().err
     doc = json.loads(out_path.read_text(encoding="utf-8"))
     assert "thin-judge" in [r["judge"] for r in doc["coverage"]["ranked"]]
     assert doc["coverage"]["masked"] == []
