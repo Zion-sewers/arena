@@ -56,6 +56,9 @@ from experiment.registry import (
     register_plan,
     verify_experiment,
 )
+from experiment.registry import (
+    register_design as register_design_record,
+)
 from experiment.types import ExperimentPlan
 
 PLAN = ExperimentPlan(name="reranker-v2-vs-v1", n_planned=800, alpha=0.05, looks=(0.5, 1.0))
@@ -768,6 +771,129 @@ def test_replication_critical_value_is_sides_aware(tmp_path: str) -> None:
     )
     assert refused.status == "no_ship"
     assert any("REPLICATION_NOT_CONFIRMED" in r for r in refused.reasons)
+
+
+def _one_sided_registry(tmp_path: str) -> tuple[str, str]:
+    plan = ExperimentPlan(
+        name="one-sided-latency", n_planned=800, alpha=0.05, looks=(0.5, 1.0), sides="one"
+    )
+    registry = os.path.join(str(tmp_path), "one.jsonl")
+    return registry, register_plan(plan, registry)
+
+
+def _lower_better_design(digest: str) -> ExperimentDesign:
+    return _design(
+        digest,
+        metrics=(
+            MetricDeclaration("latency_p99", "oec", "lower_better"),
+            MetricDeclaration("safety_violations", "guardrail", "lower_better", 0.02),
+        ),
+    )
+
+
+def test_register_design_refuses_one_sided_lower_better_oec(tmp_path: str) -> None:
+    # B1 (round-2 implementation review): a one-sided sequential test
+    # only ever rejects for positive z, while a lower_better win needs
+    # a negative z — the combination can never ship, so registration
+    # refuses it instead of hash-chaining a dead design.
+    registry, digest = _one_sided_registry(str(tmp_path))
+    with pytest.raises(ValueError, match="one-sided"):
+        register_design(_lower_better_design(digest), registry)
+
+
+def test_ship_names_one_sided_lower_better_instead_of_mismatch(tmp_path: str) -> None:
+    # Defense in depth for a design registered before the registration
+    # refusal existed (seeded here through the raw record writer): the
+    # gate must blame the incoherent design, never misreport honest
+    # evidence as DECISION_MISMATCH.
+    registry, digest = _one_sided_registry(str(tmp_path))
+    design = _lower_better_design(digest)
+    register_design_record(design.to_dict(), registry)
+    for final_z, rejected in ((-2.5, True), (-2.5, False), (2.5, True)):
+        verdict = ship_decision(
+            design,
+            _evidence(
+                digest,
+                final_z=final_z,
+                final_rejected=rejected,
+                oec_metric="latency_p99",
+                looks=(
+                    LookEvidence(0.5, -1.0, False, metric="latency_p99"),
+                    LookEvidence(1.0, final_z, rejected, metric="latency_p99"),
+                ),
+            ),
+            registry,
+        )
+        assert verdict.status == "no_ship"
+        assert any("ONE_SIDED_LOWER_BETTER" in r for r in verdict.reasons)
+        assert not any("DECISION_MISMATCH" in r for r in verdict.reasons)
+
+
+def test_two_sided_lower_better_oec_ships(tmp_path: str) -> None:
+    # Control for the one-sided refusal: the same lower_better OEC on
+    # a two-sided plan ships on honest evidence.
+    registry, digest = _registry(str(tmp_path))
+    design = _registered_design(registry, digest, metrics=_lower_better_design(digest).metrics)
+    verdict = ship_decision(
+        design,
+        _evidence(
+            digest,
+            final_z=-2.5,
+            oec_metric="latency_p99",
+            looks=(
+                LookEvidence(0.5, -1.0, False, metric="latency_p99"),
+                LookEvidence(1.0, -2.5, True, metric="latency_p99"),
+            ),
+        ),
+        registry,
+    )
+    assert verdict.status == "ship"
+
+
+def test_evidence_loader_refuses_nonfinite_looks(tmp_path: str) -> None:
+    # A2 (round-2 implementation review): the JSON loader is the CLI
+    # trust boundary — an infinite z is not a plausible statistic and
+    # must never reach the gate.
+    registry, digest = _registry(str(tmp_path))
+    _registered_design(registry, digest)
+    evidence = _evidence(digest)
+    doc: dict[str, object] = {
+        "plan_digest": evidence.plan_digest,
+        "oec_metric": evidence.oec_metric,
+        "run_id": evidence.run_id,
+        "experiment": {
+            "n_final": evidence.experiment.n_final,
+            "looks": [
+                {
+                    "fraction": look.fraction,
+                    "z": look.z,
+                    "rejected": look.rejected,
+                    "metric": look.metric,
+                }
+                for look in evidence.experiment.looks
+            ],
+        },
+        "srm_counts": list(evidence.srm_counts),
+        "aa": {"a_successes": 250, "a_n": 500, "b_successes": 260, "b_n": 500},
+        "guardrails": [
+            {
+                "name": "safety_violations",
+                "control_successes": 24,
+                "control_n": 400,
+                "treated_successes": 16,
+                "treated_n": 400,
+            }
+        ],
+        "replication": None,
+    }
+    infinite_z = json.loads(json.dumps(doc))
+    infinite_z["experiment"]["looks"][1]["z"] = float("inf")  # type: ignore[index]
+    with pytest.raises(ValueError, match="finite"):
+        evidence_from_json(json.dumps(infinite_z))
+    infinite_fraction = json.loads(json.dumps(doc))
+    infinite_fraction["experiment"]["looks"][0]["fraction"] = float("inf")  # type: ignore[index]
+    with pytest.raises(ValueError, match="finite"):
+        evidence_from_json(json.dumps(infinite_fraction))
 
 
 def test_secondary_metrics_must_be_reported(tmp_path: str) -> None:

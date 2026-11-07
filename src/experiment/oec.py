@@ -981,6 +981,25 @@ def ship_decision(
             ]
         )
     design_digest = found
+    # Design/plan coherence, before any trust test runs: a lower_better
+    # OEC on a one-sided plan is incoherent by construction (the
+    # sequential gate only ever rejects for positive z, a lower_better
+    # win needs a negative z). Refusing here, with the design named as
+    # the problem, instead of letting verify_experiment misreport the
+    # honest evidence as DECISION_MISMATCH. Designs registered before
+    # this check existed are caught here too.
+    if plan.sides == "one" and design.oec.direction == "lower_better":
+        return refuse(
+            [
+                (
+                    "ONE_SIDED_LOWER_BETTER: a lower_better OEC cannot "
+                    "ship on a one-sided plan — the sequential gate only "
+                    "rejects for positive z, while a lower_better win "
+                    "needs a negative z. Use a two-sided plan for a "
+                    "lower_better OEC."
+                )
+            ]
+        )
     verdict = verify_experiment(design.plan_digest, registry_path, evidence.experiment)
     if not verdict.valid:
         notes.extend(verdict.notes)
@@ -1486,6 +1505,16 @@ def register_design(design: ExperimentDesign, registry_path: str) -> str:
             f"cannot register a design bound to unregistered plan "
             f"{design.plan_digest[:12]}...: register the plan first"
         ) from e
+    plan = load_plan(design.plan_digest, registry_path)
+    if plan.sides == "one" and design.oec.direction == "lower_better":
+        raise ValueError(
+            "cannot register a lower_better OEC on a one-sided plan: a "
+            "one-sided sequential test only ever rejects for positive z, "
+            "while a lower_better win needs a negative z, so the design "
+            "could never ship and honest evidence would be misreported "
+            "as DECISION_MISMATCH — use a two-sided plan for a "
+            "lower_better OEC"
+        )
     return _register_design_record(design.to_dict(), registry_path)
 
 
@@ -1511,6 +1540,10 @@ def _looks_from_json(raw: object) -> tuple[LookEvidence, ...]:
             raise TypeError(f"look fraction must be a number, got {entry['fraction']!r}")
         if not _is_number(entry["z"]):
             raise TypeError(f"look z must be a number, got {entry['z']!r}")
+        if not math.isfinite(float(entry["fraction"])):
+            raise ValueError(f"look fraction must be finite, got {entry['fraction']!r}")
+        if not math.isfinite(float(entry["z"])):
+            raise ValueError(f"look z must be finite, got {entry['z']!r}")
         if not isinstance(entry["rejected"], bool):
             raise TypeError(f"look rejected must be a bool, got {entry['rejected']!r}")
         metric = entry.get("metric", "")

@@ -191,6 +191,13 @@ clean, guardrail unregressed) and exit 0. Flip `srm_counts` to
   repo's lingua franca: decision.py, simpson strata). A continuous
   guardrail needs a mean/variance evidence type this module does not
   own, and is refused by the JSON loader rather than approximated.
+- A `lower_better` OEC cannot ship on a one-sided plan: a one-sided
+  sequential test only ever rejects for positive z, while a
+  lower_better win needs a negative z, so the combination is refused
+  at registration (`register-design`) and at the gate
+  (`ONE_SIDED_LOWER_BETTER`) instead of misreporting honest evidence
+  as `DECISION_MISMATCH`. Use a two-sided plan for a lower_better OEC
+  (error rate, latency, cost).
 - The hash chain delivers immutability, not precedence: `registered_at`
   is recorded but nothing proves the design was registered *before*
   data collection (same as #32). The defense is workflow — require the
