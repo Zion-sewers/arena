@@ -364,67 +364,114 @@ class TestLoader:
     def test_loader_refuses_a_non_string_prompt(self) -> None:
         with pytest.raises(TypeError, match="prompt must be a string"):
             candidates_from_json(
-                json.dumps({"prompt": 42, "candidates": [], "conventional_index": 0,
-                            "p_conventional": 0.5})
+                json.dumps(
+                    {"prompt": 42, "candidates": [], "conventional_index": 0, "p_conventional": 0.5}
+                )
             )
 
     def test_loader_refuses_bad_stakes(self) -> None:
         with pytest.raises(ValueError, match="stakes must be 'low' or 'high'"):
             candidates_from_json(
-                json.dumps({"prompt": PROMPT, "stakes": "critical", "candidates": [],
-                            "conventional_index": 0, "p_conventional": 0.5})
+                json.dumps(
+                    {
+                        "prompt": PROMPT,
+                        "stakes": "critical",
+                        "candidates": [],
+                        "conventional_index": 0,
+                        "p_conventional": 0.5,
+                    }
+                )
             )
 
     def test_loader_refuses_a_bool_conventional_index(self) -> None:
         with pytest.raises(TypeError, match="conventional_index must be an int"):
             candidates_from_json(
-                json.dumps({"prompt": PROMPT, "candidates": [],
-                            "conventional_index": True, "p_conventional": 0.5})
+                json.dumps(
+                    {
+                        "prompt": PROMPT,
+                        "candidates": [],
+                        "conventional_index": True,
+                        "p_conventional": 0.5,
+                    }
+                )
             )
 
     def test_loader_refuses_a_bool_p_conventional(self) -> None:
         with pytest.raises(TypeError, match="p_conventional must be a number"):
             candidates_from_json(
-                json.dumps({"prompt": PROMPT, "candidates": [],
-                            "conventional_index": 0, "p_conventional": False})
+                json.dumps(
+                    {
+                        "prompt": PROMPT,
+                        "candidates": [],
+                        "conventional_index": 0,
+                        "p_conventional": False,
+                    }
+                )
             )
 
     def test_loader_refuses_non_list_candidates(self) -> None:
         with pytest.raises(TypeError, match="candidates must be a list"):
             candidates_from_json(
-                json.dumps({"prompt": PROMPT, "candidates": "five",
-                            "conventional_index": 0, "p_conventional": 0.5})
+                json.dumps(
+                    {
+                        "prompt": PROMPT,
+                        "candidates": "five",
+                        "conventional_index": 0,
+                        "p_conventional": 0.5,
+                    }
+                )
             )
 
     def test_loader_refuses_a_non_mapping_candidate(self) -> None:
         with pytest.raises(TypeError, match="must be a mapping"):
             candidates_from_json(
-                json.dumps({"prompt": PROMPT, "candidates": ["five"],
-                            "conventional_index": 0, "p_conventional": 0.5})
+                json.dumps(
+                    {
+                        "prompt": PROMPT,
+                        "candidates": ["five"],
+                        "conventional_index": 0,
+                        "p_conventional": 0.5,
+                    }
+                )
             )
 
     def test_loader_refuses_unknown_candidate_keys(self) -> None:
         with pytest.raises(ValueError, match="unknown keys"):
             candidates_from_json(
-                json.dumps({"prompt": PROMPT,
-                            "candidates": [{"text": HASHMAP, "score": 0.7, "rank": 1}],
-                            "conventional_index": 0, "p_conventional": 0.5})
+                json.dumps(
+                    {
+                        "prompt": PROMPT,
+                        "candidates": [{"text": HASHMAP, "score": 0.7, "rank": 1}],
+                        "conventional_index": 0,
+                        "p_conventional": 0.5,
+                    }
+                )
             )
 
     def test_loader_refuses_a_non_string_candidate_text(self) -> None:
         with pytest.raises(TypeError, match="text must be a string"):
             candidates_from_json(
-                json.dumps({"prompt": PROMPT,
-                            "candidates": [{"text": 42, "score": 0.7}],
-                            "conventional_index": 0, "p_conventional": 0.5})
+                json.dumps(
+                    {
+                        "prompt": PROMPT,
+                        "candidates": [{"text": 42, "score": 0.7}],
+                        "conventional_index": 0,
+                        "p_conventional": 0.5,
+                    }
+                )
             )
 
     def test_loader_refuses_a_non_string_candidate_label(self) -> None:
         with pytest.raises(TypeError, match="label must be a string"):
             candidates_from_json(
-                json.dumps({"prompt": PROMPT,
-                            "candidates": [{"text": HASHMAP, "score": 0.7, "label": 3}],
-                            "conventional_index": 0, "p_conventional": 0.5})
+                json.dumps(
+                    {
+                        "prompt": PROMPT,
+                        "candidates": [{"text": HASHMAP, "score": 0.7, "label": 3}],
+                        "conventional_index": 0,
+                        "p_conventional": 0.5,
+                    }
+                )
             )
 
     def test_non_finite_p_conventional_is_refused(self) -> None:
