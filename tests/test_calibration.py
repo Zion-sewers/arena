@@ -635,6 +635,7 @@ def test_cli_calibrated_exits_zero(tmp_path: Path, capsys: pytest.CaptureFixture
     out = capsys.readouterr().out
     assert "calibrated" in out
     assert "may gate" in out
+    assert "once a live judge transport calls require_calibrated" in out
 
 
 def test_cli_miscalibrated_exits_two(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

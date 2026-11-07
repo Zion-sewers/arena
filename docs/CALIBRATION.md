@@ -85,7 +85,10 @@ The loader fails closed: duplicate (judge, item) pairs, unknown keys,
 a missing required field, or a confidence outside [0, 1] all raise
 `ValueError`, so a typo cannot silently become an observation with no
 measured agreement. A copyable example ships at
-`examples/calibration-observations.json`.
+`examples/calibration-observations.json`. It is synthetic: 400 hand-built
+observations in two bins whose measured agreement exactly equals the stated
+confidence, a boundary-case illustration of a passing grade — not a
+measurement from any real judge.
 
 ## Measured agreement: the alt-test bridge
 
@@ -117,7 +120,8 @@ dropped.
 agenteval-bench calibrate --observations observations.json [--json] [--out report.json]
 ```
 
-Exit 0 = calibrated (the judge's scores may gate); exit 2 =
+Exit 0 = calibrated (the judge's scores may gate once a live judge
+transport calls require_calibrated); exit 2 =
 miscalibrated or uncalibrated (the scores must not gate); exit 1 =
 unusable observations file. The report JSON carries `judge`, `status`,
 `n_total`, `ece`, per-bin tables, `reasons`, and `notes`.

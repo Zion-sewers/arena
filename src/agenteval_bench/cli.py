@@ -768,7 +768,8 @@ def cmd_calibrate(args: list[str]) -> int:
     and grades the judge CALIBRATED / MISCALIBRATED / UNCALIBRATED.
     The grading policy defaults to min_total 50, 10 bins, min 5 per bin,
     tolerance 0.10; override with --min-total / --bins / --min-bin-n /
-    --tolerance. Exit 0 = calibrated (the judge's scores may gate);
+    --tolerance. Exit 0 = calibrated (the judge's scores may gate once a
+    live judge transport calls require_calibrated);
     exit 2 = miscalibrated or uncalibrated (the scores must not gate);
     exit 1 = unusable observations file or policy.
     """
@@ -841,7 +842,7 @@ def cmd_calibrate(args: list[str]) -> int:
         for note in record.notes:
             print(f"  ~ {note}")
         if record.status == "calibrated":
-            print("This judge's scores may gate.")
+            print("This judge's scores may gate once a live judge transport calls require_calibrated.")
         else:
             print("This judge's scores must not gate: confidence is not evidence.")
     if out:

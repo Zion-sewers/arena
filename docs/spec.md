@@ -270,7 +270,7 @@ print(result.summary())
 | Deterministic scoring  | ✅ shipped  | v0.1.0         |
 | Measurement-validity column (decide + scorer) | ✅ shipped | v0.1.0  |
 | Judge decorrelation (HOST != FAMILY) | ✅ shipped | v0.1.0  |
-| Judge calibration (confidence is not evidence) | ✅ shipped | v0.1.0  |
+| Judge calibration (confidence is not evidence) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |
