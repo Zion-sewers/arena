@@ -9,6 +9,7 @@ and selection is deterministic.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -33,6 +34,7 @@ from agenteval_bench.diverge import (
     content_tokens,
     hard_tokens,
     may_decide_high_stakes,
+    p_check_summary,
     pair_similarity,
     require_high_stakes_decision,
     select,
@@ -45,6 +47,13 @@ SORT = "Sort the list and binary search it in O(log n)"
 SCAN = "Scan the list linearly each time O(n)"
 TRIE = "Build a trie over the names for prefix lookup"
 CACHE = "Cache results in Redis with a 60s TTL"
+
+# A longer near-verbatim pair: the one-word change keeps content
+# Jaccard at 0.83, above the 0.80 bar, so the pair is convicted by
+# content overlap alone — no single shared number does the work.
+HASHMAP_LONG = "Use a hash map keyed by user id for O(1) lookup in the response cache"
+HASHMAP_LONG_PARA = "Use a hash map keyed by user id for O(1) lookups in the response cache"
+HASHMAP_LONG_ID = "Use a hash map keyed by user ID for O(1) lookup in the response cache"
 
 
 def _set(
@@ -81,11 +90,29 @@ class TestSimilarity:
         # must not read as similar: content is what counts.
         assert pair_similarity("Use the thing of the day", "Use the stuff of the week") < 0.5
 
-    def test_hard_tokens_convict_a_reworded_paraphrase(self) -> None:
-        # Same numbers, different glue: a paraphrase that keeps the
-        # figures must not pass as a different answer.
+    def test_near_verbatim_rewrite_is_convicted_by_content_tokens(self) -> None:
+        # A one-word change in a long text keeps content Jaccard at
+        # 0.83: convicted by content overlap alone, with no help from
+        # any shared number.
+        assert pair_similarity(HASHMAP_LONG, HASHMAP_LONG_PARA) > 0.80
+
+    def test_different_answers_sharing_one_number_are_not_paraphrases(self) -> None:
+        # Regression: Jaccard on singleton hard-token sets used to
+        # score these genuinely different answers as identical (1.0)
+        # because both carry the single hard token "30". A lone shared
+        # number is coincidence, not paraphrase evidence.
+        assert pair_similarity("Retry after 30 seconds", "Delete after 30 days") < 0.80
+
+    def test_synonym_rewrite_is_not_convicted_by_token_overlap(self) -> None:
+        # Documented limit (see docs/DIVERGE.md): token-level
+        # similarity cannot see a fluent synonym rewrite. "Employ a
+        # hash table indexed by user id" is the same answer as the
+        # hash-map text in different words, and it passes as diverse.
+        # This test pins the actual power of the check so the claim
+        # can never silently widen again.
         paraphrase = "Employ a hash table indexed by user id for O(1) lookup"
-        assert pair_similarity(HASHMAP, paraphrase) > 0.80
+        assert pair_similarity(HASHMAP, paraphrase) < 0.80
+        assert pair_similarity(CACHE, "Store results in Redis expiring after one minute") < 0.80
 
     def test_different_numbers_are_different_answers(self) -> None:
         assert pair_similarity("Retry after 30 seconds", "Retry after 300 seconds") < 0.80
@@ -107,8 +134,8 @@ class TestDiversity:
 
     def test_one_paraphrase_pair_fails_the_whole_set(self) -> None:
         candidates = [
-            Candidate(HASHMAP, 0.70),
-            Candidate("Use a hash map keyed by user id for O(1) lookups", 0.90),
+            Candidate(HASHMAP_LONG, 0.70),
+            Candidate(HASHMAP_LONG_PARA, 0.90),
             Candidate(SORT, 0.60),
             Candidate(TRIE, 0.80),
             Candidate(CACHE, 0.75),
@@ -116,15 +143,15 @@ class TestDiversity:
         diverge_set = build_diverge_set(PROMPT, candidates, 0, 0.20, stakes="high")
         report = analyze_diversity(diverge_set)
         assert not report.diverse
-        assert report.min_pair_diversity == 0.0
+        assert report.min_pair_diversity < 0.20
         assert report.modal_cluster == (0, 1)
         assert report.modal_share == 0.40
 
     def test_three_way_paraphrase_cluster_is_the_modal_cluster(self) -> None:
         candidates = [
-            Candidate(HASHMAP, 0.70),
-            Candidate("Use a hash map keyed by user id for O(1) lookups", 0.90),
-            Candidate("Use a hash map keyed by user ID for O(1) lookup", 0.60),
+            Candidate(HASHMAP_LONG, 0.70),
+            Candidate(HASHMAP_LONG_PARA, 0.90),
+            Candidate(HASHMAP_LONG_ID, 0.60),
             Candidate(TRIE, 0.80),
             Candidate(CACHE, 0.75),
         ]
@@ -132,6 +159,30 @@ class TestDiversity:
         report = analyze_diversity(diverge_set)
         assert report.modal_cluster == (0, 1, 2)
         assert report.modal_share == 0.60
+
+    def test_mean_similarity_names_the_most_distinctive_candidate(self) -> None:
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        assert len(report.mean_similarity_by_candidate) == 5
+        assert all(0.0 <= s <= 1.0 for s in report.mean_similarity_by_candidate)
+        # The cache answer shares no content token with any other
+        # candidate, so it is the least similar on average.
+        assert report.mean_similarity_by_candidate[4] == min(report.mean_similarity_by_candidate)
+
+    def test_a_report_from_another_set_is_refused(self) -> None:
+        _, first_set = _set()
+        _, second_set = _set(scores=(0.70, 0.90, 0.60, 0.80, 0.71))
+        first_report = analyze_diversity(first_set)
+        with pytest.raises(ValueError, match="different candidate set"):
+            check_p_conventional(second_set, first_report)
+        with pytest.raises(ValueError, match="different candidate set"):
+            select(second_set, first_report, check_p_conventional(first_set, first_report))
+
+    def test_a_self_contradictory_report_is_refused_at_construction(self) -> None:
+        _, diverge_set = _set()
+        report = analyze_diversity(diverge_set)
+        with pytest.raises(ValueError, match="contradicts the pair measurements"):
+            replace(report, diverse=False)
 
     def test_diversity_grade_is_the_weakest_link(self) -> None:
         _, diverge_set = _set()
@@ -158,9 +209,9 @@ class TestPConventional:
         # 0.60); declaring p 0.05 for the conventional answer understates
         # the measured convergence.
         candidates = [
-            Candidate(HASHMAP, 0.70),
-            Candidate("Use a hash map keyed by user id for O(1) lookups", 0.90),
-            Candidate("Use a hash map keyed by user ID for O(1) lookup", 0.60),
+            Candidate(HASHMAP_LONG, 0.70),
+            Candidate(HASHMAP_LONG_PARA, 0.90),
+            Candidate(HASHMAP_LONG_ID, 0.60),
             Candidate(TRIE, 0.80),
             Candidate(CACHE, 0.75),
         ]
@@ -169,11 +220,58 @@ class TestPConventional:
         check = check_p_conventional(diverge_set, report)
         assert check.verdict == "underconfident"
 
+    def test_conventional_minority_high_p_is_convicted(self) -> None:
+        # Three of five candidates converge on a RIVAL answer while the
+        # conventional answer is a singleton: declaring p 0.95 for the
+        # conventional answer must be overconfident, because the check
+        # runs on the conventional answer's own cluster (share 0.20),
+        # not the rival's modal share (0.60), which would have blessed it.
+        candidates = [
+            Candidate(HASHMAP_LONG, 0.70),
+            Candidate(HASHMAP_LONG_PARA, 0.90),
+            Candidate(HASHMAP_LONG_ID, 0.60),
+            Candidate(TRIE, 0.80),
+            Candidate(CACHE, 0.75),
+        ]
+        diverge_set = build_diverge_set(PROMPT, candidates, 4, 0.95, stakes="high")
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        assert check.conventional_share == 0.20
+        assert check.verdict == "overconfident"
+
+    def test_wide_interval_at_high_convergence_cannot_refute_any_p(self) -> None:
+        # At a conventional share of 0.60 the Wilson upper bound +
+        # tolerance reaches 1.00, so no declared p can be overconfident.
+        # The check must say so in its notes instead of pretending to
+        # have tested the claim.
+        candidates = [
+            Candidate(HASHMAP_LONG, 0.70),
+            Candidate(HASHMAP_LONG_PARA, 0.90),
+            Candidate(HASHMAP_LONG_ID, 0.60),
+            Candidate(TRIE, 0.80),
+            Candidate(CACHE, 0.75),
+        ]
+        diverge_set = build_diverge_set(PROMPT, candidates, 0, 1.0, stakes="high")
+        report = analyze_diversity(diverge_set)
+        check = check_p_conventional(diverge_set, report)
+        assert check.verdict == "consistent"
+        assert "cannot refute" in check.notes[0]
+
+    def test_p_check_summary_is_plain_language(self) -> None:
+        _, diverge_set = _set(p=0.95)
+        report = analyze_diversity(diverge_set)
+        over = check_p_conventional(diverge_set, report)
+        assert "0.95" in p_check_summary(over)
+        assert "re-diverge" in p_check_summary(over)
+        _, consistent_set = _set(p=0.60)
+        consistent = check_p_conventional(consistent_set, analyze_diversity(consistent_set))
+        assert "does not refute" in p_check_summary(consistent)
+
     def test_conventional_outside_the_modal_cluster_is_a_finding(self) -> None:
         candidates = [
-            Candidate(HASHMAP, 0.70),
-            Candidate("Use a hash map keyed by user id for O(1) lookups", 0.90),
-            Candidate("Use a hash map keyed by user ID for O(1) lookup", 0.60),
+            Candidate(HASHMAP_LONG, 0.70),
+            Candidate(HASHMAP_LONG_PARA, 0.90),
+            Candidate(HASHMAP_LONG_ID, 0.60),
             Candidate(TRIE, 0.80),
             Candidate(CACHE, 0.75),
         ]
@@ -190,7 +288,12 @@ class TestSelection:
         assert selection.outcome == "conventional_lost"
         assert selection.winner_index == 1
         assert "lost on score" in selection.reason
-        assert "margin 0.20" in selection.reason
+        # Margin is winner over runner-up (0.90 - 0.80); the gap to the
+        # conventional answer (0.90 - 0.70) is quoted separately.
+        assert "margin over the runner-up 0.10" in selection.reason
+        assert "gap 0.20" in selection.reason
+        assert selection.runner_up_score == 0.80
+        assert selection.margin == pytest.approx(0.10)
 
     def test_conventional_wins_and_the_reason_quotes_the_margin(self) -> None:
         _, diverge_set = _set(scores=(0.95, 0.90, 0.60, 0.80, 0.75))
@@ -200,6 +303,15 @@ class TestSelection:
         assert "margin +0.05" in won.reason
 
     def test_tie_breaks_toward_the_most_distinctive_answer(self) -> None:
+        # SORT and TRIE tie on top score (0.90). The old tie-break
+        # (smallest cluster) was dead code: every diverse set has
+        # all-singleton clusters, so it always reduced to lowest index.
+        # The real tie-break is lowest MEAN pairwise similarity: TRIE
+        # shares almost nothing with the other four (mean 0.02) while
+        # SORT shares more (mean 0.08), so TRIE wins the tie even
+        # though it is not the lowest index — and because the
+        # conventional candidate (SORT, index 1) is in the tie, the
+        # outcome is "tie", not a conventional win.
         candidates = [
             Candidate(HASHMAP, 0.70),
             Candidate(SORT, 0.90),
@@ -207,17 +319,30 @@ class TestSelection:
             Candidate(CACHE, 0.75),
             Candidate(SCAN, 0.60),
         ]
-        diverge_set = build_diverge_set(PROMPT, candidates, 2, 0.40, stakes="low")
+        diverge_set = build_diverge_set(PROMPT, candidates, 1, 0.40, stakes="low")
         report = analyze_diversity(diverge_set)
         tied = select(diverge_set, report, check_p_conventional(diverge_set, report))
         assert tied.outcome == "tie"
-        assert tied.winner_index == 1
+        assert tied.winner_index == 2
         assert "tie-break" in tied.reason
+
+    def test_a_forged_selection_is_refused_at_construction(self) -> None:
+        selection = _diverse_selection()
+        # A margin that is not winner-minus-runner-up.
+        with pytest.raises(ValueError, match="margin must equal"):
+            replace(selection, margin=0.20)
+        # An outcome that contradicts the scores (the conventional
+        # answer lost, it cannot be recorded as the winner).
+        with pytest.raises(ValueError, match="contradicts the scores"):
+            replace(selection, outcome="conventional_won")
+        # An index outside the candidate set.
+        with pytest.raises(ValueError, match="out of range"):
+            replace(selection, winner_index=5)
 
     def test_selection_refuses_a_paraphrase_set(self) -> None:
         candidates = [
-            Candidate(HASHMAP, 0.70),
-            Candidate("Use a hash map keyed by user id for O(1) lookups", 0.90),
+            Candidate(HASHMAP_LONG, 0.70),
+            Candidate(HASHMAP_LONG_PARA, 0.90),
             Candidate(SORT, 0.60),
             Candidate(TRIE, 0.80),
             Candidate(CACHE, 0.75),
@@ -244,6 +369,16 @@ class TestHighStakesGate:
         candidates, _ = _set()
         with pytest.raises(SingleSampleError, match="not sufficient"):
             build_diverge_set(PROMPT, candidates[:1], 0, 0.50, stakes="high")
+
+    def test_high_stakes_needs_exactly_five_by_policy(self) -> None:
+        # A policy that shrinks the count to 2 must not let a
+        # 2-candidate set through the high-stakes gate: the issue's
+        # contract is 5 candidates, on the library seam as well as
+        # the CLI.
+        policy = DivergePolicy(n_candidates=2)
+        candidates = [Candidate(HASHMAP, 0.70), Candidate(SORT, 0.90)]
+        with pytest.raises(SingleSampleError, match="exactly 5"):
+            build_diverge_set(PROMPT, candidates, 0, 0.50, stakes="high", policy=policy)
 
     def test_short_list_on_low_stakes_is_a_shape_error_not_a_sample_error(self) -> None:
         candidates, _ = _set()
@@ -479,6 +614,34 @@ class TestLoader:
         with pytest.raises(ValueError, match="finite"):
             build_diverge_set(PROMPT, candidates, 0, float("inf"), stakes="low")
 
+    def test_loader_refuses_a_non_finite_p_conventional(self) -> None:
+        # json.loads accepts NaN; the loader must refuse it itself
+        # rather than passing it downstream to the DivergeSet check.
+        with pytest.raises(ValueError, match="finite"):
+            candidates_from_json(
+                json.dumps(
+                    {
+                        "prompt": PROMPT,
+                        "candidates": [],
+                        "conventional_index": 0,
+                        "p_conventional": float("nan"),
+                    }
+                )
+            )
+
+    def test_loader_refuses_a_p_conventional_out_of_range(self) -> None:
+        with pytest.raises(ValueError, match="in \\[0, 1\\]"):
+            candidates_from_json(
+                json.dumps(
+                    {
+                        "prompt": PROMPT,
+                        "candidates": [],
+                        "conventional_index": 0,
+                        "p_conventional": 1.5,
+                    }
+                )
+            )
+
     def test_loader_refuses_a_bool_score(self) -> None:
         with pytest.raises(TypeError, match="must be a number"):
             candidates_from_json(
@@ -525,12 +688,15 @@ class TestCli:
     def test_cli_exits_2_on_a_paraphrase_set(self, tmp_path: Path) -> None:
         payload = self._payload()
         candidates = cast(list[dict[str, object]], payload["candidates"])
-        candidates[1] = {
-            "text": "Use a hash map keyed by user id for O(1) lookups",
-            "score": 0.90,
-        }
+        candidates[0] = {"text": HASHMAP_LONG, "score": 0.70}
+        candidates[1] = {"text": HASHMAP_LONG_PARA, "score": 0.90}
         infile = self._write(tmp_path, payload)
         assert cmd_diverge(["--candidates", infile]) == 2
+
+    def test_cli_exits_2_on_the_shipped_refusal_examples(self) -> None:
+        examples = Path(__file__).resolve().parent.parent / "examples"
+        assert cmd_diverge(["--candidates", str(examples / "diverge-paraphrase.json")]) == 2
+        assert cmd_diverge(["--candidates", str(examples / "diverge-overconfident.json")]) == 2
 
     def test_cli_exits_2_on_an_overconfident_p(self, tmp_path: Path) -> None:
         infile = self._write(tmp_path, self._payload(p=0.95))

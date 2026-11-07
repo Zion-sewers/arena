@@ -864,12 +864,13 @@ def cmd_diverge(args: list[str]) -> int:
     Reads a candidates file (--candidates file.json: prompt, 5
     candidates with scores, conventional_index, p_conventional, and
     optional stakes), scores the set for genuine diversity, checks the
-    declared p_conventional against the measured modal share, and
-    selects on score — recording why the conventional answer won or
-    lost. Exit 0 = a selection was made and it may decide on the
-    declared stakes; exit 2 = refused (paraphrase set, overconfident
-    p on high stakes, or too few candidates on high stakes);
-    exit 1 = unusable candidates file or policy.
+    declared p_conventional against the measured share of the
+    conventional answer's cluster, and selects on score — recording
+    why the conventional answer won or lost. Exit 0 = a selection was
+    made and it may decide on the declared stakes; exit 2 = refused
+    (paraphrase set, overconfident p on high stakes, or too few
+    candidates on high stakes); exit 1 = unusable candidates file or
+    policy.
     """
     from agenteval_bench.diverge import (
         DivergePolicy,
@@ -881,6 +882,7 @@ def cmd_diverge(args: list[str]) -> int:
         candidates_from_json,
         check_p_conventional,
         may_decide_high_stakes,
+        p_check_summary,
         require_high_stakes_decision,
         select,
     )
@@ -949,8 +951,10 @@ def cmd_diverge(args: list[str]) -> int:
         print(
             f"  p_conventional {p_check.declared_p:.2f} is {p_check.verdict} "
             f"(Wilson 95% [{p_check.agreement_interval[0]:.2f}, "
-            f"{p_check.agreement_interval[1]:.2f}] on the modal share)"
+            f"{p_check.agreement_interval[1]:.2f}] on the conventional "
+            f"answer's cluster share {p_check.conventional_share:.2f})"
         )
+        print(f"  -> {p_check_summary(p_check)}")
         for note in p_check.notes:
             print(f"  ! {note}")
         for pair in report.pairs:

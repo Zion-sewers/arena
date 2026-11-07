@@ -4,18 +4,23 @@ Runs the full /diverge protocol offline on recorded candidate sets
 plus one real CLI invocation on a temporary candidates file. Exit 0
 only if every acceptance expectation holds:
 - a genuinely diverse set selects on score, and the record says why
-  the conventional answer lost (highest score elsewhere, margin
-  quoted);
-- a paraphrase set (two candidates differing by one word, same
-  numbers) fails the diversity bar and selection is refused, never
-  silently made;
+  the conventional answer lost (highest score elsewhere, gap and
+  margin quoted);
+- a paraphrase set (two candidates differing by one word in a long
+  text, same numbers) fails the diversity bar on content overlap
+  alone and selection is refused, never silently made;
+- genuinely different answers that share one number ("Retry after 30
+  seconds" vs "Delete after 30 days") are NOT refused: a lone shared
+  number is coincidence, not paraphrase evidence;
 - an overconfident p_conventional (declared 0.95 while the candidates
-  converge on nothing — modal share 0.20) is convicted by the Wilson
-  interval and blocks the high-stakes gate;
+  converge on the conventional answer only 1 time in 5) is convicted
+  by the Wilson interval and blocks the high-stakes gate — including
+  when the conventional answer is a minority while a rival converges;
 - a single sample on high stakes is refused with SingleSampleError —
   one candidate is not a divergence;
 - a tie on top score breaks toward the most distinctive candidate
-  (smallest cluster), deterministically;
+  (lowest mean pairwise similarity), deterministically, even when it
+  is not the lowest index;
 - the conventional answer can also win: the record says so, with the
   margin over the runner-up;
 - the loader fails closed on an unknown key and on a missing score;
@@ -44,6 +49,7 @@ from agenteval_bench.diverge import (
     candidates_from_json,
     check_p_conventional,
     may_decide_high_stakes,
+    pair_similarity,
     require_high_stakes_decision,
     select,
 )
@@ -81,17 +87,29 @@ def main() -> int:
     selection = select(good, report, p_check)
     _expect(selection.outcome == "conventional_lost", "conventional answer lost")
     _expect(selection.winner_index == 1, "winner is the top scorer")
-    _expect("margin 0.20" in selection.reason, "reason quotes the margin")
+    _expect("gap 0.20" in selection.reason, "reason quotes the gap to the winner")
+    _expect(
+        "margin over the runner-up 0.10" in selection.reason,
+        "reason quotes the winner's margin",
+    )
     _expect("lost on score" in selection.reason, "reason names why it lost")
     _expect(may_decide_high_stakes(selection), "diverse + consistent p may decide")
     require_high_stakes_decision(selection)
 
-    # 2. The paraphrase trap: same answer twice, one word changed.
+    # 2. The paraphrase trap: same answer twice, one word changed in
+    # a long text — convicted by content overlap alone (0.83 > 0.80),
+    # with no help from any shared number.
     trap = build_diverge_set(
         PROMPT,
         [
-            Candidate("Use a hash map keyed by user id for O(1) lookup", 0.70),
-            Candidate("Use a hash map keyed by user id for O(1) lookups", 0.90),
+            Candidate(
+                "Use a hash map keyed by user id for O(1) lookup in the response cache",
+                0.70,
+            ),
+            Candidate(
+                "Use a hash map keyed by user id for O(1) lookups in the response cache",
+                0.90,
+            ),
             Candidate("Sort the list and binary search it in O(log n)", 0.60),
             Candidate("Build a trie over the names for prefix lookup", 0.80),
             Candidate("Cache results in Redis with a 60s TTL", 0.75),
@@ -103,8 +121,8 @@ def main() -> int:
     trap_report = analyze_diversity(trap)
     _expect(not trap_report.diverse, "a paraphrase pair fails the set")
     _expect(
-        trap_report.min_pair_diversity == 0.0,
-        "the paraphrase pair has zero diversity",
+        trap_report.min_pair_diversity < 0.20,
+        "the paraphrase pair has low diversity",
     )
     try:
         select(trap, trap_report, check_p_conventional(trap, trap_report))
@@ -113,11 +131,12 @@ def main() -> int:
     else:  # pragma: no cover - the refusal is the expectation
         raise AssertionError("select must refuse a paraphrase set")
 
-    # 3. The overconfident p: declared 0.95, modal share 0.20.
+    # 3. The overconfident p: declared 0.95, while the candidates
+    # converge on the conventional answer only 1 time in 5.
     over = build_diverge_set(PROMPT, _diverse_set(), 0, 0.95, stakes="high")
     over_report = analyze_diversity(over)
     over_check = check_p_conventional(over, over_report)
-    _expect(over_check.verdict == "overconfident", "p 0.95 is refuted by the modal share")
+    _expect(over_check.verdict == "overconfident", "p 0.95 is refuted by the convergence")
     over_selection = select(over, over_report, over_check)
     _expect(
         not may_decide_high_stakes(over_selection),
@@ -139,8 +158,11 @@ def main() -> int:
         raise AssertionError("one candidate must not build a high-stakes set")
 
     # 5. A tie on top score breaks toward the most distinctive answer.
-    # (The tie-break is unreachable on a paraphrase set — select()
-    # refuses those first — so the fixture is diverse by construction.)
+    # SORT and TRIE tie at 0.90; TRIE shares almost nothing with the
+    # other four (mean pairwise similarity 0.02 vs SORT's 0.08), so
+    # TRIE wins the tie even though it is not the lowest index. The
+    # conventional candidate (SORT, index 1) is in the tie, so the
+    # outcome is "tie".
     tied = build_diverge_set(
         PROMPT,
         [
@@ -150,7 +172,7 @@ def main() -> int:
             Candidate("Cache results in Redis with a 60s TTL", 0.75),
             Candidate("Scan the list linearly each time O(n)", 0.60),
         ],
-        2,
+        1,
         0.40,
         stakes="low",
     )
@@ -158,7 +180,10 @@ def main() -> int:
     _expect(tied_report.diverse, "the tie fixture is diverse")
     tied_selection = select(tied, tied_report, check_p_conventional(tied, tied_report))
     _expect(tied_selection.outcome == "tie", "top-score tie with the conventional in it")
-    _expect(tied_selection.winner_index == 1, "tie breaks to the lowest index")
+    _expect(
+        tied_selection.winner_index == 2,
+        "tie breaks to the most distinctive answer, not the lowest index",
+    )
     _expect("tie-break" in tied_selection.reason, "reason names the tie-break")
 
     # 6. The conventional answer can win: the record says so.
@@ -235,6 +260,69 @@ def main() -> int:
             "CLI report records the conventional loss",
         )
         _expect(written["report"]["diverse"] is True, "CLI report records diversity")
+
+    # 9. Genuinely different answers sharing one number are NOT
+    # refused: "Retry after 30 seconds" vs "Delete after 30 days"
+    # share only the lone number 30, which is coincidence, not
+    # paraphrase evidence.
+    _expect(
+        pair_similarity("Retry after 30 seconds", "Delete after 30 days") < 0.80,
+        "different answers sharing one number are not paraphrases",
+    )
+    numbered = build_diverge_set(
+        PROMPT,
+        [
+            Candidate("Retry after 30 seconds", 0.70),
+            Candidate("Delete after 30 days", 0.80),
+            Candidate("Sort the list and binary search it in O(log n)", 0.90),
+            Candidate("Build a trie over the names for prefix lookup", 0.60),
+            Candidate("Cache results in Redis with a 60s TTL", 0.75),
+        ],
+        0,
+        0.60,
+        stakes="high",
+    )
+    _expect(
+        analyze_diversity(numbered).diverse,
+        "a set with two answers sharing one number is diverse",
+    )
+
+    # 10. Conventional minority, high p: three candidates converge on
+    # a rival answer while the conventional answer (the cache) stands
+    # alone, and p 0.95 for it is overconfident — the check runs on
+    # the conventional answer's own cluster (share 0.20), not the
+    # rival's modal share.
+    minority = build_diverge_set(
+        PROMPT,
+        [
+            Candidate(
+                "Use a hash map keyed by user id for O(1) lookup in the response cache",
+                0.70,
+            ),
+            Candidate(
+                "Use a hash map keyed by user id for O(1) lookups in the response cache",
+                0.90,
+            ),
+            Candidate(
+                "Use a hash map keyed by user ID for O(1) lookup in the response cache",
+                0.60,
+            ),
+            Candidate("Build a trie over the names for prefix lookup", 0.80),
+            Candidate("Cache results in Redis with a 60s TTL", 0.75),
+        ],
+        4,
+        0.95,
+        stakes="high",
+    )
+    minority_check = check_p_conventional(minority, analyze_diversity(minority))
+    _expect(
+        minority_check.verdict == "overconfident",
+        "p 0.95 for a minority conventional answer is overconfident",
+    )
+    _expect(
+        not minority_check.conventional_in_modal,
+        "the minority conventional answer is outside the modal cluster",
+    )
 
     print("diverge demo: all drills passed")
     return 0
