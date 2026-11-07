@@ -18,6 +18,16 @@ from agenteval_bench.decision import (
 from agenteval_bench.engine import EvalRunner
 from agenteval_bench.models import EvalCase, EvalResult, EvalSuite, RunResult
 from agenteval_bench.scoring import DeterministicScorer
+from agenteval_bench.validity import (
+    MetricValidity,
+    ValidityGrade,
+    ValidityPolicy,
+    ValidityReport,
+    assess_decision,
+    assess_scorer,
+    default_validity_policy,
+    validate_proxy,
+)
 
 __all__ = [
     "CostEvidence",
@@ -31,12 +41,20 @@ __all__ = [
     "EvalResult",
     "EvalRunner",
     "EvalSuite",
+    "MetricValidity",
     "ProportionEvidence",
     "RiskLevel",
     "RiskThresholds",
     "RunResult",
     "UnmeasuredEvidence",
+    "ValidityGrade",
+    "ValidityPolicy",
+    "ValidityReport",
+    "assess_decision",
+    "assess_scorer",
     "decide",
     "default_policy",
+    "default_validity_policy",
     "policy_fingerprint",
+    "validate_proxy",
 ]

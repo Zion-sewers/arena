@@ -54,6 +54,9 @@ src/agenteval_bench/
   decision.py     # Decision system: evidence -> uncertainty -> threshold -> action
                   #   (Dimension/RiskLevel/DecisionAction, Wilson intervals, decide)
   decision_demo.py # Seeded end-to-end demo of the decision system
+  validity.py     # Measurement validity: every metric carries a reliability
+                  #   column (ValidityGrade, validate_proxy, ValidityReport)
+  validity_demo.py # Seeded end-to-end demo of measurement validity
   cli.py          # CLI entry point (run --suite --ci --threshold; decide --suite --policy)
 tests/            # pytest suite (engine + CLI gateway)
 examples/         # Golden replay suites (YAML)
@@ -68,6 +71,7 @@ docs/             # Specifications, archive, roadmap references
 | `EvalSuite.from_yaml`| Parse + validate YAML into typed `EvalSuite`/`EvalCase` models.       |
 | `DeterministicScorer`| Apply configured matchers; return `EvalResult` with details.          |
 | `EvalRunner`         | Iterate cases, invoke `agent_fn`, collect `EvalResult`s into `RunResult`. |
+| `ValidityReport`     | Validity assessment per metric; a metric without a note is UNASSESSED and untrusted. |
 | `cli.main`           | Parse argv, load suite, build replay `agent_fn`, print summary + gate. |
 
 ### 4.3 Data-flow diagram
@@ -225,6 +229,7 @@ print(result.summary())
 | Feature                | Status      | Est. milestone |
 |------------------------|-------------|----------------|
 | Deterministic scoring  | ✅ shipped  | v0.1.0         |
+| Measurement-validity column (`validity.py`) | ✅ shipped | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |

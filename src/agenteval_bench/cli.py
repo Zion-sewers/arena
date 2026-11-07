@@ -253,6 +253,7 @@ def cmd_decide(args: list[str]) -> int:
         UnmeasuredEvidence,
         policy_fingerprint,
     )
+    from agenteval_bench.validity import assess_decision
 
     args, suite_path = _flag(args, "--suite")
     args, policy_path = _flag(args, "--policy")
@@ -332,6 +333,11 @@ def cmd_decide(args: list[str]) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 3
     print(decision.summary())
+    # Every metric carries a measurement-reliability column (arena#43):
+    # this mode replays recorded outputs, so reliability is
+    # replay-agreement, graded UNVALIDATED_PROXY — never as live stability.
+    validity = assess_decision(decision, reliability_kind="replay")
+    print(validity.summary())
     print(
         "Note: reliability here is replay-agreement (recorded outputs "
         "re-scored across runs); it cannot detect live-agent flakiness."
@@ -345,6 +351,7 @@ def cmd_decide(args: list[str]) -> int:
             "seed": seed,
             "reliability_runs": reliability_runs,
             "policy_fingerprint": policy_fingerprint(policy),
+            "validity": validity.to_dict(),
             "dimensions": {},
         }
         for dimension, verdict in decision.verdicts.items():
