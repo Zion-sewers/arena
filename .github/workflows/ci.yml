@@ -55,3 +55,5 @@ jobs:
         run: PYTHONPATH=src python -m experiment.demo_prespec
       - name: Anti-mode-collapse demo (/diverge with 5 candidates + p_conventional; paraphrases refused, single sample refused)
         run: PYTHONPATH=src python -m agenteval_bench.diverge_demo
+      - name: Persona symmetry demo (declared contracts; violations fail the gate)
+        run: PYTHONPATH=src python -m agenteval_bench.symmetry_demo

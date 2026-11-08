@@ -58,6 +58,10 @@ src/agenteval_bench/
                   #   (VersionSpec/VersionEvidence, r = L/n, promote;
                   #   PROMOTE / HOLD / REJECT; accuracy-only promotion refused)
   promotion_demo.py # Seeded end-to-end demo of the promotion gate
+  symmetry.py     # Persona symmetry gate: declared symmetry contracts per
+                  #   persona (PersonaContract, check_symmetry;
+                  #   INVARIANT / EQUIVARIANT; violations fail the gate)
+  symmetry_demo.py # Seeded end-to-end demo of the symmetry gate
   validity.py     # Measurement validity: every metric carries a reliability
                   #   column (ValidityGrade, validate_proxy, ValidityReport)
   validity_demo.py # Seeded end-to-end demo of measurement validity
@@ -133,6 +137,7 @@ docs/             # Specifications, archive, roadmap references
 | `ReviewGateReport`   | Analysis pre-specification: 10-question gate over a finding vs its registered plan; CONFIRMED / EXPLORATORY_ONLY / REFUSED. |
 | `Selection`          | /diverge selection record: winner vs conventional scores, margin, closed outcome, reason from measured facts; only a token-level-diverse selection graded under the canonical policy with a non-overconfident p may decide on high stakes. |
 | `PromotionVerdict`   | Version promotion gate: PROMOTE only on measured log-evidence gain clearing the margin; accuracy gain never promotes; complexity reported as r = L/n. |
+| `SymmetryReport`   | Persona symmetry gate: each persona declares its symmetry contract (model substitution / whitespace / context order invariant, topic substitution equivariant); violations FAIL with the transformation named. |
 | `cli.main`           | Parse argv, load suite, build replay `agent_fn`, print summary + gate. |
 
 ### 4.3 Data-flow diagram
@@ -239,6 +244,7 @@ table:
 | `ship` | SHIP | NO_SHIP / NEEDS_REPLICATION | bad input | — |
 | `diverge` | selection made | bad input | refused (paraphrase set / overconfident p / single sample on high stakes) | — |
 | `register-design` | registered | — | bad input | — |
+| `symmetry` | all personas pass | violation | bad input | — |
 
 > The `compare` and `report` subcommands described in earlier drafts are **`planned`**
 > (see §9) and are **not** implemented in v0.1.0; invoking an unknown command exits `1`.
@@ -302,6 +308,7 @@ print(result.summary())
 | Analysis pre-specification (10-question review gate) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Anti-mode-collapse /diverge (5 candidates + p_conventional) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Evidence-gate version promotion (evidence gain, not accuracy; L/n reported) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
+| Persona symmetry gate (declared contracts per persona; violations fail the gate) | ✅ shipped (CLI + CI demo; live ritual sync-tested only) | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |

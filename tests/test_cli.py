@@ -331,3 +331,31 @@ def test_prespec_cli_non_object_doc_exit_2(monkeypatch, capsys, tmp_path, doc):
     assert code == 2, err
     assert "unusable plan" in err
     assert "Traceback" not in err
+
+
+def test_symmetry_cli_passes_all_personas(monkeypatch, capsys):
+    # arena#52: the symmetry gate runs over the canonical sample input
+    # and exits 0 with one PASS line per persona.
+    code, out, err = _run(["symmetry"], monkeypatch, capsys)
+    assert code == 0, err
+    assert "verdict: PASS (4/4 personas pass)" in out
+    for persona in ("builder", "critic", "guardian", "dreamer"):
+        assert f"persona {persona}: PASS" in out
+
+
+def test_symmetry_cli_writes_json_report(monkeypatch, capsys, tmp_path):
+    import json
+
+    report_path = tmp_path / "symmetry.json"
+    code, _out, err = _run(["symmetry", "--out", str(report_path)], monkeypatch, capsys)
+    assert code == 0, err
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["command"] == "symmetry"
+    assert payload["verdict"] == "PASS"
+    assert [p["persona"] for p in payload["personas"]] == [
+        "builder",
+        "critic",
+        "guardian",
+        "dreamer",
+    ]
+    assert all(p["violations"] == [] for p in payload["personas"])
