@@ -80,6 +80,14 @@ from agenteval_bench.judges import (
     registry_from_json,
 )
 from agenteval_bench.models import EvalCase, EvalResult, EvalSuite, RunResult
+from agenteval_bench.promotion import (
+    PromotionAction,
+    PromotionPolicy,
+    PromotionVerdict,
+    VersionEvidence,
+    VersionSpec,
+    promote,
+)
 from agenteval_bench.scoring import DeterministicScorer
 from agenteval_bench.validity import (
     MetricValidity,
@@ -127,6 +135,9 @@ __all__ = [
     "PCheckVerdict",
     "PConventionalCheck",
     "PairSimilarity",
+    "PromotionAction",
+    "PromotionPolicy",
+    "PromotionVerdict",
     "ProportionEvidence",
     "RankedLeaderboard",
     "RankingRefused",
@@ -143,6 +154,8 @@ __all__ = [
     "ValidityGrade",
     "ValidityPolicy",
     "ValidityReport",
+    "VersionEvidence",
+    "VersionSpec",
     "allocate",
     "analyze_diversity",
     "assess_decision",
@@ -169,6 +182,7 @@ __all__ = [
     "p_check_summary",
     "pair_similarity",
     "policy_fingerprint",
+    "promote",
     "registry_from_json",
     "render_ranked",
     "require_calibrated",

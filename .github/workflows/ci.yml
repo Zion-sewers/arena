@@ -39,6 +39,8 @@ jobs:
         run: PYTHONPATH=src python -m agenteval_bench.tracebench_demo < /dev/null
       - name: Decision-system demo (evidence -> uncertainty -> threshold -> action)
         run: PYTHONPATH=src python -m agenteval_bench.decision_demo
+      - name: Promotion-gate demo (evidence gain, not accuracy gain; L/n reported)
+        run: PYTHONPATH=src python -m agenteval_bench.promotion_demo
       - name: Measurement-validity demo (every metric carries a reliability column)
         run: PYTHONPATH=src python -m agenteval_bench.validity_demo
       - name: Judge-decorrelation demo (HOST != FAMILY; holes reported, never dropped)
