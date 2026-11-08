@@ -1294,6 +1294,63 @@ def cmd_register_analysis_plan(args: list[str]) -> int:
     return 0
 
 
+def cmd_symmetry(args: list[str]) -> int:
+    """Run the persona symmetry gate over all registered personas (arena#52).
+
+    Checks every persona's declared symmetries on the canonical sample
+    input and prints one line per check plus the verdict. Exit 0 = all
+    PASS; exit 1 = any violation (named); exit 2 = unusable input.
+    With --out <file.json>, writes a JSON report of the same verdicts.
+    """
+    from agenteval_bench.symmetry import (
+        SAMPLE_INPUT,
+        SymmetryVerdict,
+        check_all_personas,
+    )
+
+    args, out = _flag(args, "--out")
+    reports = check_all_personas(SAMPLE_INPUT)
+    lines = ["Persona symmetry gate (arena#52):"]
+    for report in reports:
+        lines.append(report.summary())
+    failed = [r for r in reports if r.verdict is SymmetryVerdict.FAIL]
+    lines.append(
+        f"verdict: {'PASS' if not failed else 'FAIL'} "
+        f"({len(reports) - len(failed)}/{len(reports)} personas pass)"
+    )
+    print("\n".join(lines))
+    if out:
+        payload = {
+            "tool": "agenteval-bench",
+            "command": "symmetry",
+            "verdict": "PASS" if not failed else "FAIL",
+            "personas": [
+                {
+                    "persona": report.persona.value,
+                    "verdict": report.verdict.value,
+                    "violations": [
+                        {
+                            "transformation": v.transformation.value,
+                            "kind": v.kind.value,
+                            "expected": v.expected,
+                            "actual": v.actual,
+                        }
+                        for v in report.violations
+                    ],
+                }
+                for report in reports
+            ],
+        }
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+        except OSError as e:
+            print(f"Error: cannot write report: {e}", file=sys.stderr)
+            return 2
+        print(f"Report: {out}")
+    return 0 if not failed else 1
+
+
 def cmd_replay(args: list[str]) -> int:
     """Verify a replay log is bit-exact: re-run and byte-compare."""
     args, log_path = _flag(args, "--log")
@@ -2287,6 +2344,9 @@ def main() -> None:
         print("       agenteval-bench register-analysis-plan --plan <file.json>")
         print("                                [--registry plans/analyses.jsonl]")
         print("                                (exit 0 registered, 2 bad input)")
+        print("       agenteval-bench symmetry [--out report.json]")
+        print("                                (exit 0 all personas pass,")
+        print("                                 1 violation, 2 bad input)")
         print("       agenteval-bench bugsmith --repo <dir> --out <dir> [--procedural 8]")
         print("                                [--seed 42] [--local] [--config curation.json]")
         print("                                [--pr-mirror patch:pr-ref]")
@@ -2342,6 +2402,8 @@ def main() -> None:
         sys.exit(cmd_prespec(rest))
     elif cmd == "register-analysis-plan":
         sys.exit(cmd_register_analysis_plan(rest))
+    elif cmd == "symmetry":
+        sys.exit(cmd_symmetry(rest))
     elif cmd == "bugsmith":
         sys.exit(cmd_bugsmith(rest))
     elif cmd == "snapshot":
