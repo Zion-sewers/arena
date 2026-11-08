@@ -171,15 +171,31 @@ PRESPEC_PLAN = {
 }
 
 
-def _prespec_files(tmp_path, hypothesis, accessed="2026-11-08T00:00:00+00:00"):
-    import json
+def _prespec_files(tmp_path, hypothesis, accessed=None):
+    """Build plan + finding + registry files for the prespec CLI tests.
 
-    from experiment import plan_from_dict, register_analysis_plan
+    ``accessed`` defaults to one hour after the plan's registration time:
+    the finding must claim data accessed after the plan was written (Q2),
+    and a hardcoded absolute timestamp is a time-bomb — it passes only
+    until the wall clock crosses it (arena#51 fix-forward: the
+    2026-11-08T00:00 default went red at midnight 2026-11-08). Callers
+    that need a specific access time pass it explicitly.
+    """
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from experiment import load_analysis_plan, plan_from_dict, register_analysis_plan
 
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(PRESPEC_PLAN), encoding="utf-8")
     registry = str(tmp_path / "analyses.jsonl")
     digest = register_analysis_plan(plan_from_dict(PRESPEC_PLAN), registry)
+    _, registered_at = load_analysis_plan(digest, registry)
+    if accessed is None:
+        parsed = datetime.fromisoformat(registered_at)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        accessed = (parsed + timedelta(hours=1)).isoformat()
     finding = {
         "plan_digest": digest,
         "mode": "confirmatory",
@@ -208,6 +224,32 @@ def test_prespec_cli_confirms(monkeypatch, capsys, tmp_path):
     assert code == 0, out
     assert "verdict: CONFIRMED" in out
     assert "[PASS] Q5" in out
+
+
+def test_prespec_cli_fixture_accessed_after_registration(monkeypatch, capsys, tmp_path):
+    """Pin for the 2026-11-08 time-bomb: the default fixture access time
+    must sit after the plan's registration time on every run, not just
+    until a hardcoded date is crossed. Reads both timestamps back from
+    the files the helper wrote, so a future hardcoded default fails here
+    instead of inside the CLI gate."""
+    import json
+    from datetime import datetime
+    from pathlib import Path
+
+    from experiment import load_analysis_plan
+
+    _, finding, registry = _prespec_files(
+        tmp_path,
+        "reranker v2 cuts hallucinated citations by at least 10pp vs v1",
+    )
+    finding_doc = json.loads(Path(finding).read_text(encoding="utf-8"))
+    _, registered_at = load_analysis_plan(finding_doc["plan_digest"], registry)
+    accessed = datetime.fromisoformat(finding_doc["data_accessed_at"])
+    registered = datetime.fromisoformat(registered_at)
+    assert accessed > registered, (
+        f"fixture data_accessed_at ({accessed}) must be after "
+        f"registered_at ({registered}) or Q2 refuses the finding"
+    )
 
 
 def test_prespec_cli_refuses_post_hoc(monkeypatch, capsys, tmp_path):
