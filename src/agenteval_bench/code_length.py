@@ -31,9 +31,16 @@ stated compressor — canonical JSON serialisation
 upper bound on the version's Kolmogorov complexity, not the complexity
 itself; the comparison is valid because every version is measured
 under the SAME compressor, so a shorter measured code is a genuinely
-more compressible version. A version measured under a different
-compressor is not comparable — the report carries no compressor field
-because there is only one, named here.
+more compressible version. The compressor is carried on the version
+itself (``ModelVersion.compressor``) and enforced equal across
+candidates in :func:`_require_versions` — a version measured under a
+different compressor is refused, not silently compared.
+
+One measurement caveat, stated plainly: JSON decimal encoding makes
+the measured length sensitive to float formatting, not only to weight
+values — two artifacts differing only in float precision can measure
+differently. Quantise or round weights before measuring when the
+comparison must be about the weights, not their print precision.
 
 Parameter count alone is NOT a complexity argument (acceptance
 criterion 3). It is enforced structurally, not by convention:
@@ -51,17 +58,30 @@ generalisation (held-out mean log-loss). Capacity growth without
 generalisation improvement stops training: over a patience window the
 meter returns STOP when capacity strictly grew while the best
 held-out log-loss in the window failed to beat the best before the
-window by more than ``min_improvement_bits``. The meter REPORTS; it
-never drives a training loop itself — the loop honours the STOP
-decision (the demo shows a loop that breaks on it). A STOP names the
-window, the capacity growth in bits, and both held-out bests, so the
-stop is auditable, not a bare flag.
+window by more than ``min_improvement_bits``. The meter REPORTS a
+STOP; it never drives a training loop itself, and no loop shipped in
+this repo stops on it — acceptance criterion 2 is delivered here as a
+STOP report plus a demo loop that honours it, not as a wired
+training-loop control (this is an evaluation tool, spec NG5). A STOP
+names the window, the capacity growth in bits, and both held-out
+bests, so the stop is auditable, not a bare flag. The reported
+generalisation gap is a diagnostic only; it does not enter the stop
+decision.
 
 Measurements are caller-measured, never invented here: held-out
 log-loss must come from held-out data scored under the version (a
 probabilistic judge/router output). There is no accuracy-derived
 shortcut — accuracy without probabilities has no log-loss, and this
-module refuses to invent one.
+module refuses to invent one. The worked path from a real artifact
+is :meth:`ModelVersion.from_artifact` (measures the bits itself and
+records the compressor) plus :func:`mean_log_loss_bits` (computes
+mean held-out log-loss from scored (probability, label) pairs); the
+raw-number constructor remains as an explicitly marked escape hatch
+for pre-measured versions. A two-part-code comparison is only
+defined on the SAME held-out set: candidates must share one
+``held_out_n`` (and one ``held_out_set`` id when given), enforced in
+:func:`_require_versions`, because totals over different n compare
+set size, not quality.
 """
 
 from __future__ import annotations
@@ -108,7 +128,11 @@ def measure_description_bits(artifact: Mapping[str, object]) -> int:
     """
     try:
         canonical = json.dumps(
-            artifact, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            artifact,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
         )
     except (TypeError, ValueError) as e:
         raise TypeError(
@@ -128,6 +152,13 @@ class ModelVersion:
     reads it (acceptance criterion 3: parameter count alone is not a
     complexity argument). A version with no measured held-out fit
     cannot be constructed: ``held_out_n`` >= 1 is enforced.
+    ``compressor`` names the compressor the description was measured
+    under; ``held_out_set`` names the held-out set the fit was scored
+    on. Both are enforced equal across candidates, so a comparison
+    can never silently mix compressors or held-out sets. Prefer
+    :meth:`from_artifact`, which measures the bits itself; the
+    raw-number constructor is the escape hatch for pre-measured
+    versions.
     """
 
     name: str
@@ -135,16 +166,27 @@ class ModelVersion:
     held_out_n: int
     held_out_mean_log_loss_bits: float
     parameter_count: int | None = None
+    compressor: str = COMPRESSOR
+    held_out_set: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("model version name must be non-empty")
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("model version name must be a non-empty str")
+        if isinstance(self.description_bits, bool) or not isinstance(self.description_bits, int):
+            raise TypeError(f"description_bits must be an int, got {self.description_bits!r}")
         if self.description_bits < 0:
-            raise ValueError(
-                f"description_bits must be >= 0, got {self.description_bits}"
-            )
+            raise ValueError(f"description_bits must be >= 0, got {self.description_bits}")
+        if isinstance(self.held_out_n, bool) or not isinstance(self.held_out_n, int):
+            raise TypeError(f"held_out_n must be an int, got {self.held_out_n!r}")
         if self.held_out_n < 1:
             raise ValueError(f"held_out_n must be >= 1, got {self.held_out_n}")
+        if isinstance(self.held_out_mean_log_loss_bits, bool) or not isinstance(
+            self.held_out_mean_log_loss_bits, (int, float)
+        ):
+            raise TypeError(
+                "held_out_mean_log_loss_bits must be a number, "
+                f"got {self.held_out_mean_log_loss_bits!r}"
+            )
         if not math.isfinite(self.held_out_mean_log_loss_bits):
             raise ValueError(
                 "held_out_mean_log_loss_bits must be finite, "
@@ -152,23 +194,92 @@ class ModelVersion:
             )
         if self.held_out_mean_log_loss_bits < 0:
             raise ValueError(
-                "held_out_mean_log_loss_bits must be >= 0, "
-                f"got {self.held_out_mean_log_loss_bits}"
+                f"held_out_mean_log_loss_bits must be >= 0, got {self.held_out_mean_log_loss_bits}"
+            )
+        if self.parameter_count is not None and (
+            isinstance(self.parameter_count, bool) or not isinstance(self.parameter_count, int)
+        ):
+            raise ValueError(
+                f"parameter_count must be an int or None, got {self.parameter_count!r}"
             )
         if self.parameter_count is not None and self.parameter_count < 0:
-            raise ValueError(
-                f"parameter_count must be >= 0, got {self.parameter_count}"
-            )
+            raise ValueError(f"parameter_count must be >= 0, got {self.parameter_count}")
+        if not isinstance(self.compressor, str) or not self.compressor:
+            raise ValueError("compressor must be a non-empty str")
+        if self.held_out_set is not None and (
+            not isinstance(self.held_out_set, str) or not self.held_out_set
+        ):
+            raise ValueError("held_out_set must be a non-empty str or None")
+
+    @classmethod
+    def from_artifact(
+        cls,
+        name: str,
+        artifact: Mapping[str, object],
+        held_out_n: int,
+        held_out_mean_log_loss_bits: float,
+        parameter_count: int | None = None,
+        held_out_set: str | None = None,
+    ) -> ModelVersion:
+        """Build a version by MEASURING its artifact, not trusting a number.
+
+        ``description_bits`` is derived by calling
+        :func:`measure_description_bits` on the artifact, and
+        ``compressor`` is recorded as the module's single compressor —
+        the measured path is the default, the raw-number constructor
+        is the escape hatch for pre-measured versions.
+        """
+        return cls(
+            name=name,
+            description_bits=measure_description_bits(artifact),
+            held_out_n=held_out_n,
+            held_out_mean_log_loss_bits=held_out_mean_log_loss_bits,
+            parameter_count=parameter_count,
+            compressor=COMPRESSOR,
+            held_out_set=held_out_set,
+        )
 
     @property
     def held_out_total_log_loss_bits(self) -> float:
         """Total held-out code length: mean log-loss times n, in bits."""
-        return self.held_out_mean_log_loss_bits * self.held_out_n
+        try:
+            return self.held_out_mean_log_loss_bits * self.held_out_n
+        except OverflowError as e:
+            raise ValueError(
+                f"held_out total log-loss overflows for held_out_n={self.held_out_n}"
+            ) from e
 
     @property
     def total_description_bits(self) -> float:
         """Two-part code length: model bits + data-given-model bits."""
         return self.description_bits + self.held_out_total_log_loss_bits
+
+
+def mean_log_loss_bits(pairs: Sequence[tuple[float, bool]]) -> float:
+    """Mean held-out log-loss in bits from scored (probability, label) pairs.
+
+    Each pair is (predicted probability of the positive label, whether
+    the label is positive). Probabilities must lie in (0, 1]; a 0 or
+    1-outside probability is refused, not clipped — clipping would
+    invent a finite loss for a prediction the model ruled out.
+    """
+    scored = tuple(pairs)
+    if not scored:
+        raise ValueError("mean log-loss needs at least one scored pair")
+    total = 0.0
+    for p, label in scored:
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            raise TypeError(f"predicted probability must be a number, got {p!r}")
+        if not 0.0 < p <= 1.0:
+            raise ValueError(f"predicted probability must lie in (0, 1], got {p}")
+        q = p if label else 1.0 - p
+        if q <= 0.0:
+            raise ValueError(
+                "a prediction of probability 1 for the wrong label "
+                "has infinite log-loss and is refused, not clipped"
+            )
+        total += -math.log2(q)
+    return total / len(scored)
 
 
 @dataclass(frozen=True)
@@ -182,8 +293,9 @@ class SelectionReport:
     the best-fitting version's, in total bits (0 when the winner is
     the best fit). ``equivalent`` holds the versions that counted as
     equal performance under the band; ``rule`` names which selection
-    rule ran. The rationale states the trade in one sentence so the
-    decision is auditable without re-running the selection.
+    rule ran. ``equivalence_band_bits`` is None for the pure rule,
+    which has no band. The rationale states the trade in one sentence
+    so the decision is auditable without re-running the selection.
     """
 
     winner: ModelVersion
@@ -192,7 +304,7 @@ class SelectionReport:
     best_fit: ModelVersion
     fit_deficit_bits: float
     code_saving_bits: float
-    equivalence_band_bits: float
+    equivalence_band_bits: float | None
     rule: str
 
     def __post_init__(self) -> None:
@@ -202,9 +314,18 @@ class SelectionReport:
             raise ValueError("the winner must be one of the candidates")
         if self.best_fit not in self.candidates:
             raise ValueError("the best fit must be one of the candidates")
+        if not set(self.equivalent) <= set(self.candidates):
+            raise ValueError("equivalent versions must be among the candidates")
         if self.fit_deficit_bits < 0:
+            raise ValueError(f"fit_deficit_bits must be >= 0, got {self.fit_deficit_bits}")
+        if self.code_saving_bits < 0:
+            raise ValueError(f"code_saving_bits must be >= 0, got {self.code_saving_bits}")
+        if self.equivalence_band_bits is not None and (
+            not math.isfinite(self.equivalence_band_bits) or self.equivalence_band_bits < 0
+        ):
             raise ValueError(
-                f"fit_deficit_bits must be >= 0, got {self.fit_deficit_bits}"
+                "equivalence_band_bits must be finite and >= 0 or None, "
+                f"got {self.equivalence_band_bits}"
             )
 
     @property
@@ -214,7 +335,7 @@ class SelectionReport:
             return (
                 f"{self.winner.name} wins: best fit "
                 f"({self.winner.held_out_mean_log_loss_bits:.4f} bits/item) and "
-                f"shortest total code "
+                f"shortest total code among the equivalent versions "
                 f"({self.winner.total_description_bits:.1f} bits)"
             )
         return (
@@ -227,10 +348,15 @@ class SelectionReport:
         )
 
     def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form of the selection."""
+        """JSON-serializable form of the selection.
+
+        Strict JSON: the pure rule has no band, so the field is None,
+        never infinity.
+        """
         return {
             "winner": self.winner.name,
             "rule": self.rule,
+            "compressor": self.winner.compressor,
             "equivalence_band_bits": self.equivalence_band_bits,
             "fit_deficit_bits": self.fit_deficit_bits,
             "code_saving_bits": self.code_saving_bits,
@@ -243,6 +369,8 @@ class SelectionReport:
                     "held_out_mean_log_loss_bits": v.held_out_mean_log_loss_bits,
                     "total_description_bits": v.total_description_bits,
                     "parameter_count": v.parameter_count,
+                    "compressor": v.compressor,
+                    "held_out_set": v.held_out_set,
                 }
                 for v in self.candidates
             ],
@@ -276,13 +404,33 @@ def _shortest_total(
 
 
 def _require_versions(versions: Sequence[ModelVersion]) -> tuple[ModelVersion, ...]:
-    """Validate a candidate list: non-empty, unique names."""
+    """Validate a candidate list: non-empty, unique names, one held-out set.
+
+    A two-part-code comparison is only defined on the same data, so
+    candidates must share one ``held_out_n`` and one ``held_out_set``
+    id (a version with no set id cannot be compared against one with
+    a named set), and one compressor — otherwise the totals compare
+    set size or compressor, not quality.
+    """
     ordered = tuple(versions)
     if not ordered:
         raise ValueError("selecting among no versions is not a selection")
     names = [v.name for v in ordered]
     if len(set(names)) != len(names):
         raise ValueError(f"version names must be unique, got {names}")
+    ns = {v.held_out_n for v in ordered}
+    if len(ns) != 1:
+        raise ValueError(
+            f"versions must share one held_out_n (same held-out set), got {sorted(ns)}"
+        )
+    compressors = {v.compressor for v in ordered}
+    if len(compressors) != 1:
+        raise ValueError(f"versions must share one compressor, got {sorted(compressors)}")
+    held_out_sets = {v.held_out_set for v in ordered}
+    if len(held_out_sets) != 1:
+        raise ValueError(
+            f"versions must share one held_out_set id, got {sorted(s or '' for s in held_out_sets)}"
+        )
     return ordered
 
 
@@ -307,8 +455,7 @@ def select_version(
     equivalent = tuple(
         v
         for v in ordered
-        if v.held_out_mean_log_loss_bits <= best.held_out_mean_log_loss_bits
-        + equivalence_band_bits
+        if v.held_out_mean_log_loss_bits <= best.held_out_mean_log_loss_bits + equivalence_band_bits
     )
     winner = _shortest_total(equivalent)
     return SelectionReport(
@@ -316,9 +463,8 @@ def select_version(
         candidates=ordered,
         equivalent=equivalent,
         best_fit=best,
-        fit_deficit_bits=winner.held_out_mean_log_loss_bits
-        - best.held_out_mean_log_loss_bits,
-        code_saving_bits=float(best.description_bits - winner.description_bits),
+        fit_deficit_bits=winner.held_out_mean_log_loss_bits - best.held_out_mean_log_loss_bits,
+        code_saving_bits=float(best.total_description_bits - winner.total_description_bits),
         equivalence_band_bits=equivalence_band_bits,
         rule="equal-performance code length",
     )
@@ -343,10 +489,9 @@ def select_by_total_length(
         candidates=ordered,
         equivalent=ordered,
         best_fit=best,
-        fit_deficit_bits=winner.held_out_mean_log_loss_bits
-        - best.held_out_mean_log_loss_bits,
-        code_saving_bits=float(best.description_bits - winner.description_bits),
-        equivalence_band_bits=float("inf"),
+        fit_deficit_bits=winner.held_out_mean_log_loss_bits - best.held_out_mean_log_loss_bits,
+        code_saving_bits=float(best.total_description_bits - winner.total_description_bits),
+        equivalence_band_bits=None,
         rule="minimum total description length",
     )
 
@@ -400,8 +545,9 @@ class CapacityVerdict:
     ``min_improvement_bits`` — capacity growth without generalisation
     improvement. ``capacity_growth_bits`` is the window's capacity
     growth (last minus first); ``max_generalization_gap_bits`` is the
-    widest train/held-out gap inside the window. The reason names the
-    window steps and both held-out bests, so the stop is auditable.
+    widest train/held-out gap inside the window, reported as a
+    diagnostic — it does not enter the stop decision. The reason names
+    the window steps and both held-out bests, so the stop is auditable.
     """
 
     decision: StopDecision

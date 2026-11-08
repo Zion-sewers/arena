@@ -78,12 +78,15 @@ src/agenteval_bench/
   code_length.py  # Model/version selection by code length; capacity meter
                   #   (ModelVersion, SelectionReport, select_version,
                   #   select_by_total_length, CapacityReading,
-                  #   CapacityVerdict, assess_capacity; two-part code
-                  #   length = measured description bits under one fixed
-                  #   compressor + held-out log-loss; parameter count is
-                  #   diagnostic only, never a complexity argument; the
-                  #   meter stops training on capacity growth without
-                  #   generalisation improvement over a patience window)
+                  #   CapacityVerdict, assess_capacity, mean_log_loss_bits;
+                  #   two-part code length = measured description bits under
+                  #   one fixed compressor + held-out log-loss, candidates
+                  #   enforced to share one held-out n, one held-out set,
+                  #   and one compressor; parameter count is diagnostic
+                  #   only, never a complexity argument; the meter REPORTS
+                  #   stop on capacity growth without generalisation
+                  #   improvement over a patience window — a STOP report
+                  #   only, no shipped loop stops on it)
   code_length_demo.py # Seeded end-to-end demo of code-length selection
                   #   and the capacity meter
   diverge.py      # Anti-mode-collapse: /diverge with 5 candidates +
@@ -255,8 +258,8 @@ table:
 from agenteval_bench import EvalSuite, EvalRunner, DeterministicScorer
 
 suite = EvalSuite.from_yaml("eval.yaml")
-runner = EvalRunner()                       # or EvalRunner(DeterministicScorer())
-result = runner.run(suite, agent_fn=lambda q: "...")   # Callable[[str], str]
+runner = EvalRunner()  # or EvalRunner(DeterministicScorer())
+result = runner.run(suite, agent_fn=lambda q: "...")  # Callable[[str], str]
 print(result.summary())
 ```
 

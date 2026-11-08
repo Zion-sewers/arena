@@ -22,16 +22,23 @@ refusing them:
 5. The measurement itself: key order cannot change a description
    length, and a repetitive artifact measures shorter than a random
    one of the same size.
+6. The worked path: versions built from real recorded artifacts in
+   examples/ via ModelVersion.from_artifact, with held-out log-loss
+   computed from scored pairs — no hand-supplied bit counts.
 """
 
 from __future__ import annotations
 
+import json
 import random
+from pathlib import Path
 
 from agenteval_bench.code_length import (
+    COMPRESSOR,
     CapacityReading,
     ModelVersion,
     assess_capacity,
+    mean_log_loss_bits,
     measure_description_bits,
     select_by_total_length,
     select_version,
@@ -59,7 +66,10 @@ def main() -> int:
 
     # 1. Parameter count is not complexity: same entry count, and the
     # 10M-parameter version's artifact compresses ~100x shorter than
-    # the 100k-parameter version's, because its rules repeat.
+    # the 100k-parameter version's, because its rules repeat. The
+    # parameter counts are ILLUSTRATIVE labels for the trap (the
+    # artifacts themselves hold 10k entries each); the selection never
+    # reads them, and the measured bits are what decides.
     rng = random.Random(7)
     big_repeated = _repeated_routing_table(10_000)
     small_random = _random_weights(rng, 10_000)
@@ -124,7 +134,7 @@ def main() -> int:
         abs(report.fit_deficit_bits - 0.005) < 1e-9,
         f"the report names the 0.005 bits/item deficit ({report.fit_deficit_bits})",
     )
-    _expect(report.code_saving_bits == 7800.0, "the report names the 7800 saved bits")
+    _expect(report.code_saving_bits == 7797.5, "the report names the 7797.5 saved bits")
     print(f"        {report.rationale}")
 
     # 3. The two rules differ exactly where the trade is large.
@@ -132,7 +142,7 @@ def main() -> int:
     _expect(
         mdl.winner.name == "judge-tiny-code",
         "unbanded, the tiny code wins: it costs 500 x 0.055 = 27.5 bits "
-        "of fit and saves 1100 code bits, total 325 vs 1400",
+        "of fit and saves 1075 total bits, total 325 vs 1400",
     )
     _expect(
         report.winner.name != mdl.winner.name,
@@ -146,24 +156,42 @@ def main() -> int:
     # still be continuing (improvement 0.40 -> 0.38 beats the bar);
     # by step 5 the window 3-5 shows growth with no improvement.
     readings = [
-        CapacityReading(step=0, capacity_bits=1000,
-                        held_out_mean_log_loss_bits=0.40,
-                        train_mean_log_loss_bits=0.38),
-        CapacityReading(step=1, capacity_bits=1100,
-                        held_out_mean_log_loss_bits=0.39,
-                        train_mean_log_loss_bits=0.36),
-        CapacityReading(step=2, capacity_bits=1200,
-                        held_out_mean_log_loss_bits=0.38,
-                        train_mean_log_loss_bits=0.34),
-        CapacityReading(step=3, capacity_bits=1300,
-                        held_out_mean_log_loss_bits=0.38,
-                        train_mean_log_loss_bits=0.32),
-        CapacityReading(step=4, capacity_bits=1400,
-                        held_out_mean_log_loss_bits=0.38,
-                        train_mean_log_loss_bits=0.30),
-        CapacityReading(step=5, capacity_bits=1500,
-                        held_out_mean_log_loss_bits=0.38,
-                        train_mean_log_loss_bits=0.28),
+        CapacityReading(
+            step=0,
+            capacity_bits=1000,
+            held_out_mean_log_loss_bits=0.40,
+            train_mean_log_loss_bits=0.38,
+        ),
+        CapacityReading(
+            step=1,
+            capacity_bits=1100,
+            held_out_mean_log_loss_bits=0.39,
+            train_mean_log_loss_bits=0.36,
+        ),
+        CapacityReading(
+            step=2,
+            capacity_bits=1200,
+            held_out_mean_log_loss_bits=0.38,
+            train_mean_log_loss_bits=0.34,
+        ),
+        CapacityReading(
+            step=3,
+            capacity_bits=1300,
+            held_out_mean_log_loss_bits=0.38,
+            train_mean_log_loss_bits=0.32,
+        ),
+        CapacityReading(
+            step=4,
+            capacity_bits=1400,
+            held_out_mean_log_loss_bits=0.38,
+            train_mean_log_loss_bits=0.30,
+        ),
+        CapacityReading(
+            step=5,
+            capacity_bits=1500,
+            held_out_mean_log_loss_bits=0.38,
+            train_mean_log_loss_bits=0.28,
+        ),
     ]
     stopped_at: int | None = None
     for i in range(1, len(readings) + 1):
@@ -182,9 +210,12 @@ def main() -> int:
 
     # 4b. Counter-case: held-out still improving, capacity growth is fine.
     improving = [
-        CapacityReading(step=s, capacity_bits=1000 + 100 * s,
-                        held_out_mean_log_loss_bits=0.40 - 0.02 * s,
-                        train_mean_log_loss_bits=0.38 - 0.02 * s)
+        CapacityReading(
+            step=s,
+            capacity_bits=1000 + 100 * s,
+            held_out_mean_log_loss_bits=0.40 - 0.02 * s,
+            train_mean_log_loss_bits=0.38 - 0.02 * s,
+        )
         for s in range(6)
     ]
     verdict = assess_capacity(improving)
@@ -203,6 +234,61 @@ def main() -> int:
         measure_description_bits(repeated) < measure_description_bits(randomish),
         "a repetitive artifact measures shorter than a random one",
     )
+
+    # 6. The worked path from real artifacts: two recorded repo
+    # artifacts are measured by the module itself (from_artifact),
+    # their held-out log-loss is computed from scored pairs, and the
+    # selection runs on those measured numbers — no hand-supplied bit
+    # counts anywhere. The report round-trips through strict JSON.
+    examples_dir = Path(__file__).resolve().parents[2] / "examples"
+    scored = [(0.9, True), (0.8, True), (0.7, False), (0.6, True), (0.95, True)]
+    fit = mean_log_loss_bits(scored)
+    registry_version = ModelVersion.from_artifact(
+        "judges-registry",
+        json.loads((examples_dir / "judges-registry.json").read_text()),
+        held_out_n=len(scored),
+        held_out_mean_log_loss_bits=fit,
+        held_out_set="demo-held-out",
+    )
+    calibration_version = ModelVersion.from_artifact(
+        "calibration-observations",
+        json.loads((examples_dir / "calibration-observations.json").read_text()),
+        held_out_n=len(scored),
+        held_out_mean_log_loss_bits=fit,
+        held_out_set="demo-held-out",
+    )
+    _expect(
+        registry_version.description_bits
+        == measure_description_bits(
+            json.loads((examples_dir / "judges-registry.json").read_text())
+        ),
+        "from_artifact measures the recorded artifact itself",
+    )
+    _expect(
+        registry_version.compressor == COMPRESSOR,
+        "from_artifact records the compressor it measured under",
+    )
+    measured_report = select_version([registry_version, calibration_version])
+    expected_winner = min(
+        [registry_version, calibration_version],
+        key=lambda v: v.total_description_bits,
+    )
+    _expect(
+        measured_report.winner.name == expected_winner.name,
+        "selection over measured artifacts picks the shorter total code",
+    )
+    strict_json = json.dumps(measured_report.to_dict(), allow_nan=False)
+    _expect(
+        json.loads(strict_json)["winner"] == expected_winner.name,
+        "the report round-trips through strict JSON",
+    )
+    unbanded = select_by_total_length([registry_version, calibration_version])
+    _expect(
+        unbanded.equivalence_band_bits is None,
+        "the pure rule reports no band, never infinity",
+    )
+    json.dumps(unbanded.to_dict(), allow_nan=False)
+    print("  ok    the unbanded report round-trips through strict JSON")
 
     print("demo checks passed: code length selects, capacity stops, measurement honest")
     return 0
