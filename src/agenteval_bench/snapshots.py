@@ -236,6 +236,14 @@ def _case_to_dict(case: EvalCase) -> dict[str, Any]:
         ],
         "skip": case.skip,
         "output": case.output,
+        # Triple-regime replay evidence (arena#53): the recorded
+        # outputs and inputs under the perturbed regimes. A suite
+        # that passes through snapshots must keep them, or re-grading
+        # it yields UNMEASURED with no error saying why.
+        "output_light": case.output_light,
+        "output_adversarial": case.output_adversarial,
+        "input_light": case.input_light,
+        "input_adversarial": case.input_adversarial,
     }
 
 
@@ -321,6 +329,17 @@ def _case_from_dict(d: dict[str, Any]) -> EvalCase:
     output = d.get("output")
     if output is not None and not isinstance(output, str):
         raise SnapshotCorrupted("case: output must be a string or null")
+    triple: dict[str, str | None] = {}
+    for key in (
+        "output_light",
+        "output_adversarial",
+        "input_light",
+        "input_adversarial",
+    ):
+        value = d.get(key)
+        if value is not None and not isinstance(value, str):
+            raise SnapshotCorrupted(f"case: {key} must be a string or null")
+        triple[key] = value
     return EvalCase(
         id=case_id,
         input=text,
@@ -328,6 +347,10 @@ def _case_from_dict(d: dict[str, Any]) -> EvalCase:
         rubric=rubric,
         skip=skip,
         output=output,
+        output_light=triple["output_light"],
+        output_adversarial=triple["output_adversarial"],
+        input_light=triple["input_light"],
+        input_adversarial=triple["input_adversarial"],
     )
 
 

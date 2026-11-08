@@ -50,6 +50,24 @@ class EvalCase:
     skip: bool = False
     # Recorded agent output, for replay suites scored in CI without a live agent.
     output: str | None = None
+    # Recorded agent outputs under the perturbed regimes (arena#53):
+    # output_light is the agent's answer to the lightly-perturbed input,
+    # output_adversarial to the fully-adversarial input. The triple-regime
+    # replay runner scores all three; a missing recording makes that
+    # regime unmeasured, never silently dropped.
+    output_light: str | None = None
+    output_adversarial: str | None = None
+    # Recorded perturbed inputs the recordings answer (arena#53):
+    # input_light is the lightly-perturbed input the agent ran on,
+    # input_adversarial the fully-adversarial one. The replay runner
+    # verifies each recorded input equals perturb_input() for the
+    # seed before scoring; a missing recorded input leaves that
+    # regime UNMEASURED, and a mismatched one is refused outright.
+    # New fields sit between output_adversarial and dimension: every
+    # in-repo EvalCase construction uses keyword arguments (verified),
+    # so no positional caller can silently mis-bind them.
+    input_light: str | None = None
+    input_adversarial: str | None = None
     # Which decision dimension this case measures ("quality" or "safety").
     # Reliability is a cross-run property and cost comes from a per-case
     # cost function, so neither is a case tag (see CASE_DIMENSIONS).
@@ -145,6 +163,10 @@ class EvalSuite:
                     rubric=rubric,
                     skip=case_data.get("skip", False),
                     output=case_data.get("output"),
+                    output_light=case_data.get("output_light"),
+                    output_adversarial=case_data.get("output_adversarial"),
+                    input_light=case_data.get("input_light"),
+                    input_adversarial=case_data.get("input_adversarial"),
                     dimension=_parse_dimension(case_data),
                     cost=_parse_cost(case_data),
                 )
