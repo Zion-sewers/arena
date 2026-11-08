@@ -367,7 +367,11 @@ def main() -> int:
     rebuilt = ledger_from_dicts(payloads)
     _expect(
         audit_ledger(rebuilt).flagged
-        == ["calibration_gap", "perturbation_stability"],
+        == [
+            "alt_conservative_score",
+            "calibration_gap",
+            "perturbation_stability",
+        ],
         "fail-closed parser rebuilds the shipped ledger bit-for-bit",
     )
     _expect(
