@@ -4,22 +4,32 @@ Runs the full ledger pipeline offline on the shipped registry. Exit 0
 only if every acceptance expectation holds:
 - every shipped metric lists at least one assumption, each with a
   falsifier;
-- the shipped ledger audits clean, and every per-command metric set
-  audits clean when fed to audit_report;
-- audit_report flags a reported metric with no ledger entry;
+- the shipped ledger audit flags exactly the two honestly-unbacked
+  soft metrics (calibration_gap, perturbation_stability) and nothing
+  else: every other soft metric is backed by a HARD metric that is
+  independently measured;
+- kind is coerced and validated at construction: a plain "soft"
+  string becomes SOFT, a garbage kind raises, and a hand-built spec
+  can never slip a non-Enum kind past the audit as clean;
+- audit_measured audits only what the report measured: a soft metric
+  whose backup was not measured in this report is flagged, and a
+  metric the report did not print is never audited;
+- audit_report flags a reported metric with no ledger entry, and
+  refuses a bare string;
 - an assumption-free metric is refused at construction, and a
   whitespace-only assumption, name, or phenomenon is refused too;
 - a list passed as assumptions is copied: mutating the source list
   leaves the frozen spec unchanged;
-- a soft metric without a hard backup is refused at construction;
+- a soft metric without a hard backup constructs and is flagged by
+  the audit (the honest unbacked filing), never silently clean;
 - the audit flags a soft metric whose backup names a missing metric,
   and one whose backup names a SOFT metric;
-- the two circular backups from the first round are gone:
-  scorer_validity is backed by label_agreement (ground-truth
-  validation, not the scorer's own output) and calibration_gap by
-  agreement_rate (its own measured component);
+- the circular backups from the first rounds are gone: the gap and
+  the stability drop are filed UNBACKED, and the matcher proxies are
+  backed by label_agreement (ground-truth validation, not the
+  scorer's own output);
 - the fail-closed parser rebuilds the shipped ledger bit-for-bit and
-  refuses a soft spec with no backup and a spec with unknown keys;
+  refuses a spec with unknown keys;
 - the audit summary prints the assumption texts, and to_dict carries
   the full specs;
 - an empty audit is not clean, and require_ledger_ok raises on a
@@ -34,12 +44,12 @@ import sys
 
 from agenteval_bench.metric_ledger import (
     METRIC_LEDGER,
-    REPORT_METRIC_SETS,
     LedgerStatus,
     MetricAssumption,
     MetricKind,
     MetricSpec,
     audit_ledger,
+    audit_measured,
     audit_report,
     ledger_from_dicts,
     require_ledger_ok,
@@ -68,8 +78,11 @@ def main() -> int:
                 bool(assumption.text) and bool(assumption.falsifier),
                 f"{name} assumption carries a falsifier",
             )
-    _expect(audit.all_ok, "shipped ledger audits clean")
-    _expect(audit.flagged == [], "no shipped metric is flagged")
+    _expect(
+        audit.flagged == ["calibration_gap", "perturbation_stability"],
+        "shipped ledger flags exactly the two honestly-unbacked soft "
+        "metrics, nothing else",
+    )
     kinds = {spec.kind for spec in METRIC_LEDGER.values()}
     _expect(
         kinds == {MetricKind.HARD, MetricKind.SOFT},
@@ -78,27 +91,60 @@ def main() -> int:
     for name, spec in METRIC_LEDGER.items():
         if spec.kind is MetricKind.SOFT:
             backup = spec.hard_backup
-            _expect(
-                backup is not None
-                and METRIC_LEDGER[backup].kind is MetricKind.HARD,
-                f"soft {name} is backed by hard {backup}",
-            )
+            if backup is None:
+                _expect(
+                    name in audit.flagged,
+                    f"unbacked soft {name} is flagged by the audit",
+                )
+            else:
+                _expect(
+                    METRIC_LEDGER[backup].kind is MetricKind.HARD,
+                    f"soft {name} is backed by hard {backup}",
+                )
     _expect(
-        METRIC_LEDGER["scorer_validity"].hard_backup == "label_agreement",
-        "scorer_validity is backed by ground-truth label agreement, "
+        METRIC_LEDGER["calibration_gap"].hard_backup is None,
+        "calibration_gap is filed UNBACKED: the gap is computed from "
+        "the agreement rate itself, so it cannot check itself",
+    )
+    _expect(
+        METRIC_LEDGER["perturbation_stability"].hard_backup is None,
+        "perturbation_stability is filed UNBACKED: the drops are "
+        "differences of the pass rates themselves",
+    )
+    _expect(
+        METRIC_LEDGER["contains"].hard_backup == "label_agreement"
+        and METRIC_LEDGER["regex"].hard_backup == "label_agreement"
+        and METRIC_LEDGER["json_schema"].hard_backup == "label_agreement",
+        "the soft matchers are backed by ground-truth label agreement, "
         "not the scorer's own output",
     )
     _expect(
-        METRIC_LEDGER["calibration_gap"].hard_backup == "agreement_rate",
-        "calibration_gap is backed by its own measured agreement rate",
+        METRIC_LEDGER["p_conventional"].hard_backup == "conventional_share",
+        "p_conventional is backed by the measured cluster share",
     )
-    for command, metric_set in REPORT_METRIC_SETS.items():
-        report_audit = audit_report(metric_set)
-        _expect(
-            report_audit.all_ok,
-            f"the {command} report's metric set audits clean "
-            f"({len(metric_set)} metrics)",
-        )
+    # Live derivation: the audit covers only what the report measured.
+    run_audit = audit_measured({"pass_rate": True})
+    _expect(
+        run_audit.all_ok and [f.metric for f in run_audit.findings] == ["pass_rate"],
+        "run without labels audits pass_rate only — never a metric "
+        "the report never showed",
+    )
+    labels_audit = audit_measured(
+        {"pass_rate": True, "label_agreement": True, "contains": True}
+    )
+    _expect(
+        labels_audit.all_ok,
+        "run with validity labels audits the measured matcher and its "
+        "backup clean",
+    )
+    unmeasured_backup = audit_measured({"contains": True})
+    _expect(
+        unmeasured_backup.flagged == ["contains"]
+        and unmeasured_backup.findings[0].status
+        is LedgerStatus.FLAGGED_NO_BACKUP,
+        "a soft metric whose backup was not measured in this report "
+        "is flagged, even though the registry names one",
+    )
     summary = audit.summary()
     for name in METRIC_LEDGER:
         _expect(name in summary, f"audit summary names {name}")
@@ -119,6 +165,36 @@ def main() -> int:
         "audit_report flags a reported metric with no ledger entry",
     )
     _expect(not ghost.all_ok, "a flagged report audit is not clean")
+    try:
+        audit_report("pass_rate")  # type: ignore[arg-type]
+    except TypeError:
+        _expect(True, "audit_report refuses a bare string")
+    else:
+        raise AssertionError("audit_report audited a bare string's characters")
+
+    # Kind is coerced and validated at construction (round-2 B1).
+    plain = MetricSpec(
+        name="vibes",
+        kind="soft",  # type: ignore[arg-type]
+        phenomenon="how good it felt",
+        assumptions=(MetricAssumption(text="it felt good", falsifier="it felt bad"),),
+    )
+    _expect(plain.kind is MetricKind.SOFT, 'plain "soft" string coerces to SOFT')
+    _expect(
+        audit_measured({"vibes": True}, ledger={"vibes": plain}).flagged == ["vibes"],
+        "a coerced soft metric with no backup audits flagged, never clean",
+    )
+    try:
+        MetricSpec(
+            name="vibes",
+            kind="banana",  # type: ignore[arg-type]
+            phenomenon="how good it felt",
+            assumptions=(MetricAssumption(text="t", falsifier="f"),),
+        )
+    except ValueError:
+        _expect(True, "a garbage kind raises at construction")
+    else:
+        raise AssertionError("a garbage kind constructed")
 
     try:
         MetricSpec(
@@ -165,19 +241,23 @@ def main() -> int:
     )
     _expect(isinstance(spec.assumptions, tuple), "assumptions stored as tuple")
 
-    try:
-        MetricSpec(
-            name="vibes",
-            kind=MetricKind.SOFT,
-            phenomenon="how good it felt",
-            assumptions=(
-                MetricAssumption(text="it felt good", falsifier="it felt bad"),
-            ),
-        )
-    except ValueError as exc:
-        _expect("hard backup" in str(exc), "soft without backup refused")
-    else:
-        raise AssertionError("soft metric without backup was accepted")
+    unbacked = MetricSpec(
+        name="vibes",
+        kind=MetricKind.SOFT,
+        phenomenon="how good it felt",
+        assumptions=(
+            MetricAssumption(text="it felt good", falsifier="it felt bad"),
+        ),
+    )
+    _expect(
+        unbacked.hard_backup is None,
+        "soft without backup constructs (the honest unbacked filing)",
+    )
+    _expect(
+        audit_measured({"vibes": True}, ledger={"vibes": unbacked}).flagged
+        == ["vibes"],
+        "soft without backup audits flagged, never silently clean",
+    )
 
     ghost_backup = audit_ledger(
         {
@@ -242,26 +322,26 @@ def main() -> int:
     ]
     rebuilt = ledger_from_dicts(payloads)
     _expect(
-        audit_ledger(rebuilt).all_ok,
-        "fail-closed parser rebuilds the shipped ledger",
+        audit_ledger(rebuilt).flagged
+        == ["calibration_gap", "perturbation_stability"],
+        "fail-closed parser rebuilds the shipped ledger bit-for-bit",
     )
     _expect(
         spec_from_dict(payloads[0]) == METRIC_LEDGER[payloads[0]["name"]],
         "parser round-trips one shipped spec",
     )
-    try:
-        spec_from_dict(
-            {
-                "name": "vibes",
-                "kind": "soft",
-                "phenomenon": "how good it felt",
-                "assumptions": [{"text": "t", "falsifier": "f"}],
-            }
-        )
-    except ValueError as exc:
-        _expect("hard backup" in str(exc), "parser refuses soft without backup")
-    else:
-        raise AssertionError("parser accepted a soft spec with no backup")
+    parsed_unbacked = spec_from_dict(
+        {
+            "name": "vibes",
+            "kind": "soft",
+            "phenomenon": "how good it felt",
+            "assumptions": [{"text": "t", "falsifier": "f"}],
+        }
+    )
+    _expect(
+        parsed_unbacked.hard_backup is None,
+        "parser accepts a soft spec with no backup (audit flags it)",
+    )
     try:
         spec_from_dict(
             {

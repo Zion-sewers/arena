@@ -2,11 +2,14 @@
 
 Adversarial cases: assumption-free and whitespace-only specs refused
 at construction, at parsing, and at audit; a mutable source list
-cannot mutate a frozen spec; soft metrics without a backup, with a
-missing backup, or with a SOFT backup refused at build and flagged at
-audit; a reported metric with no ledger entry flagged by audit_report;
-a hand-built ledger with a mis-filed spec flagged; duplicate names
-refused; an empty audit is not clean.
+cannot mutate a frozen spec; a garbage kind is refused and a plain
+"soft" string coerces (round-2 B1: no fail-open kind); soft metrics
+without a backup, with a missing backup, or with a SOFT backup are
+flagged at audit (an unbacked soft metric is the honest filing, not a
+refusal); a soft metric whose backup was not measured in this report
+is flagged; a reported metric with no ledger entry flagged by
+audit_report; a hand-built ledger with a mis-filed spec flagged;
+duplicate names refused; an empty audit is not clean.
 """
 
 from __future__ import annotations
@@ -15,13 +18,13 @@ import pytest
 
 from agenteval_bench.metric_ledger import (
     METRIC_LEDGER,
-    REPORT_METRIC_SETS,
     LedgerAudit,
     LedgerStatus,
     MetricAssumption,
     MetricKind,
     MetricSpec,
     audit_ledger,
+    audit_measured,
     audit_report,
     ledger_from_dicts,
     require_ledger_ok,
@@ -128,14 +131,88 @@ class TestAssumptionFreeRefused:
 
 
 class TestSoftNeedsHardBackup:
-    def test_soft_without_backup_refused_at_construction(self) -> None:
-        with pytest.raises(ValueError, match="hard backup"):
+    def test_soft_without_backup_constructs_but_audits_flagged(self) -> None:
+        # Round 3: the honest filing for a soft metric with no
+        # independent backup is UNBACKED, flagged in every report that
+        # prints it — not a refusal, and never silently clean.
+        spec = MetricSpec(
+            name="vibes",
+            kind=MetricKind.SOFT,
+            phenomenon="how good it felt",
+            assumptions=(_assumption(),),
+        )
+        assert spec.hard_backup is None
+        audit = audit_measured({"vibes": True}, ledger={"vibes": spec})
+        assert audit.flagged == ["vibes"]
+        assert (
+            audit.findings[0].status is LedgerStatus.FLAGGED_NO_BACKUP
+        )
+
+    def test_plain_string_kind_coerces_to_enum(self) -> None:
+        # Round-2 B1: kind="soft" (a plain str, no backup) must not
+        # slip past the backup rule as clean — it coerces to SOFT and
+        # the audit flags it.
+        spec = MetricSpec(
+            name="vibes",
+            kind="soft",  # type: ignore[arg-type]
+            phenomenon="how good it felt",
+            assumptions=(_assumption(),),
+        )
+        assert spec.kind is MetricKind.SOFT
+        audit = audit_measured({"vibes": True}, ledger={"vibes": spec})
+        assert audit.flagged == ["vibes"]
+        plain_hard = MetricSpec(
+            name="count",
+            kind="hard",  # type: ignore[arg-type]
+            phenomenon="a direct count",
+            assumptions=(_assumption(),),
+        )
+        assert plain_hard.kind is MetricKind.HARD
+
+    def test_garbage_kind_refused_at_construction(self) -> None:
+        with pytest.raises(ValueError, match="kind"):
             MetricSpec(
                 name="vibes",
-                kind=MetricKind.SOFT,
+                kind="banana",  # type: ignore[arg-type]
                 phenomenon="how good it felt",
                 assumptions=(_assumption(),),
             )
+
+    def test_non_string_kind_refused_at_construction(self) -> None:
+        with pytest.raises(ValueError, match="kind"):
+            MetricSpec(
+                name="vibes",
+                kind=7,  # type: ignore[arg-type]
+                phenomenon="how good it felt",
+                assumptions=(_assumption(),),
+            )
+
+    def test_audit_flags_soft_with_unmeasured_backup(self) -> None:
+        # Round-2 B3: naming a backup in the registry is not proof it
+        # was measured in this report.
+        ledger = {
+            "contains": _soft("contains", "label_agreement"),
+            "label_agreement": _hard("label_agreement"),
+        }
+        audit = audit_measured({"contains": True}, ledger=ledger)
+        assert audit.flagged == ["contains"]
+        finding = audit.findings[0]
+        assert finding.status is LedgerStatus.FLAGGED_NO_BACKUP
+        assert "not measured in this report" in finding.detail
+        audit = audit_measured(
+            {"contains": True, "label_agreement": True}, ledger=ledger
+        )
+        assert audit.all_ok
+
+    def test_audit_measured_skips_unmeasured_names(self) -> None:
+        # Round-2 B1/B3: a metric the report did not print is never
+        # audited, so the headline never certifies a phantom number.
+        audit = audit_measured(
+            {"pass_rate": True, "label_agreement": False},
+            ledger={"pass_rate": _hard("pass_rate")},
+        )
+        assert [f.metric for f in audit.findings] == ["pass_rate"]
+        assert audit.all_ok
 
     def test_hard_with_backup_refused(self) -> None:
         with pytest.raises(ValueError, match="carries no backup"):
@@ -209,14 +286,15 @@ class TestSoftNeedsHardBackup:
 
 
 class TestAuditReport:
-    def test_every_report_set_audits_clean(self) -> None:
-        for command, metric_set in REPORT_METRIC_SETS.items():
-            audit = audit_report(metric_set)
-            assert audit.all_ok, f"{command} set flagged: {audit.flagged}"
+    def test_audit_report_refuses_bare_string(self) -> None:
+        # Auditing "pass_rate" as characters would flag each letter:
+        # a latent footgun, refused outright.
+        with pytest.raises(TypeError, match="bare string"):
+            audit_report("pass_rate")  # type: ignore[arg-type]
 
-    def test_report_sets_cover_the_shipped_ledger(self) -> None:
-        covered = set().union(*REPORT_METRIC_SETS.values())
-        assert covered == set(METRIC_LEDGER)
+    def test_audit_measured_refuses_bare_string(self) -> None:
+        with pytest.raises(TypeError, match="mapping"):
+            audit_measured("pass_rate")  # type: ignore[arg-type]
 
     def test_unknown_metric_flagged_not_in_ledger(self) -> None:
         audit = audit_report(["ghost_metric"])
@@ -254,36 +332,75 @@ class TestShippedLedger:
                 assert assumption.falsifier
                 assert assumption.falsifier == assumption.falsifier.strip()
 
-    def test_shipped_ledger_audits_clean(self) -> None:
+    def test_shipped_ledger_flags_only_the_unbacked_soft_metrics(self) -> None:
+        # Round 3: the shipped ledger is NOT all-clean by design —
+        # calibration_gap and perturbation_stability are filed UNBACKED
+        # on purpose (no independent backup exists) and flagged here,
+        # exactly as in the reports that print them.
         audit = audit_ledger()
-        assert audit.all_ok
-        assert audit.flagged == []
-        require_ledger_ok(audit)
+        assert audit.flagged == [
+            "calibration_gap",
+            "perturbation_stability",
+        ]
+        assert not audit.all_ok
+        with pytest.raises(ValueError, match="flagged metrics"):
+            require_ledger_ok(audit)
 
     def test_shipped_ledger_has_both_kinds(self) -> None:
         kinds = {spec.kind for spec in METRIC_LEDGER.values()}
         assert kinds == {MetricKind.HARD, MetricKind.SOFT}
 
-    def test_every_soft_metric_backed_by_hard(self) -> None:
+    def test_every_soft_metric_backed_by_hard_or_flagged_unbacked(self) -> None:
         for spec in METRIC_LEDGER.values():
             if spec.kind is MetricKind.SOFT:
                 backup = spec.hard_backup
-                assert backup is not None
-                assert METRIC_LEDGER[backup].kind is MetricKind.HARD
+                if backup is None:
+                    assert spec.name in audit_ledger().flagged
+                else:
+                    assert METRIC_LEDGER[backup].kind is MetricKind.HARD
             else:
                 assert spec.hard_backup is None
 
     def test_backups_are_not_circular(self) -> None:
-        # The two circular backups from the first round: the scorer's
-        # validity must not be backed by the scorer's own output, and
-        # the calibration gap must be backed by its own measured
-        # component, not by an unrelated rate.
+        # Round-2 B2: the two circular backups are gone — the gap and
+        # the stability drop are filed UNBACKED, and the matcher
+        # proxies are backed by ground-truth label agreement (labels
+        # the scorer never sees), not by the scorer's own output.
+        assert METRIC_LEDGER["calibration_gap"].hard_backup is None
+        assert METRIC_LEDGER["perturbation_stability"].hard_backup is None
+        for matcher in ("contains", "regex", "json_schema"):
+            assert (
+                METRIC_LEDGER[matcher].hard_backup == "label_agreement"
+            )
         assert (
-            METRIC_LEDGER["scorer_validity"].hard_backup == "label_agreement"
+            METRIC_LEDGER["p_conventional"].hard_backup
+            == "conventional_share"
         )
-        assert (
-            METRIC_LEDGER["calibration_gap"].hard_backup == "agreement_rate"
+
+    def test_quality_safety_name_the_matcher_dependence(self) -> None:
+        # Round-2 B5: the dimension proportions inherit the soft
+        # matchers' proxy error — the dependence is named, not hidden
+        # behind the HARD label.
+        for dimension in ("quality", "safety"):
+            texts = " ".join(
+                a.text for a in METRIC_LEDGER[dimension].assumptions
+            )
+            assert "soft matchers" in texts
+
+    def test_reliability_names_the_replay_path(self) -> None:
+        # Round-2 B5: decide replays recorded outputs, so the
+        # phenomenon says replay-agreement, never live stability.
+        phenomenon = METRIC_LEDGER["reliability"].phenomenon
+        assert "replay-agreement" in phenomenon
+        assert "ignores the seed" in " ".join(
+            a.text for a in METRIC_LEDGER["reliability"].assumptions
         )
+
+    def test_no_scorer_validity_entry(self) -> None:
+        # Round-2 B3 (product): scorer_validity is a validity table,
+        # not a printed number — auditing it would certify a number
+        # the report never shows.
+        assert "scorer_validity" not in METRIC_LEDGER
 
     def test_audit_summary_prints_assumption_texts(self) -> None:
         summary = audit_ledger().summary()
@@ -294,14 +411,17 @@ class TestShippedLedger:
 
     def test_audit_to_dict_carries_full_specs(self) -> None:
         data = audit_ledger().to_dict()
-        assert data["all_ok"] is True
-        assert data["flagged"] == []
+        assert data["all_ok"] is False
+        assert data["flagged"] == [
+            "calibration_gap",
+            "perturbation_stability",
+        ]
         assert len(data["findings"]) == len(METRIC_LEDGER)
         metrics = data["metrics"]
         assert metrics["pass_rate"]["assumptions"]
         assert metrics["pass_rate"]["phenomenon"]
         assert metrics["calibration_gap"]["kind"] == "soft"
-        assert metrics["calibration_gap"]["hard_backup"] == "agreement_rate"
+        assert metrics["calibration_gap"]["hard_backup"] is None
 
     def test_spec_to_dict_carries_name_and_round_trips(self) -> None:
         for name, spec in METRIC_LEDGER.items():
@@ -344,18 +464,22 @@ class TestFailClosedParsing:
                 }
             )
 
-    def test_parser_refuses_soft_without_backup(self) -> None:
-        with pytest.raises(ValueError, match="hard backup"):
-            spec_from_dict(
-                {
-                    "name": "vibes",
-                    "kind": "soft",
-                    "phenomenon": "how good it felt",
-                    "assumptions": [
-                        {"text": "it felt good", "falsifier": "it felt bad"}
-                    ],
-                }
-            )
+    def test_parser_accepts_soft_without_backup(self) -> None:
+        # Round 3: the parser accepts an unbacked soft spec — the
+        # audit flags it, the parser does not refuse it.
+        parsed = spec_from_dict(
+            {
+                "name": "vibes",
+                "kind": "soft",
+                "phenomenon": "how good it felt",
+                "assumptions": [
+                    {"text": "it felt good", "falsifier": "it felt bad"}
+                ],
+            }
+        )
+        assert parsed.hard_backup is None
+        audit = audit_measured({"vibes": True}, ledger={"vibes": parsed})
+        assert audit.flagged == ["vibes"]
 
     def test_parser_refuses_bad_kind(self) -> None:
         with pytest.raises(ValueError, match="kind"):
@@ -469,8 +593,38 @@ class TestFailClosedParsing:
         with pytest.raises(ValueError, match="duplicate"):
             ledger_from_dicts([payload, payload])
 
-    def test_ledger_from_dicts_builds_clean_ledger(self) -> None:
+    def test_parser_refuses_unknown_assumption_keys(self) -> None:
+        with pytest.raises(ValueError, match="unknown keys"):
+            spec_from_dict(
+                {
+                    "name": "x",
+                    "kind": "hard",
+                    "phenomenon": "a count",
+                    "assumptions": [
+                        {"text": "t", "falsifier": "f", "surprise": True},
+                    ],
+                }
+            )
+
+    def test_parser_refuses_duplicate_assumptions(self) -> None:
+        with pytest.raises(ValueError, match="duplicate assumption"):
+            spec_from_dict(
+                {
+                    "name": "x",
+                    "kind": "hard",
+                    "phenomenon": "a count",
+                    "assumptions": [
+                        {"text": "t", "falsifier": "f"},
+                        {"text": "t", "falsifier": "f"},
+                    ],
+                }
+            )
+
+    def test_ledger_from_dicts_builds_shipped_ledger(self) -> None:
         payloads = [spec.to_dict() for spec in METRIC_LEDGER.values()]
         built = ledger_from_dicts(payloads)
-        assert audit_ledger(built).all_ok
         assert set(built) == set(METRIC_LEDGER)
+        assert audit_ledger(built).flagged == [
+            "calibration_gap",
+            "perturbation_stability",
+        ]

@@ -14,8 +14,7 @@ from typing import Any
 from agenteval_bench.decision import DecisionPolicy, RiskLevel
 from agenteval_bench.engine import DEFAULT_SEED, EvalRunner
 from agenteval_bench.metric_ledger import (
-    REPORT_METRIC_SETS,
-    audit_report,
+    audit_measured,
     require_ledger_ok,
 )
 from agenteval_bench.models import EvalSuite
@@ -205,6 +204,7 @@ def _suite_to_yaml_dict(suite: EvalSuite) -> dict[str, Any]:
 def cmd_run(args: list[str]) -> int:
     args, suite_path = _flag(args, "--suite")
     args, ci_mode = _has(args, "--ci")
+    args, strict_ledger = _has(args, "--strict-ledger")
     args, threshold_s = _flag(args, "--threshold", "1.0")
     args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
     args, replay_log = _flag(args, "--replay-log")
@@ -250,6 +250,7 @@ def cmd_run(args: list[str]) -> int:
     from agenteval_bench.validity import assess_scorer, validate_matcher_labels
 
     scorer_report = assess_scorer()
+    validated_matcher: str | None = None
     if labels_path:
         try:
             measured = validate_matcher_labels(labels_path)
@@ -259,21 +260,38 @@ def cmd_run(args: list[str]) -> int:
                 file=sys.stderr,
             )
             return 1
+        validated_matcher = measured.metric
         scorer_report = assess_scorer(notes={measured.metric: measured})
         print(f"Validity labels: {labels_path} — {measured.metric} measured: {measured.basis}")
     print(scorer_report.summary())
 
     # Every metric this report prints lists its assumptions (arena#56):
-    # the ledger audit is fed exactly the metrics the run printed —
-    # pass_rate plus the scorer's matchers — with each metric's
-    # assumption texts, so a soft metric without a hard backup is
-    # flagged in the report, never silently presented.
-    ledger_audit = audit_report(REPORT_METRIC_SETS["run"])
+    # the audit is derived from the values this report actually
+    # printed — pass_rate always, plus label_agreement and the one
+    # validated matcher only when --validity-labels measured them.
+    # The validity table prints per-matcher grades, not matcher rates,
+    # so the matchers are audited only when a validation measured one.
+    reported: dict[str, bool] = {"pass_rate": True}
+    if validated_matcher is not None:
+        reported["label_agreement"] = True
+        reported[validated_matcher] = True
+    ledger_audit = audit_measured(reported)
     print(ledger_audit.summary("run"))
     print(
         "Ledger HARD/SOFT says how each number is measured; validity "
         "grades govern whether to trust it here."
     )
+    # --strict-ledger: a flagged audit fails the run (exit 2, the
+    # same code as a failed --ci gate), so a flagged metric cannot
+    # pass a gate silently. Default off, mirroring --strict-validity
+    # in decide.
+    if strict_ledger and not ledger_audit.all_ok:
+        print(
+            "Ledger gate (strict): run refused — flagged metrics: "
+            + ", ".join(ledger_audit.flagged),
+            file=sys.stderr,
+        )
+        return 2
 
     if replay_log:
         log = _build_log(suite, suite_path, digest, result, outputs, seed)
@@ -512,11 +530,19 @@ def cmd_decide(args: list[str]) -> int:
     scorer_report = assess_scorer()
     print(scorer_report.summary())
     # Every metric this report prints lists its assumptions (arena#56):
-    # the ledger audit is fed exactly the metrics the decision printed
-    # — the four dimensions plus the scorer's matchers — with each
-    # metric's assumption texts, and is carried in the JSON report, so
-    # the decision's metrics are never read without theirs.
-    ledger_audit = audit_report(REPORT_METRIC_SETS["decide"])
+    # the audit is derived from the decision object actually printed
+    # — only the dimensions with measured evidence. An UNMEASURED
+    # dimension prints no number, so it is never audited as clean.
+    # The scorer table prints per-matcher grades, not matcher rates,
+    # so the matchers are not audited here (decide takes no
+    # --validity-labels); the ledger travels in the JSON report with
+    # the dimension numbers it annotates.
+    reported: dict[str, bool] = {
+        dimension.value: True
+        for dimension, verdict in decision.verdicts.items()
+        if not isinstance(verdict.evidence, UnmeasuredEvidence)
+    }
+    ledger_audit = audit_measured(reported)
     print(ledger_audit.summary("decide"))
     print(
         "Ledger HARD/SOFT says how each number is measured; validity "
@@ -664,6 +690,11 @@ def cmd_baseline(args: list[str]) -> int:
     with open(out, "w", encoding="utf-8") as f:
         f.write(json.dumps(doc, sort_keys=True, indent=2) + "\n")
     print(f"Baseline snapshot: {len(scores)} scores (seed={seed}) -> {out}")
+    print(
+        "Note: per-case scores are frozen recordings, not a reported "
+        "aggregate metric — the aggregate pass_rate over them is covered "
+        "by the metric ledger (see docs/METRIC-LEDGER.md)."
+    )
     return 0
 
 
@@ -767,6 +798,10 @@ def cmd_alt_test(args: list[str]) -> int:
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+    # Every metric this report prints lists its assumptions (arena#56):
+    # the leaderboard's winning rates (rho/omega) and the coverage
+    # board, derived from the report object actually printed.
+    ledger_audit = audit_measured({"alt_win_rate": True, "alt_coverage": True})
     try:
         require_ranking(board)
     except RankingRefused as e:
@@ -777,13 +812,16 @@ def cmd_alt_test(args: list[str]) -> int:
         # board is still printed, so the masked judges and the fix are
         # visible in the refusal itself.
         print(render_ranked(board))
+        print(ledger_audit.summary("alt-test"))
         print(f"Refused: {e}", file=sys.stderr)
         return 1
     print(render_text(report))
     print(render_ranked(board))
+    print(ledger_audit.summary("alt-test"))
     if out:
         doc = report.to_dict()
         doc["coverage"] = board.to_dict()
+        doc["metric_ledger"] = ledger_audit.to_dict()
         with open(out, "w", encoding="utf-8") as f:
             f.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
         print(f"Report: {out}")
@@ -881,10 +919,18 @@ def cmd_simpson(args: list[str]) -> int:
         for note in verdict.notes:
             lines.append(f"  note: {note}")
     print("\n".join(lines))
+    # Every metric this report prints lists its assumptions (arena#56):
+    # the per-stratum rates and the pooled delta, derived from the
+    # verdict object actually printed.
+    ledger_audit = audit_measured(
+        {"simpson_stratum_rate": True, "simpson_pooled_delta": True}
+    )
+    print(ledger_audit.summary("simpson"))
     if out:
         payload = {
             "tool": "agenteval-bench",
             "command": "simpson",
+            "metric_ledger": ledger_audit.to_dict(),
             "accepted": verdict.accepted,
             "violations": list(verdict.violations),
             "notes": list(verdict.notes),
@@ -1010,6 +1056,7 @@ def cmd_calibrate(args: list[str]) -> int:
     args, obs_path = _flag(args, "--observations")
     args, out = _flag(args, "--out")
     args, as_json = _has(args, "--json")
+    args, strict_ledger = _has(args, "--strict-ledger")
     args, min_total_s = _flag(args, "--min-total")
     args, bins_s = _flag(args, "--bins")
     args, min_bin_n_s = _flag(args, "--min-bin-n")
@@ -1039,11 +1086,14 @@ def cmd_calibrate(args: list[str]) -> int:
         return 1
     record = calibrate(judge, observations, policy)
     # Every metric this report prints lists its assumptions (arena#56):
-    # the ledger audit is fed exactly the metrics calibrate printed —
-    # the agreement rate and the calibration gap — with each metric's
-    # assumption texts. Under --json the audit travels in the JSON
-    # itself, so stdout stays parseable.
-    ledger_audit = audit_report(REPORT_METRIC_SETS["calibrate"])
+    # the agreement rate and the calibration gap (ECE is the
+    # bin-weighted aggregate of the same gap), derived from the record
+    # actually printed. The gap is filed UNBACKED on purpose — it is
+    # computed from the agreement rate itself — so the audit flags it
+    # in every report; the flag is the honesty, not a defect.
+    ledger_audit = audit_measured(
+        {"agreement_rate": True, "calibration_gap": True}
+    )
     ledger_json = ledger_audit.to_dict()
     if as_json:
         payload = record.to_dict()
@@ -1093,6 +1143,18 @@ def cmd_calibrate(args: list[str]) -> int:
         # Under --json stdout is the report JSON itself, so the Report:
         # line goes to stderr to keep stdout parseable.
         print(f"Report: {out}", file=sys.stderr if as_json else sys.stdout)
+    # --strict-ledger: a flagged audit means the numbers must not gate
+    # (exit 2, the same code as miscalibrated). Default off: the gap
+    # is flagged by design (unbacked), so strict mode refuses to
+    # certify a calibrate report at all — use it only when that
+    # refusal is what you want.
+    if strict_ledger and not ledger_audit.all_ok:
+        print(
+            "Ledger gate (strict): calibrate refused — flagged metrics: "
+            + ", ".join(ledger_audit.flagged),
+            file=sys.stderr,
+        )
+        return 2
     return 0 if record.status == "calibrated" else 2
 
 
@@ -1180,6 +1242,18 @@ def cmd_diverge(args: list[str]) -> int:
         "selection": selection.to_dict(),
         "may_decide_high_stakes": may_decide_high_stakes(selection),
     }
+    # Every metric this report prints lists its assumptions (arena#56):
+    # the min pairwise diversity, the conventional share, and the
+    # declared p_conventional, derived from the report object
+    # actually printed.
+    ledger_audit = audit_measured(
+        {
+            "pairwise_diversity": True,
+            "conventional_share": True,
+            "p_conventional": True,
+        }
+    )
+    payload["metric_ledger"] = ledger_audit.to_dict()
     if as_json:
         print(json.dumps(payload, indent=2))
     else:
@@ -1214,6 +1288,7 @@ def cmd_diverge(args: list[str]) -> int:
                 "  high-stakes decision: "
                 + ("allowed" if may_decide_high_stakes(selection) else "refused")
             )
+        print(ledger_audit.summary("diverge"))
     if out:
         try:
             with open(out, "w", encoding="utf-8") as f:
@@ -1264,6 +1339,7 @@ def cmd_perturb(args: list[str]) -> int:
     import yaml
 
     from agenteval_bench.perturbation import (
+        REGIMES,
         StabilityPolicy,
         check_stability,
         emit_triple_inputs,
@@ -1274,6 +1350,7 @@ def cmd_perturb(args: list[str]) -> int:
     args, out = _flag(args, "--out")
     args, as_json = _has(args, "--json")
     args, emit_inputs = _has(args, "--emit-inputs")
+    args, strict_ledger = _has(args, "--strict-ledger")
     args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
     args, clean_s = _flag(args, "--clean-threshold", "0.9")
     args, light_s = _flag(args, "--light-threshold", "0.9")
@@ -1381,11 +1458,25 @@ def cmd_perturb(args: list[str]) -> int:
         return 3
     verdict = check_stability(report, policy)
     # Every metric this report prints lists its assumptions (arena#56):
-    # the ledger audit is fed exactly the metrics perturb printed —
-    # the per-regime pass rates and the stability verdict — with each
-    # metric's assumption texts. Under --json the audit travels in the
-    # JSON payload itself, so stdout stays parseable.
-    ledger_audit = audit_report(REPORT_METRIC_SETS["perturb"])
+    # the audit is derived from the report object actually printed —
+    # pass_rate only for regimes that were measured and scored, and
+    # the stability verdict only when both drops exist. A regime that
+    # printed UNMEASURED contributes no number and is never audited
+    # as clean. Stability is filed UNBACKED on purpose — the drops are
+    # differences of the pass rates themselves — so the audit flags it
+    # in every report that prints it. Under --json the audit travels
+    # in the JSON payload itself, so stdout stays parseable.
+    reported: dict[str, bool] = {}
+    for regime in REGIMES:
+        sub = report.by_regime(regime)
+        if sub.measured and sub.verdicts:
+            reported["pass_rate"] = True
+    if (
+        verdict.clean_to_light_drop is not None
+        and verdict.clean_to_adversarial_drop is not None
+    ):
+        reported["perturbation_stability"] = True
+    ledger_audit = audit_measured(reported)
     payload = {
         "report": report.to_dict(),
         "verdict": verdict.to_dict(),
@@ -1398,8 +1489,6 @@ def cmd_perturb(args: list[str]) -> int:
     if as_json:
         print(json.dumps(payload, indent=2))
     else:
-        from agenteval_bench.perturbation import REGIMES
-
         def _pct(value: float | None) -> str:
             return f"{value:.1%}" if value is not None else "n/a"
 
@@ -1446,6 +1535,17 @@ def cmd_perturb(args: list[str]) -> int:
             print(f"Error: cannot write report: {exc}", file=sys.stderr)
             return 3
         print(f"Report: {out}", file=sys.stderr if as_json else sys.stdout)
+    # --strict-ledger: a STABLE verdict resting on a flagged metric is
+    # downgraded to UNSTABLE (exit 1), so a flagged stability number
+    # cannot gate a release. Default off; other outcomes already exit
+    # non-zero.
+    if strict_ledger and not ledger_audit.all_ok and verdict.outcome == "stable":
+        print(
+            "Ledger gate (strict): STABLE downgraded to UNSTABLE — "
+            "flagged metrics: " + ", ".join(ledger_audit.flagged),
+            file=sys.stderr,
+        )
+        return 1
     return {"stable": 0, "unstable": 1, "unmeasured": 2}[verdict.outcome]
 
 
@@ -1495,8 +1595,24 @@ def cmd_ship(args: list[str]) -> int:
     except (ValueError, TypeError, KeyError) as e:
         print(f"Error: unusable registry or design: {e}", file=sys.stderr)
         return 2
+    # Every metric this report prints lists its assumptions (arena#56):
+    # OEC z, SRM chi2, A/A z, and the guardrail deltas — each only
+    # when the verdict object actually carries it — derived from the
+    # verdict, with the audit carried in the JSON report.
+    reported: dict[str, bool] = {}
+    if verdict.oec_z is not None:
+        reported["oec_z"] = True
+    if verdict.srm is not None:
+        reported["srm_chi2"] = True
+    if verdict.aa is not None:
+        reported["aa_z"] = True
+    if verdict.guardrails:
+        reported["guardrail_delta"] = True
+    ledger_audit = audit_measured(reported)
+    payload = verdict.to_dict()
+    payload["metric_ledger"] = ledger_audit.to_dict()
     if as_json:
-        print(json.dumps(verdict.to_dict(), indent=2))
+        print(json.dumps(payload, indent=2))
     else:
         print(f"verdict: {verdict.status.upper().replace('_', ' ')}")
         if verdict.oec_z is not None:
@@ -1517,10 +1633,11 @@ def cmd_ship(args: list[str]) -> int:
             print(f"  ! {reason}")
         for note in verdict.notes:
             print(f"  ~ {note}")
+        print(ledger_audit.summary("ship"))
     if out:
         try:
             with open(out, "w", encoding="utf-8") as f:
-                f.write(json.dumps(verdict.to_dict(), indent=2) + "\n")
+                f.write(json.dumps(payload, indent=2) + "\n")
         except OSError as e:
             print(f"Error: cannot write report: {e}", file=sys.stderr)
             return 2
@@ -1970,6 +2087,10 @@ def cmd_snapshot(args: list[str]) -> int:
             print(f"feedback loop: {meta.feedback_loop}")
         print(f"cases: {len(suite.cases)}  "
               f"baseline: pass_rate {base.pass_rate:.1%} (agent={base.agent}, seed={base.seed})")
+        # Every metric this report prints lists its assumptions
+        # (arena#56): the baseline pass_rate, derived from the
+        # version object actually printed.
+        print(audit_measured({"pass_rate": True}).summary("snapshot show"))
         if version.promotions:
             print(f"promotions ({len(version.promotions)}):")
             for p in version.promotions:
@@ -2142,6 +2263,9 @@ def _snapshot_publish(args: list[str]) -> int:
     print(f"Published {suite.name}/{version.version_id} digest={version.digest}")
     print(f"Baseline: pass_rate {version.baseline.pass_rate:.1%} "
           f"(agent={version.baseline.agent}, seed={seed})")
+    # Every metric this report prints lists its assumptions (arena#56):
+    # the baseline pass_rate, derived from the version just published.
+    print(audit_measured({"pass_rate": True}).summary("snapshot publish"))
     if promotions:
         print(f"Promotions recorded: {len(promotions)}")
     return 0
@@ -2261,6 +2385,11 @@ def _snapshot_compare(args: list[str]) -> int:
           f"(seed={report.seed})")
     print(f"baseline pass_rate {report.baseline_pass_rate:.1%} -> "
           f"candidate {report.candidate_pass_rate:.1%}")
+    # Every metric this report prints lists its assumptions (arena#56):
+    # the baseline and candidate pass rates, derived from the
+    # comparison report actually printed. The gate verdict rests on
+    # them, so they are never shown without their assumptions.
+    print(audit_measured({"pass_rate": True}).summary("snapshot compare"))
     if missing_ids:
         print(f"Note: {len(missing_ids)} case(s) had no candidate output and scored 0 "
               f"({', '.join(missing_ids[:5])}{'...' if len(missing_ids) > 5 else ''}).")
@@ -2299,6 +2428,7 @@ def cmd_tiered(args: list[str]) -> int:
     args, min_cov_s = _flag(args, "--min-coverage", str(DEFAULT_MIN_COVERAGE))
     args, out = _flag(args, "--out")
     args, root_s = _flag(args, "--root", ".")
+    args, strict_ledger = _has(args, "--strict-ledger")
 
     if args:
         print(f"Error: unknown argument(s): {' '.join(args)}", file=sys.stderr)
@@ -2332,27 +2462,41 @@ def cmd_tiered(args: list[str]) -> int:
         for note in p.notes:
             print(f"  note: {note}")
     # Every metric this report prints lists its assumptions (arena#56):
-    # the ledger audit is fed exactly the metrics tiered printed —
-    # coverage and mutation score, when the phase measured them — with
-    # each metric's assumption texts.
-    tiered_metrics: list[str] = []
+    # the audit is derived from the report object actually printed —
+    # coverage and mutation score, when the phase measured them — and
+    # travels in the --out JSON, so the filed artifact never carries
+    # assumption-free numbers.
+    tiered_metrics: dict[str, bool] = {}
     if report.coverage_percent is not None:
         print(f"coverage: {report.coverage_percent:.1f}%")
-        tiered_metrics.append("coverage_pct")
+        tiered_metrics["coverage_pct"] = True
     if report.mutation_score is not None:
         print(f"mutation score: {report.mutation_score:.0%}")
-        tiered_metrics.append("mutation_score")
+        tiered_metrics["mutation_score"] = True
+    ledger_audit = audit_measured(tiered_metrics)
     if tiered_metrics:
-        print(audit_report(tiered_metrics).summary("tiered"))
+        print(ledger_audit.summary("tiered"))
     print(f"verdict: {report.verdict}")
     if out:
         try:
+            payload: dict[str, object] = dict(report.to_dict())
+            payload["metric_ledger"] = ledger_audit.to_dict()
             with open(out, "w", encoding="utf-8") as f:
-                f.write(report.to_json())
+                f.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         except OSError as e:
             print(f"Error: cannot write report: {e}", file=sys.stderr)
             return 1
         print(f"Report: {out}")
+    # --strict-ledger: a flagged audit fails the pipeline (exit 2).
+    # Default off; coverage and mutation score are HARD, so this only
+    # fires on a metric with no ledger entry.
+    if strict_ledger and not ledger_audit.all_ok:
+        print(
+            "Ledger gate (strict): tiered refused — flagged metrics: "
+            + ", ".join(ledger_audit.flagged),
+            file=sys.stderr,
+        )
+        return 2
     return 0 if report.verdict == "PASS" else 2
 
 
@@ -2453,6 +2597,11 @@ def _tracebench_mine(args: list[str]) -> int:
     print(f"Manifest: {out_path / 'manifest.json'}")
     print(f"Mined cases: {out_path / 'mined-cases.json'}")
     print(f"Oracle outputs: {out_path / 'oracle-outputs.json'}")
+    print(
+        "Note: tracebench mine prints case counts only — no scored "
+        "metric is reported, so the metric ledger does not apply to "
+        "this output (see docs/METRIC-LEDGER.md)."
+    )
     return 0
 
 
@@ -2553,6 +2702,13 @@ def _tracebench_regress(args: list[str]) -> int:
     print(f"Report: {result.report_path}")
     print(f"Action ledger: {result.actions_path}")
     print(f"Manifest: {result.manifest_path}")
+    print(
+        "Note: the regression aggregates above (mined/new/updated/"
+        "retired counts and the gate verdict) are not yet covered by "
+        "the metric ledger — the candidate pass_rate behind the "
+        "verdict is audited in the snapshot-compare step (see "
+        "docs/METRIC-LEDGER.md)."
+    )
     return 0 if result.verdict == "GATE_PASS" else 2
 
 
@@ -2652,8 +2808,16 @@ def cmd_flywheel(args: list[str]) -> int:
     rate = leading_gate_catch_rate(ledger_path)
     if rate is None:
         print(f"ledger: {ledger_path} (no runs yet)")
+        print(
+            "Note: no gate-catch rate was measured in this run, so "
+            "there is no metric for the ledger to audit."
+        )
     else:
         print(f"ledger: {ledger_path} (leading gate-catch rate: {rate:.0%})")
+        # Every metric this report prints lists its assumptions
+        # (arena#56): the gate-catch rate, derived from the ledger
+        # value actually printed.
+        print(audit_measured({"gate_catch_rate": True}).summary("flywheel"))
     print(f"payloads: {out_dir}")
     print("NOTE: payloads are rendered, not posted — the fleet runner "
           "posts them via the GitHub API.")
