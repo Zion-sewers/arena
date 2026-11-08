@@ -41,10 +41,13 @@ candidate cluster, so it can check the declared ``p_conventional``.
 Where no such independent measurement exists, the honest filing is
 UNBACKED, not a circular backup: a SOFT metric may carry
 ``hard_backup=None``, and the audit flags it ``FLAGGED_NO_BACKUP``
-in every report that prints it. Two entries are filed that way on
+in every report that prints it. Three entries are filed that way on
 purpose — ``calibration_gap`` (the gap is computed from the
-agreement rate itself) and ``perturbation_stability`` (the drop is a
-difference of the pass rates it would be checked against). A
+agreement rate itself), ``perturbation_stability`` (the drop is a
+difference of the pass rates it would be checked against), and
+``alt_conservative_score`` (the score is a mean of Wilson bounds
+computed from the same wins the win rate is computed from, so the
+win rate cannot independently check it). A
 circular reference is not a backup, and a flagged soft metric is
 still a printed metric: the flag, not silence, is what the issue
 requires ("a soft metric without hard backup is flagged").
@@ -589,8 +592,8 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
                     "sample: each bin contributes its share of the "
                     "total, weighted by its count, and no inferred "
                     "quantity enters the computation",
-                    "ECE changes when the same observations are "
-                    "re-binned without re-measuring",
+                    "ECE is computed from anything but the recorded "
+                    "(confidence, agreed) pairs in the printed bins",
                 ),
                 _a(
                     "ECE 0 means agreement matched confidence in the "
@@ -938,19 +941,27 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
         ),
         "alt_conservative_score": MetricSpec(
             name="alt_conservative_score",
-            kind=MetricKind.HARD,
+            kind=MetricKind.SOFT,
             phenomenon="the conservative score printed in the ranking "
             "column: mean Wilson 95% lower bound on the win rate (over "
             "covered cells for ranked judges, over all cells as the "
-            "diagnostic for masked judges)",
+            "diagnostic for masked judges). Each cell's score is an "
+            "interval bound — a 95% interval estimate of the true win "
+            "rate, not a recorded value — so the mean of bounds is "
+            "SOFT under the ledger rule, filed UNBACKED on purpose: "
+            "the win rate is computed from the same wins the bounds "
+            "are computed from, so it cannot independently check the "
+            "score",
             assumptions=(
                 _a(
-                    "The score is a deterministic function of the "
-                    "recorded pairwise comparisons: each cell's Wilson "
-                    "lower bound, averaged over the cells the column "
-                    "says it covers",
-                    "a conservative score is quoted from comparisons "
-                    "that were never recorded",
+                    "Each cell's score is a Wilson 95% lower bound on "
+                    "the recorded pairwise comparisons: the score "
+                    "consumes an inferred quantity, so it is SOFT even "
+                    "though it is a deterministic function of the "
+                    "recorded comparisons — determinism is not the test",
+                    "a conservative score is quoted as a directly "
+                    "measured rate, or from comparisons that were "
+                    "never recorded",
                 ),
                 _a(
                     "Ranking is refused, not published, when any ranked "

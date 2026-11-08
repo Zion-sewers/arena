@@ -847,6 +847,15 @@ def cmd_alt_test(args: list[str]) -> int:
         # visible in the refusal itself.
         print(render_ranked(board))
         print(ledger_audit.summary("alt-test"))
+        if "alt_conservative_score" in ledger_audit.flagged:
+            # The ranking is ordered by the conservative score, which
+            # is unbacked (see ledger): the flag rides with the
+            # ranking itself, not only in the audit block below it.
+            print(
+                "Ranking ordered by alt_conservative_score, which is "
+                "unbacked (see ledger): do not quote the ranking as "
+                "verified."
+            )
         print(f"Refused: {e}", file=sys.stderr)
         return 1
     ledger_audit = audit_measured(
@@ -860,10 +869,25 @@ def cmd_alt_test(args: list[str]) -> int:
     print(render_text(report))
     print(render_ranked(board))
     print(ledger_audit.summary("alt-test"))
+    if "alt_conservative_score" in ledger_audit.flagged:
+        # The ranking is ordered by the conservative score, which is
+        # unbacked (see ledger): the flag rides with the ranking
+        # itself, not only in the audit block below it.
+        print(
+            "Ranking ordered by alt_conservative_score, which is "
+            "unbacked (see ledger): do not quote the ranking as "
+            "verified."
+        )
     if out:
         doc = report.to_dict()
         doc["coverage"] = board.to_dict()
         doc["metric_ledger"] = ledger_audit.to_dict()
+        if "alt_conservative_score" in ledger_audit.flagged:
+            doc["ranking_note"] = (
+                "Ranking ordered by alt_conservative_score, which is "
+                "unbacked — no independent hard measurement exists "
+                "for it. Do not quote the ranking as verified."
+            )
         with open(out, "w", encoding="utf-8") as f:
             f.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
         print(f"Report: {out}")

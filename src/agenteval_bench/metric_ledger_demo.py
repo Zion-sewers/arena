@@ -4,10 +4,10 @@ Runs the full ledger pipeline offline on the shipped registry. Exit 0
 only if every acceptance expectation holds:
 - every shipped metric lists at least one assumption, each with a
   falsifier;
-- the shipped ledger audit flags exactly the two honestly-unbacked
-  soft metrics (calibration_gap, perturbation_stability) and nothing
-  else: every other soft metric is backed by a HARD metric that is
-  independently measured;
+- the shipped ledger audit flags exactly the three honestly-unbacked
+  soft metrics (alt_conservative_score, calibration_gap,
+  perturbation_stability) and nothing else: every other soft metric
+  is backed by a HARD metric that is independently measured;
 - kind is coerced and validated at construction: a plain "soft"
   string becomes SOFT, a garbage kind raises, and a hand-built spec
   can never slip a non-Enum kind past the audit as clean;
@@ -80,8 +80,13 @@ def main() -> int:
                 f"{name} assumption carries a falsifier",
             )
     _expect(
-        audit.flagged == ["calibration_gap", "perturbation_stability"],
-        "shipped ledger flags exactly the two honestly-unbacked soft "
+        audit.flagged
+        == [
+            "alt_conservative_score",
+            "calibration_gap",
+            "perturbation_stability",
+        ],
+        "shipped ledger flags exactly the three honestly-unbacked soft "
         "metrics, nothing else",
     )
     kinds = {spec.kind for spec in METRIC_LEDGER.values()}

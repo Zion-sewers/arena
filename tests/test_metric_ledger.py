@@ -415,9 +415,13 @@ class TestShippedLedger:
         # Round 3: the shipped ledger is NOT all-clean by design —
         # calibration_gap and perturbation_stability are filed UNBACKED
         # on purpose (no independent backup exists) and flagged here,
-        # exactly as in the reports that print them.
+        # exactly as in the reports that print them. Round 6 adds
+        # alt_conservative_score: a mean of Wilson bounds is SOFT
+        # under the ledger rule, and the win rate cannot back it
+        # (same wins), so it is filed UNBACKED too.
         audit = audit_ledger()
         assert audit.flagged == [
+            "alt_conservative_score",
             "calibration_gap",
             "perturbation_stability",
         ]
@@ -433,12 +437,13 @@ class TestShippedLedger:
         # Round 4: ece (the headline calibrate number, own entry),
         # treated_share (simpson), the alt-test ranking numbers,
         # prior_score (snapshot promotions), and the tracebench
-        # regression aggregates — every one HARD, every one with
-        # assumptions and a falsifier.
+        # regression aggregates — every one with assumptions and a
+        # falsifier. Round 6: alt_conservative_score is SOFT, not
+        # HARD — a mean of Wilson lower bounds consumes an inferred
+        # quantity — and filed UNBACKED, like the gap.
         for name in (
             "ece",
             "treated_share",
-            "alt_conservative_score",
             "alt_annotator_rho",
             "prior_score",
             "regression_counts",
@@ -449,6 +454,23 @@ class TestShippedLedger:
             assert spec.kind is MetricKind.HARD
             assert spec.assumptions
             assert spec.hard_backup is None
+        score = METRIC_LEDGER["alt_conservative_score"]
+        assert score.kind is MetricKind.SOFT
+        assert score.hard_backup is None
+        assert score.assumptions
+        assert "Wilson" in score.phenomenon
+
+    def test_conservative_score_is_soft_because_it_consumes_a_bound(self) -> None:
+        # Round-6 B1 (product + arch): the score is a mean of Wilson
+        # 95% lower bounds, so the ledger rule files it SOFT; the win
+        # rate is computed from the same wins and cannot back it, so
+        # it is UNBACKED and every alt-test report flags it.
+        score = METRIC_LEDGER["alt_conservative_score"]
+        assert score.kind is MetricKind.SOFT
+        assert score.hard_backup is None
+        audit = audit_measured({"alt_conservative_score": True})
+        assert audit.flagged == ["alt_conservative_score"]
+        assert not audit.all_ok
 
     def test_ece_is_not_the_calibration_gap(self) -> None:
         # Round-4 B1 (arch): the per-bin gap (confidence minus the
@@ -523,6 +545,7 @@ class TestShippedLedger:
         data = audit_ledger().to_dict()
         assert data["all_ok"] is False
         assert data["flagged"] == [
+            "alt_conservative_score",
             "calibration_gap",
             "perturbation_stability",
         ]
@@ -735,6 +758,7 @@ class TestFailClosedParsing:
         built = ledger_from_dicts(payloads)
         assert set(built) == set(METRIC_LEDGER)
         assert audit_ledger(built).flagged == [
+            "alt_conservative_score",
             "calibration_gap",
             "perturbation_stability",
         ]

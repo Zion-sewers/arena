@@ -607,9 +607,16 @@ def test_alt_test_json_carries_ledger(monkeypatch, capsys):
             capsys,
         )
         assert code == 0, stdout
-        # Round 4: the conservative score that orders the ranking
-        # and the per-annotator rho_f values are audited too (4/4).
-        assert "Metric ledger (alt-test): 4/4 metrics clean" in stdout
+        # Round 6: the conservative score that orders the ranking is
+        # SOFT and unbacked (a mean of Wilson bounds), so the ranked
+        # board flags it — 3/4 clean — and the ranking carries the
+        # flag inline, the way calibrate/perturb do.
+        assert "Metric ledger (alt-test): 3/4 metrics clean" in stdout
+        assert (
+            "Ranking ordered by alt_conservative_score, which is "
+            "unbacked (see ledger): do not quote the ranking as "
+            "verified." in stdout
+        )
         _assert_stdout_covered(
             stdout,
             "alt-test",
@@ -635,7 +642,10 @@ def test_alt_test_json_carries_ledger(monkeypatch, capsys):
         with open(out, encoding="utf-8") as f:
             report = json.load(f)
         ledger = report["metric_ledger"]
-        assert ledger["all_ok"] is True
+        assert ledger["all_ok"] is False
+        assert ledger["flagged"] == ["alt_conservative_score"]
+        assert "Ranking ordered by alt_conservative_score" in report["ranking_note"]
+        assert "unbacked" in report["ranking_note"]
         assert set(ledger["metrics"]) == {
             "alt_win_rate",
             "alt_annotator_rho",
@@ -676,8 +686,16 @@ def test_alt_test_refusal_audits_only_the_printed_board(monkeypatch, capsys):
             capsys,
         )
         assert code == 1, stdout
-        assert "Metric ledger (alt-test): 2/2 metrics clean" in stdout
+        # Round 6: the masked diagnostic is the same Wilson-bound
+        # score, so the refused board flags it too — 1/2 clean — and
+        # the ranking flag line prints with the refusal.
+        assert "Metric ledger (alt-test): 1/2 metrics clean" in stdout
         assert "alt_conservative_score" in stdout
+        assert (
+            "Ranking ordered by alt_conservative_score, which is "
+            "unbacked (see ledger): do not quote the ranking as "
+            "verified." in stdout
+        )
         assert "alt_win_rate" not in stdout
         assert "alt_annotator_rho" not in stdout
         # Growth scan: the refused board prints only the masked
@@ -1052,6 +1070,20 @@ def test_tracebench_mine_prints_not_covered_notice(monkeypatch, capsys, tmp_path
     )
     assert code == 0, out
     assert "the metric ledger does not apply to this output" in out
+    # Round-6 N2 (arch): the notice alone is not coverage — the mined
+    # line renders case counts, so the scan pins them as declared
+    # components, and a future metric printed here fails the scan.
+    _assert_stdout_covered(
+        out,
+        "tracebench mine",
+        [
+            (
+                r"^Mined \d+ case\(s\) from \d+ trace\(s\)",
+                None,
+                "tracebench mine case counts (pipeline bookkeeping)",
+            ),
+        ],
+    )
 
 
 # --- Growth safety (round-4 arch B3) ---------------------------------------
@@ -1061,15 +1093,18 @@ def test_tracebench_mine_prints_not_covered_notice(monkeypatch, capsys, tmp_path
 # The backstop is this scan: every stdout line that renders a number must
 # match a declared rendering pattern tied to an audited metric (or a
 # declared component of one). A new metric line matches no pattern
-# and fails here. The detector sees numbers, not formats: decimals,
-# integer percents, fractions, integer counts with a unit noun
-# ("12 tests", "42 cases", "7 instances"), and labeled bare integers
-# ("score 87"). The remaining boundary, documented so it cannot drift
-# silently: bare integers with no unit, label, percent, or fraction
-# shape (seeds, n=, digests, version ids, timestamps) are components
-# under the docs rule and are asserted by the per-command audit tests,
-# not this scan — the dispatch test is the backstop for a new command,
-# and a new metric printed in one of those shapes must grow a pattern
+# and fails here. The detector sees the enumerated shapes only:
+# decimals, integer percents, fractions, integer counts with a listed
+# unit noun ("12 tests", "42 cases", "7 instances"), and labeled bare
+# integers after one of the listed labels ("score 87"). It is NOT
+# format-blind: an unlabeled bare integer, a count with an unlisted
+# noun, or a word percent passes the scan unseen. The remaining
+# boundary, documented so it cannot drift silently: bare integers
+# with no unit, label, percent, or fraction shape (seeds, n=,
+# digests, version ids, timestamps) are components under the docs
+# rule and are asserted by the per-command audit tests, not this
+# scan — the dispatch test is the backstop for a new command, and a
+# new metric printed in one of those shapes must grow a pattern
 # here, not hide behind the boundary.
 
 
@@ -1083,6 +1118,7 @@ _METRIC_VALUE = re.compile(
 
 _AUDIT_LINE = re.compile(
     r"^  [a-z_0-9]+ +(?:hard|soft) backup=|^    - |^  FLAGGED: "
+    r"|^  [a-z_0-9]+ +NOT IN LEDGER — "
 )
 
 
@@ -1156,6 +1192,25 @@ def _assert_stdout_covered(
                 f"{command}: rendering {note!r} names {metric}, which "
                 "the audit does not cover"
             )
+
+
+def test_split_audit_blocks_keeps_not_in_ledger_rows() -> None:
+    # Round-6 N3 (impl): a NOT_IN_LEDGER finding row sorts first in
+    # the block, and the splitter must still consume the whole block —
+    # otherwise the audit's own assumption text (which carries numbers
+    # like a Wilson 0.95) leaks into "rest" and the scan fails on the
+    # audit instead of on the unledgered metric.
+    out = (
+        "Pass rate: 100.0%\n"
+        "Metric ledger (run): 0/2 metrics clean\n"
+        "  mystery_metric         NOT IN LEDGER — reported metric has no ledger entry\n"
+        "  pass_rate              hard backup=—               OK\n"
+        "    - The Wilson 95% interval is the uncertainty (breaks if: x)\n"
+        "  FLAGGED: mystery_metric — do not quote or gate on flagged metrics\n"
+    )
+    audit_lines, rest = _split_audit_blocks(out)
+    assert len(audit_lines) == 5
+    assert rest == ["Pass rate: 100.0%"]
 
 
 def test_tracebench_regress_carries_ledger(monkeypatch, capsys, tmp_path):

@@ -38,11 +38,16 @@ component; if the report presents it as a result (a rate, a score,
 a z, a delta, a share), it is a metric and needs an entry. The
 growth-scan test enforces the boundary at the observable surface
 (see Enforcement): every decimal, integer-percent, fraction,
-integer+unit count, or labeled bare-integer rendering must match a
-declared pattern tied to an audited metric or a declared component.
-The scan is format-blind by design: a new metric printed as an
-integer percent or a fraction is caught the same way as one printed
-as a decimal.
+integer+unit count, or labeled bare-integer rendering in the
+detector's enumerated shapes (decimals, `N%`, `N/M`, `z=`/`chi2=`,
+integers followed by a listed unit noun, bare integers after one of
+the listed labels `score`/`rate`/`total`/`count`/`recorded`) must
+match a declared pattern tied to an audited metric or a declared
+component. The scan is format-aware, not format-blind: a new metric
+printed in an unlisted shape (an unlabeled bare integer, a count
+with an unlisted noun, a word percent) passes the scan, so the
+enumerated shapes are the documented boundary — widen the detector
+before relying on it for a new rendering shape.
 
 ## What "backed by" means
 
@@ -61,10 +66,13 @@ the candidate cluster, while the declared p is a stated belief).
 
 Where no independent measurement exists, the honest filing is
 UNBACKED, not a circular backup: `calibration_gap` (the gap is
-computed from the agreement rate itself) and
+computed from the agreement rate itself),
 `perturbation_stability` (the drops are differences of the pass
-rates themselves) carry `hard_backup=None`, and the audit flags them
-`FLAGGED_NO_BACKUP` in every report that prints them. A circular
+rates themselves), and `alt_conservative_score` (the score is a mean
+of Wilson bounds computed from the same wins the win rate is
+computed from, so the win rate cannot independently check it) carry
+`hard_backup=None`, and the audit flags them `FLAGGED_NO_BACKUP` in
+every report that prints them. A circular
 reference is not a backup, and a flagged soft metric is still a
 printed metric: the flag, not silence, is what the issue requires.
 
@@ -103,13 +111,13 @@ tables print together in `run` and `decide` for this reason.
 | `guardrail_delta` | hard | — | Treated-vs-control guardrail difference |
 | `alt_win_rate` | hard | — | A judge's winning rate (rho/omega) on recorded comparisons |
 | `alt_annotator_rho` | hard | — | Per-annotator mean win probability rho_f (mean of n recorded binary wins) |
-| `alt_conservative_score` | hard | — | Conservative score: mean Wilson 95% lower bound on the win rate (covered cells when ranked, all cells as the diagnostic when masked) |
 | `alt_coverage` | hard | — | Fraction of (judge, annotator) cells meeting the floor |
 | `prior_score` | hard | — | A case's recorded score in a previous snapshot version (promotion provenance) |
 | `regression_counts` | hard | — | Cases mined, new, updated, and retired in one scheduled tracebench regression run |
 | `regression_streak` | hard | — | Consecutive failed scheduled regression runs (the rollback streak) |
 | `gate_catch_rate` | hard | — | Fraction of sampled flywheel payloads the gate caught |
 | `validated_share` | hard | — | Fraction of mined bugsmith candidate reports that break at least one test |
+| `alt_conservative_score` | soft | UNBACKED (flagged) | Conservative score: mean Wilson 95% lower bound on the win rate (covered cells when ranked, all cells as the diagnostic when masked) — a mean of bounds, so SOFT under the ledger rule |
 | `calibration_gap` | soft | UNBACKED (flagged) | Per-bin mean judge confidence minus the Wilson lower bound of measured agreement (ECE is a different aggregate and has its own entry) |
 | `perturbation_stability` | soft | UNBACKED (flagged) | Whether the agent's verdict survives input perturbation |
 | `p_conventional` | soft | `conventional_share` | Declared probability the conventional answer is right |
@@ -198,9 +206,11 @@ headline carries the flag next to the grade (`calibrate` appends
 "calibration gap unbacked (see ledger): do not quote it as verified";
 `perturb`
 appends "(stability label unbacked — see ledger)" to the verdict
-line), the gating sentence scopes gating to the measured grade
+line; `alt-test` prints "Ranking ordered by
+alt_conservative_score, which is unbacked (see ledger): do not quote
+the ranking as verified" with the ranking itself), the gating sentence scopes gating to the measured grade
 (the bin-check grade for calibrate), never to the flagged number,
-and the JSON carries a `status_note` / `verdict_note` next to the
+and the JSON carries a `status_note` / `verdict_note` / `ranking_note` next to the
 grade. `calibrate` JSON qualifies `status` itself when flagged
 (`"calibrated (flagged: calibration_gap unbacked)"`) and, under
 `--strict-ledger`, writes `status` as `"refused (ledger gate)"`
@@ -279,7 +289,11 @@ are covered by the audit it prints.
 - CI enforces the ledger on the live path: the tiered expanded
   step runs with `--strict-ledger`, and a `run --strict-ledger`
   step runs the support-agent suite, so a flagged metric fails the
-  build, not just a local run.
+  build, not just a local run. A second CI step exercises the
+  flagging strict path itself — it asserts `perturb --strict-ledger`
+  exits 1 (STABLE downgraded to UNSTABLE) and `calibrate
+  --strict-ledger` exits 2 (refused) — so the gate is a live gate,
+  not only a tripwire for future misfiling.
 
 ## Worked example (the cash test, with real numbers)
 

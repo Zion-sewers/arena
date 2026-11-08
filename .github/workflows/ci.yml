@@ -29,6 +29,13 @@ jobs:
           path: tiered-expanded-report.json
       - name: Ledger gate (run --strict-ledger; a flagged metric fails the build)
         run: agenteval-bench run --suite examples/support-agent.yaml --strict-ledger
+      - name: Ledger gate (flagging strict path; perturb downgrades, calibrate refuses)
+        run: |
+          set +e
+          agenteval-bench perturb --suite examples/perturbation-triple.yaml --strict-ledger
+          test $? -eq 1 || { echo "perturb --strict-ledger must exit 1 (STABLE downgraded to UNSTABLE)" >&2; exit 1; }
+          agenteval-bench calibrate --observations examples/calibration-observations.json --strict-ledger
+          test $? -eq 2 || { echo "calibrate --strict-ledger must exit 2 (refused: unbacked gap)" >&2; exit 1; }
       - name: Experiment-discipline demo (violations must fail)
         run: PYTHONPATH=src python -m experiment.demo
       - name: Simpson-safe aggregation demo (reversal must be refused)
