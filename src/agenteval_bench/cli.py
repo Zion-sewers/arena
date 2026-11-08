@@ -258,6 +258,14 @@ def cmd_run(args: list[str]) -> int:
         print(f"Validity labels: {labels_path} — {measured.metric} measured: {measured.basis}")
     print(scorer_report.summary())
 
+    # Every reported metric lists its assumptions (arena#56): the
+    # metric-assumption ledger audit prints next to the validity table,
+    # so a soft metric without a hard backup is flagged in the report,
+    # never silently presented.
+    from agenteval_bench.metric_ledger import audit_ledger
+
+    print(audit_ledger().summary())
+
     if replay_log:
         log = _build_log(suite, suite_path, digest, result, outputs, seed)
         log.write(replay_log)
@@ -488,6 +496,13 @@ def cmd_decide(args: list[str]) -> int:
     # is printed in the same output, so the two grades are never read apart.
     scorer_report = assess_scorer()
     print(scorer_report.summary())
+    # Every reported metric lists its assumptions (arena#56): the ledger
+    # audit prints with the validity tables and is carried in the JSON
+    # report, so the decision's metrics are never read without theirs.
+    from agenteval_bench.metric_ledger import audit_ledger
+
+    ledger_audit = audit_ledger()
+    print(ledger_audit.summary())
     # --strict-validity is the enforcement switch: a GATE that rests on an
     # untrusted metric is downgraded to INVESTIGATE. Default off, because
     # replay mode structurally cannot trust reliability (see above), so a
@@ -518,6 +533,7 @@ def cmd_decide(args: list[str]) -> int:
             "policy_fingerprint": policy_fingerprint(policy),
             "validity": validity.to_dict(),
             "scorer_validity": scorer_report.to_dict(),
+            "metric_ledger": ledger_audit.to_dict(),
             "dimensions": {},
         }
         if evidence_action is not None:

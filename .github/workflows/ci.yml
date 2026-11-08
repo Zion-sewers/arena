@@ -57,3 +57,5 @@ jobs:
         run: PYTHONPATH=src python -m agenteval_bench.diverge_demo
       - name: Perturbation-stability demo (clean / light / adversarial; robust STABLE, naive UNSTABLE on the drop, fragile UNSTABLE on light)
         run: PYTHONPATH=src python -m agenteval_bench.perturbation_demo
+      - name: Metric-ledger demo (every metric lists assumptions; soft needs hard backup; assumption-free refused)
+        run: PYTHONPATH=src python -m agenteval_bench.metric_ledger_demo
