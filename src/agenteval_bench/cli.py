@@ -1255,6 +1255,27 @@ def cmd_perturb(args: list[str]) -> int:
         return 3
     if emit_inputs:
         emitted = emit_triple_inputs(suite, seed=seed)
+        # A re-emit drops recordings that answer a different input:
+        # say so at the moment of action, naming what was lost, so
+        # the operator never discovers the loss silently at grading
+        # time (the dropped regimes grade UNMEASURED until refilled).
+        dropped = [
+            f"{old.id}/{regime}"
+            for old, new in zip(suite.cases, emitted.cases)
+            for regime, field in (
+                ("light", "output_light"),
+                ("adversarial", "output_adversarial"),
+            )
+            if getattr(old, field) is not None
+            and getattr(new, field) is None
+        ]
+        if dropped:
+            print(
+                "Warning: re-emit dropped recordings that answer a "
+                f"different input: {', '.join(dropped)} — re-run the "
+                "agent on the emitted inputs to refill them.",
+                file=sys.stderr,
+            )
         text = yaml.safe_dump(
             _suite_to_yaml_dict(emitted),
             sort_keys=False,

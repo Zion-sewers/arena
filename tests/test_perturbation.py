@@ -133,14 +133,16 @@ def test_light_is_deterministic_per_seed_and_case():
         first = perturb_input(case.input, Regime.LIGHT, 42, case.id)
         second = perturb_input(case.input, Regime.LIGHT, 42, case.id)
         assert first == second
-        # Same text, different seed: the draw is independent — every
-        # case in this suite actually changes under seed 7 (a
-        # same-value assertion would leave per-seed independence
-        # unpinned).
-        other_seed = perturb_input(case.input, Regime.LIGHT, 7, case.id)
-        assert other_seed.input != first.input
-    # Same text, different case id: the draw is independent — at
-    # least one case in the suite actually changes.
+    # Same text, different seed or case id: the draw is independent.
+    # Suite-level, not per-case: seed-independence only requires
+    # *some* case to change (a light edit could in principle
+    # coincide across seeds for one input), so a universal
+    # per-case assertion would be brittle to future suite edits.
+    assert any(
+        perturb_input(case.input, Regime.LIGHT, 7, case.id).input
+        != perturb_input(case.input, Regime.LIGHT, 42, case.id).input
+        for case in SUITE.cases
+    )
     assert any(
         perturb_input(case.input, Regime.LIGHT, 42, "someone-else").input
         != perturb_input(case.input, Regime.LIGHT, 42, case.id).input
@@ -1078,6 +1080,49 @@ def test_emit_drops_recordings_when_seed_changes():
     )
     assert dropped.cases[0].input_light is not None
     assert dropped.cases[0].output_light is None
+
+
+def test_cli_emit_inputs_warns_when_dropping_recordings(
+    monkeypatch, capsys, tmp_path
+):
+    # Round-4 product advisory: the CLI dropped stale recordings
+    # silently at emit time. Re-emitting a filled suite under a new
+    # seed must name the dropped recordings on stderr.
+    recordings = {
+        cid: {"output": a, "output_light": a, "output_adversarial": a}
+        for cid, a in ANSWERS.items()
+    }
+    path = _write(_suite_yaml(recordings))
+    emitted_path = str(tmp_path / "re-emitted.yaml")
+    try:
+        code, _, err = _run(
+            [
+                "perturb", "--suite", path, "--emit-inputs",
+                "--seed", "7", "--out", emitted_path,
+            ],
+            monkeypatch, capsys,
+        )
+        assert code == 0
+        assert "dropped recordings" in err
+        assert "refund/light" in err
+        emitted = EvalSuite.from_yaml(emitted_path)
+        assert all(c.output_light is None for c in emitted.cases)
+        # Emitting a fresh suite drops nothing and warns about nothing.
+        fresh_path = _write(_suite_yaml({cid: {} for cid in ANSWERS}))
+        try:
+            code, _, err = _run(
+                [
+                    "perturb", "--suite", fresh_path, "--emit-inputs",
+                    "--out", str(tmp_path / "fresh.yaml"),
+                ],
+                monkeypatch, capsys,
+            )
+            assert code == 0
+            assert "dropped recordings" not in err
+        finally:
+            os.unlink(fresh_path)
+    finally:
+        os.unlink(path)
 
 
 def test_cli_all_skipped_suite_is_unmeasured_not_zero(monkeypatch, capsys):
