@@ -67,6 +67,36 @@ mapping (the registry against itself, for the demo and the parser
 round-trip); ``audit_report`` is the names-only wrapper for callers
 that already know every named metric was measured.
 
+An audit that measured nothing is not a failure: it audited nothing,
+so there is nothing to flag and nothing to gate on. Its summary
+says "no metrics measured — nothing audited" (never "0/0 metrics
+clean"), its JSON carries ``all_ok: true`` with empty findings, and
+``--strict-ledger`` passes through on it. Callers that must have
+audited something check ``findings`` themselves; ``require_ledger_ok``
+raises only on a flagged audit.
+
+Components are not metrics. A number that gates, ranks, or grades is
+a metric and needs a ledger entry; a number that is an input, a
+denominator, or pipeline bookkeeping for an audited metric is a
+component, covered by that metric's assumptions: per-bin confidence
+means (components of the calibration gap), candidate scores printed
+in a selection reason (inputs to the selection), SRM/A-A p-values
+(the z/chi2 entries' assumptions name the p-value reading),
+pipeline counts (corpus traces, detected/sampled payloads — the
+denominators the audited rates are computed from), and phase
+durations (timings, not measurements). The per-command CLI tests
+pin the line: every numeric metric line a command prints must be an
+audited metric or a declared component of one.
+
+The audit validates what it is handed. ``audit_measured`` and
+``audit_ledger`` accept only ``MetricSpec`` values (anything else
+raises TypeError, mirroring the parser boundary) and re-validate
+each spec they audit — kind is coerced to ``MetricKind``, so a
+hand-built spec that bypassed ``__post_init__`` with a plain-string
+kind is audited as the kind it names, and a garbage kind raises
+instead of auditing clean. The audit stores the re-validated specs,
+so the summary can never crash on a hand-built kind.
+
 Acceptance (arena#56), enforced here, not in prose:
 - every reported metric lists its assumptions — ``MetricSpec`` refuses
   an empty or blank ``assumptions`` list at construction, and the
@@ -87,23 +117,40 @@ reports; prespec assumptions gate an analysis plan.
 
 Scope: the ledger covers every metric printed by ``run``, ``decide``,
 ``calibrate``, ``perturb``, ``tiered``, ``simpson``, ``diverge``,
-``ship``, ``alt-test``, ``snapshot`` (show / publish / compare), and
-``flywheel``; each of those commands prints the audit of the metrics
-it measured (or, for ``flywheel`` with no runs yet, says no rate was
-measured) and carries ``metric_ledger`` in its JSON report where it
-writes one. ``baseline`` freezes per-case scores, not an aggregate
-metric: it prints a notice saying so. ``tracebench`` reports a gate
-verdict and case counts, not scored metrics: it prints an in-report
-notice that its aggregates are not ledger-covered. The
+``ship``, ``alt-test``, ``snapshot`` (show / publish / compare),
+``flywheel``, and ``tracebench regress``; each of those commands
+prints the audit of the metrics it measured (or, for ``flywheel``
+with no runs yet and for a command that measured nothing, says no
+metric was measured) and carries ``metric_ledger`` in its JSON report
+where it writes one. ``baseline`` freezes per-case scores, not an
+aggregate metric: it prints a notice saying so. ``tracebench mine``
+writes benchmark artifacts, not a metric report: it prints an
+in-report notice that the ledger does not apply to its output. The
 judge-allocation command (``judges``) prints no scored metric and is
 out of scope. ``novelty_score`` has no CLI print site and is not in
 the ledger until one exists.
+
+Flagged verdicts are qualified at the point of the verdict, never
+certified alongside the flag. A report whose audit flags a metric
+must not headline the flagged verdict as a certification: the
+``calibrate`` headline carries the unbacked-gap flag next to the ECE
+number and its gating sentence scopes gating to the bin-check grade
+(the live ``require_calibrated`` gate), never to the ECE number; the
+``perturb`` verdict line carries the unbacked-stability flag next to
+STABLE, and under ``--strict-ledger`` the artifact itself is
+downgraded to UNSTABLE. The grade (bin checks passed, drops within
+policy) is a measured fact and stays; what the report must not do
+is present the flagged number as verified. The validity tables in
+``run`` and ``decide`` grade matcher proxies; the ledger headline
+covers the printed aggregates/dimensions only, and the report says
+so in its own text.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as _dataclass_replace
 from enum import Enum
 from types import MappingProxyType
 
@@ -478,7 +525,10 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
             name="calibration_gap",
             kind=MetricKind.SOFT,
             phenomenon="mean judge confidence minus measured agreement "
-            "rate (ECE is the bin-weighted aggregate of the same gap)",
+            "rate, per bin against the Wilson lower bound of agreement "
+            "(ECE is a different aggregate — the bin-weighted mean "
+            "absolute difference between agreement and confidence — "
+            "and has its own entry)",
             assumptions=(
                 _a(
                     "Confidence is self-reported by the judge, not "
@@ -500,6 +550,36 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
                     "agreement — not a backup the ledger certifies",
                     "the gap is quoted with no agreement rate printed "
                     "next to it",
+                ),
+            ),
+        ),
+        "ece": MetricSpec(
+            name="ece",
+            kind=MetricKind.HARD,
+            phenomenon="bin-weighted mean absolute difference between "
+            "mean judge confidence and measured agreement rate "
+            "(expected calibration error)",
+            assumptions=(
+                _a(
+                    "ECE is a deterministic function of the recorded "
+                    "observations: each bin contributes its share of "
+                    "the total, weighted by its count",
+                    "ECE changes when the same observations are "
+                    "re-binned without re-measuring",
+                ),
+                _a(
+                    "ECE 0 means agreement matched confidence in the "
+                    "printed bins on average, not that the judge is "
+                    "calibrated on unseen items",
+                    "an ECE of 0 is quoted as proof of calibration on "
+                    "new items",
+                ),
+                _a(
+                    "ECE is a different aggregate from the per-bin "
+                    "calibration gap: the gap compares confidence "
+                    "against the Wilson lower bound of agreement, ECE "
+                    "against the agreement rate itself",
+                    "the ECE number is quoted as the per-bin gap",
                 ),
             ),
         ),
@@ -623,6 +703,24 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
                     "pooled arm totals, which must equal the summed "
                     "strata",
                     "the pooled totals disagree with the summed strata",
+                ),
+            ),
+        ),
+        "treated_share": MetricSpec(
+            name="treated_share",
+            kind=MetricKind.HARD,
+            phenomenon="share of treated cases within one stratum "
+            "(treated count over the stratum total)",
+            assumptions=(
+                _a(
+                    "The share is the treated count over the stratum's "
+                    "own total, never over the pooled arms",
+                    "a stratum share is computed from pooled counts",
+                ),
+                _a(
+                    "Stratum membership is recorded before the outcome, "
+                    "not assigned after seeing it",
+                    "a case moves strata after its outcome is known",
                 ),
             ),
         ),
@@ -813,6 +911,58 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
                 ),
             ),
         ),
+        "alt_conservative_score": MetricSpec(
+            name="alt_conservative_score",
+            kind=MetricKind.HARD,
+            phenomenon="the conservative score printed in the ranking "
+            "column: mean Wilson 95% lower bound on the win rate (over "
+            "covered cells for ranked judges, over all cells as the "
+            "diagnostic for masked judges)",
+            assumptions=(
+                _a(
+                    "The score is a deterministic function of the "
+                    "recorded pairwise comparisons: each cell's Wilson "
+                    "lower bound, averaged over the cells the column "
+                    "says it covers",
+                    "a conservative score is quoted from comparisons "
+                    "that were never recorded",
+                ),
+                _a(
+                    "Ranking is refused, not published, when any ranked "
+                    "judge's cells fall below the coverage floors",
+                    "a ranking is quoted over cells below the floor",
+                ),
+                _a(
+                    "A masked judge's diagnostic is the same bound over "
+                    "all its cells, not the covered-cells score: the "
+                    "two numbers are not comparable across the "
+                    "RANKED/MASKED line",
+                    "a masked diagnostic is quoted as a ranked "
+                    "conservative score",
+                ),
+            ),
+        ),
+        "alt_annotator_rho": MetricSpec(
+            name="alt_annotator_rho",
+            kind=MetricKind.HARD,
+            phenomenon="per-annotator mean win probability rho_f: the "
+            "mean of n binary wins for one judge against one annotator",
+            assumptions=(
+                _a(
+                    "rho_f is the mean of n recorded binary wins, so "
+                    "round(rho_f * n) recovers the integer win count "
+                    "exactly",
+                    "a rho_f is quoted with no n to recover the wins "
+                    "from",
+                ),
+                _a(
+                    "The wins are recorded pairwise comparisons, never "
+                    "live judgments",
+                    "a rho_f is quoted from comparisons that were never "
+                    "recorded",
+                ),
+            ),
+        ),
         "gate_catch_rate": MetricSpec(
             name="gate_catch_rate",
             kind=MetricKind.HARD,
@@ -829,6 +979,64 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
                     "The ledger is append-only: a run's catch verdict is "
                     "written once and never edited",
                     "a ledger entry is edited after the run",
+                ),
+            ),
+        ),
+        "prior_score": MetricSpec(
+            name="prior_score",
+            kind=MetricKind.HARD,
+            phenomenon="a case's recorded score in a previous snapshot "
+            "version, printed as promotion provenance",
+            assumptions=(
+                _a(
+                    "The score is the recorded score from the named "
+                    "previous version, never re-scored at print time",
+                    "a prior score is quoted as the case's current score",
+                ),
+                _a(
+                    "The promotion names the failure the case was "
+                    "promoted from, so the score is traceable to its "
+                    "origin",
+                    "a prior score is quoted with no promotion record "
+                    "behind it",
+                ),
+            ),
+        ),
+        "regression_counts": MetricSpec(
+            name="regression_counts",
+            kind=MetricKind.HARD,
+            phenomenon="cases mined, new, updated, and retired in one "
+            "scheduled tracebench regression run",
+            assumptions=(
+                _a(
+                    "The counts are read off the mined benchmark and "
+                    "the frozen store for this run, never estimated",
+                    "a count is quoted for cases the run never mined",
+                ),
+                _a(
+                    "A case counts as updated only when its content "
+                    "changed since the previous version; a case whose "
+                    "trace left the corpus counts as retired, except "
+                    "when the mine yields nothing at all",
+                    "an unreadable corpus retires the whole benchmark",
+                ),
+            ),
+        ),
+        "regression_streak": MetricSpec(
+            name="regression_streak",
+            kind=MetricKind.HARD,
+            phenomenon="consecutive failed scheduled regression runs "
+            "(the rollback streak)",
+            assumptions=(
+                _a(
+                    "The streak counts consecutive GATE_FAIL runs in "
+                    "the chained run state, reset by a GATE_PASS",
+                    "a streak is quoted after a run that never gated",
+                ),
+                _a(
+                    "The streak is the number the rollback action "
+                    "dispatches on, so it is never hand-fed per run",
+                    "an operator resets the streak without a passing run",
                 ),
             ),
         ),
@@ -872,7 +1080,10 @@ class LedgerAudit:
     like Decision's verdicts: a frozen dataclass alone does not stop
     dict mutation. The audit renders from the ledger it audited, never
     from module global state. An audit with no findings audited
-    nothing and is not clean.
+    nothing: it is not a failure, it is nothing to gate on — ``all_ok``
+    is True, the summary says so, and ``--strict-ledger`` passes
+    through. Callers that must have audited something check
+    ``findings`` themselves.
     """
 
     findings: tuple[LedgerFinding, ...] = field(default_factory=tuple)
@@ -893,23 +1104,26 @@ class LedgerAudit:
 
     @property
     def all_ok(self) -> bool:
-        """True only when at least one metric was audited and none flagged."""
-        return bool(self.findings) and not self.flagged
+        """True when nothing was flagged. An empty audit audited
+        nothing, so there is nothing to flag: it passes through, and
+        a report that measured nothing says so in its summary instead
+        of claiming a clean audit."""
+        return not self.flagged
 
     def summary(self, report: str | None = None) -> str:
         """Human-readable listing: every metric with its kind, backup,
         and assumption texts with falsifiers. A flagged metric is
-        named with its remediation, never hidden."""
+        named with its remediation, never hidden. An audit that
+        measured nothing never prints an "N/N clean" headline."""
         title = "Metric ledger" + (f" ({report})" if report else "")
+        if not self.findings:
+            return f"{title}: no metrics measured — nothing audited"
         lines = [
             (
                 f"{title}: {len(self.findings) - len(self.flagged)}"
                 f"/{len(self.findings)} metrics clean"
             )
         ]
-        if not self.findings:
-            lines.append("  no metrics audited — nothing was checked")
-            return "\n".join(lines)
         for finding in sorted(self.findings, key=lambda f: f.metric):
             spec = self.ledger.get(finding.metric)
             if spec is None:
@@ -956,6 +1170,36 @@ class LedgerAudit:
         }
 
 
+def _normalized_spec(name: str, spec: object) -> MetricSpec:
+    """Re-validate one ledger entry and return a proper MetricSpec.
+
+    The audit accepts only ``MetricSpec`` values (anything else
+    raises TypeError, mirroring ``audit_ledger``) and coerces the
+    kind: a spec built by bypassing ``__post_init__`` with a plain
+    ``"soft"`` string is audited as SOFT, and a garbage kind raises
+    ValueError instead of auditing clean. Rebuilding through
+    ``dataclasses.replace`` re-runs ``__post_init__``, so a
+    hand-built spec is re-checked wholesale (name, phenomenon,
+    assumptions, backup) and the audit stores only valid specs —
+    the summary can never crash on a hand-built kind.
+    """
+    if not isinstance(spec, MetricSpec):
+        raise TypeError(
+            f"ledger entry {name!r} is not a MetricSpec: "
+            f"got {type(spec).__name__}"
+        )
+    try:
+        kind = MetricKind(spec.kind)
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"metric {name!r}: field 'kind' must be 'hard' or "
+            f"'soft', got {spec.kind!r}"
+        ) from None
+    if kind is not spec.kind or not isinstance(spec.assumptions, tuple):
+        return _dataclass_replace(spec, kind=kind)
+    return spec
+
+
 def _audit_entry(
     name: str,
     spec: MetricSpec,
@@ -969,8 +1213,13 @@ def _audit_entry(
     report is flagged FLAGGED_NO_BACKUP: naming a backup in the
     registry is not proof it exists in the report. When ``measured``
     is None the audited set itself counts as measured (whole-ledger
-    audits and the names-only wrapper).
+    audits and the names-only wrapper). The spec is re-validated
+    here too, so a direct caller gets the same fail-closed behavior
+    as the audit entry points: a non-``MetricSpec`` raises
+    TypeError, a garbage kind raises ValueError, and a plain-string
+    kind is coerced before the softness decision is made.
     """
+    spec = _normalized_spec(name, spec)
     if spec.name != name:
         return LedgerFinding(
             metric=name,
@@ -999,7 +1248,8 @@ def _audit_entry(
                 status=LedgerStatus.FLAGGED_BAD_BACKUP,
                 detail=f"hard backup {backup!r} is not in the ledger",
             )
-        if ledger[backup].kind is not MetricKind.HARD:
+        backup_spec = _normalized_spec(backup, ledger[backup])
+        if backup_spec.kind is not MetricKind.HARD:
             return LedgerFinding(
                 metric=name,
                 status=LedgerStatus.FLAGGED_BAD_BACKUP,
@@ -1039,22 +1289,23 @@ def audit_ledger(
     assumption-free specs, so the audit re-verifies defensively: a
     hand-built mapping cannot slip a bad entry past it. A value that
     is not a MetricSpec raises TypeError — the audit fails closed,
-    never silently passes a malformed entry. Note the shipped ledger
+    never silently passes a malformed entry. The audit stores the
+    re-validated specs, so the summary renders real ``MetricKind``
+    values even for hand-built entries. Note the shipped ledger
     is NOT all-clean by design: ``calibration_gap`` and
     ``perturbation_stability`` are filed unbacked on purpose (no
     independent backup exists) and are flagged here, exactly as they
     are flagged in the reports that print them.
     """
     findings: list[LedgerFinding] = []
-    for name in sorted(ledger):
-        spec = ledger[name]
-        if not isinstance(spec, MetricSpec):
-            raise TypeError(
-                f"ledger entry {name!r} is not a MetricSpec: "
-                f"got {type(spec).__name__}"
-            )
-        findings.append(_audit_entry(name, spec, ledger))
-    return LedgerAudit(findings=tuple(findings), ledger=ledger)
+    # Normalize the whole ledger first: a soft metric's backup may
+    # sort after it, and the backup-kind check must see it.
+    normalized: dict[str, MetricSpec] = {
+        name: _normalized_spec(name, ledger[name]) for name in sorted(ledger)
+    }
+    for name in sorted(normalized):
+        findings.append(_audit_entry(name, normalized[name], normalized))
+    return LedgerAudit(findings=tuple(findings), ledger=normalized)
 
 
 def audit_measured(
@@ -1071,7 +1322,11 @@ def audit_measured(
     flagged FLAGGED_NO_BACKUP. A printed metric with no ledger entry
     is flagged FLAGGED_NOT_IN_LEDGER, never silently clean. A bare
     string is refused (TypeError): auditing its characters would be a
-    latent footgun, not a report.
+    latent footgun, not a report. A ledger value that is not a
+    MetricSpec raises TypeError, and a hand-built spec with a
+    non-Enum kind is coerced (garbage kind raises ValueError) —
+    the audit fails closed, never silently passes a malformed entry,
+    and the audit stores the re-validated specs.
     """
     if isinstance(measured, (str, bytes)) or not isinstance(measured, Mapping):
         raise TypeError(
@@ -1079,9 +1334,28 @@ def audit_measured(
             f"got {type(measured).__name__}"
         )
     names = frozenset(name for name, was in measured.items() if was)
-    findings: list[LedgerFinding] = []
+    # Normalize the measured entries and the backups they name, so
+    # the backup-kind check and the summary both see real MetricKind
+    # values. Entries the report did not measure are never touched.
+    normalized: dict[str, MetricSpec] = {}
     for name in sorted(names):
         spec = ledger.get(name)
+        if spec is not None:
+            normalized[name] = _normalized_spec(name, spec)
+    for name in sorted(names):
+        spec = ledger.get(name)
+        if (
+            isinstance(spec, MetricSpec)
+            and isinstance(spec.hard_backup, str)
+            and spec.hard_backup in ledger
+            and spec.hard_backup not in normalized
+        ):
+            normalized[spec.hard_backup] = _normalized_spec(
+                spec.hard_backup, ledger[spec.hard_backup]
+            )
+    findings: list[LedgerFinding] = []
+    for name in sorted(names):
+        spec = normalized.get(name)
         if spec is None:
             findings.append(
                 LedgerFinding(
@@ -1091,8 +1365,10 @@ def audit_measured(
                 )
             )
         else:
-            findings.append(_audit_entry(name, spec, ledger, measured=names))
-    return LedgerAudit(findings=tuple(findings), ledger=ledger)
+            findings.append(
+                _audit_entry(name, spec, normalized, measured=names)
+            )
+    return LedgerAudit(findings=tuple(findings), ledger=normalized)
 
 
 def audit_report(
@@ -1119,12 +1395,14 @@ def audit_report(
 
 
 def require_ledger_ok(audit: LedgerAudit) -> None:
-    """Raise on a flagged (or empty) ledger audit, naming the flagged
-    metrics. Callers that gate on the ledger use this; report printers
-    use :meth:`LedgerAudit.summary` and let the reader see the flag."""
-    if not audit.all_ok:
-        if not audit.findings:
-            raise ValueError("metric ledger audit checked no metrics")
+    """Raise on a flagged ledger audit, naming the flagged metrics.
+    Callers that gate on the ledger use this; report printers use
+    :meth:`LedgerAudit.summary` and let the reader see the flag. An
+    empty audit passes: it audited nothing, so there is nothing to
+    gate on — a command whose legitimate output measures no metric
+    (tiered gate phase, a too-small calibration file) must not fail
+    a strict gate that names zero flagged metrics."""
+    if audit.flagged:
         raise ValueError(
             "metric ledger has flagged metrics: " + ", ".join(audit.flagged)
         )

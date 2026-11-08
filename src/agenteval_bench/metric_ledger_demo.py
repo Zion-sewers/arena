@@ -32,8 +32,9 @@ only if every acceptance expectation holds:
   refuses a spec with unknown keys;
 - the audit summary prints the assumption texts, and to_dict carries
   the full specs;
-- an empty audit is not clean, and require_ledger_ok raises on a
-  flagged audit.
+- an empty audit measures nothing, so it passes through: its
+  summary says "no metrics measured", never "0/0 metrics clean",
+  and require_ledger_ok raises on a flagged audit, not an empty one.
 
 Any failure raises, so CI can gate on this demo directly.
 """
@@ -309,7 +310,45 @@ def main() -> int:
         "audit flags a soft metric backed by a SOFT metric",
     )
     empty = audit_ledger({})
-    _expect(not empty.all_ok, "an empty ledger audit is not clean")
+    _expect(empty.all_ok, "an empty ledger audit passes through: "
+            "nothing was measured, so there is nothing to flag")
+    _expect(
+        "no metrics measured" in empty.summary()
+        and "0/0 metrics clean" not in empty.summary(),
+        "an empty audit never prints an 'N/N clean' headline",
+    )
+    _expect(
+        empty.to_dict()["all_ok"] is True,
+        "an empty audit's JSON never pairs a PASS with all_ok false",
+    )
+    try:
+        require_ledger_ok(empty)
+    except ValueError:  # pragma: no cover - the pass is the expectation
+        raise AssertionError("require_ledger_ok refused an empty audit")
+    else:
+        _expect(True, "require_ledger_ok passes an empty audit")
+    # Round 4 (impl B1): a spec built by bypassing __post_init__ with
+    # a plain-string kind is audited as the kind it names, and the
+    # summary renders it without crashing.
+    sneaky = object.__new__(MetricSpec)
+    object.__setattr__(sneaky, "name", "sneaky_soft")
+    object.__setattr__(sneaky, "kind", "soft")
+    object.__setattr__(sneaky, "phenomenon", "how good it felt")
+    object.__setattr__(
+        sneaky, "assumptions", (MetricAssumption(text="t", falsifier="f"),)
+    )
+    object.__setattr__(sneaky, "hard_backup", None)
+    sneaky_audit = audit_measured(
+        {"sneaky_soft": True}, ledger={"sneaky_soft": sneaky}
+    )
+    _expect(
+        sneaky_audit.flagged == ["sneaky_soft"],
+        "a bypassed soft kind audits flagged, never clean",
+    )
+    _expect(
+        "sneaky_soft" in sneaky_audit.summary(),
+        "the summary renders a bypassed-kind audit without crashing",
+    )
     try:
         require_ledger_ok(ghost)
     except ValueError:

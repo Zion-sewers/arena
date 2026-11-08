@@ -272,12 +272,65 @@ class TestSoftNeedsHardBackup:
         with pytest.raises(TypeError, match="not a MetricSpec"):
             audit_ledger({"x": "not a spec"})  # type: ignore[arg-type]
 
-    def test_empty_ledger_audit_is_not_clean(self) -> None:
+    def test_empty_ledger_audit_is_pass_through(self) -> None:
+        # Round 4: an audit that measured nothing is not a failure —
+        # it is nothing to gate on. Its summary never prints "0/0
+        # metrics clean", its JSON never pairs a PASS with all_ok
+        # false, and --strict-ledger passes through on it.
         audit = audit_ledger({})
-        assert not audit.all_ok
-        assert "no metrics audited" in audit.summary()
-        with pytest.raises(ValueError, match="no metrics"):
-            require_ledger_ok(audit)
+        assert audit.all_ok
+        assert audit.flagged == []
+        assert "no metrics measured" in audit.summary()
+        assert "0/0 metrics clean" not in audit.summary()
+        require_ledger_ok(audit)  # must not raise
+        assert audit.to_dict()["all_ok"] is True
+
+    def test_audit_measured_rejects_non_spec_entry(self) -> None:
+        # Round-4 B1 (impl): a hand-built non-MetricSpec entry fails
+        # closed in audit_measured, exactly as audit_ledger already
+        # refused it — a duck-typed soft metric with no backup must
+        # never audit clean.
+        import types
+
+        fake = types.SimpleNamespace(
+            name="my_soft",
+            kind="soft",
+            phenomenon="x",
+            assumptions=[_assumption()],
+            hard_backup=None,
+        )
+        with pytest.raises(TypeError, match="not a MetricSpec"):
+            audit_measured({"my_soft": True}, ledger={"my_soft": fake})  # type: ignore[arg-type]
+
+    def test_audit_coerces_bypassed_kind_and_never_crashes_summary(self) -> None:
+        # Round-4 B1 (impl): a MetricSpec built by bypassing
+        # __post_init__ with a plain-string kind is audited as the
+        # kind it names, and the summary renders it without crashing.
+        sneaky = object.__new__(MetricSpec)
+        object.__setattr__(sneaky, "name", "sneaky_soft")
+        object.__setattr__(sneaky, "kind", "soft")
+        object.__setattr__(sneaky, "phenomenon", "how good it felt")
+        object.__setattr__(sneaky, "assumptions", (_assumption(),))
+        object.__setattr__(sneaky, "hard_backup", None)
+        audit = audit_measured({"sneaky_soft": True}, ledger={"sneaky_soft": sneaky})
+        assert audit.flagged == ["sneaky_soft"]
+        assert (
+            audit.findings[0].status is LedgerStatus.FLAGGED_NO_BACKUP
+        )
+        summary = audit.summary("round-4")
+        assert "sneaky_soft" in summary
+        assert "soft" in summary
+        assert audit.to_dict()["metrics"]["sneaky_soft"]["kind"] == "soft"
+
+    def test_audit_raises_on_bypassed_garbage_kind(self) -> None:
+        sneaky = object.__new__(MetricSpec)
+        object.__setattr__(sneaky, "name", "sneaky")
+        object.__setattr__(sneaky, "kind", "banana")
+        object.__setattr__(sneaky, "phenomenon", "x")
+        object.__setattr__(sneaky, "assumptions", (_assumption(),))
+        object.__setattr__(sneaky, "hard_backup", None)
+        with pytest.raises(ValueError, match="kind"):
+            audit_measured({"sneaky": True}, ledger={"sneaky": sneaky})
 
     def test_require_ledger_ok_raises_on_flagged(self) -> None:
         audit = audit_ledger({"vibes": _soft("vibes", "ghost")})
@@ -349,6 +402,37 @@ class TestShippedLedger:
     def test_shipped_ledger_has_both_kinds(self) -> None:
         kinds = {spec.kind for spec in METRIC_LEDGER.values()}
         assert kinds == {MetricKind.HARD, MetricKind.SOFT}
+
+    def test_round4_entries_exist_with_assumptions(self) -> None:
+        # Round 4: ece (the headline calibrate number, own entry),
+        # treated_share (simpson), the alt-test ranking numbers,
+        # prior_score (snapshot promotions), and the tracebench
+        # regression aggregates — every one HARD, every one with
+        # assumptions and a falsifier.
+        for name in (
+            "ece",
+            "treated_share",
+            "alt_conservative_score",
+            "alt_annotator_rho",
+            "prior_score",
+            "regression_counts",
+            "regression_streak",
+        ):
+            assert name in METRIC_LEDGER, f"{name} missing from the ledger"
+            spec = METRIC_LEDGER[name]
+            assert spec.kind is MetricKind.HARD
+            assert spec.assumptions
+            assert spec.hard_backup is None
+
+    def test_ece_is_not_the_calibration_gap(self) -> None:
+        # Round-4 B1 (arch): the per-bin gap (confidence minus the
+        # Wilson lower bound of agreement) and ECE (bin-weighted mean
+        # absolute difference) are different formulas — the gap's
+        # phenomenon must not claim ECE is its aggregate.
+        gap = METRIC_LEDGER["calibration_gap"]
+        assert "ECE is the bin-weighted aggregate" not in gap.phenomenon
+        assert "different aggregate" in gap.phenomenon
+        assert METRIC_LEDGER["ece"].phenomenon != gap.phenomenon
 
     def test_every_soft_metric_backed_by_hard_or_flagged_unbacked(self) -> None:
         for spec in METRIC_LEDGER.values():

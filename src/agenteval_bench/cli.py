@@ -281,6 +281,18 @@ def cmd_run(args: list[str]) -> int:
         "Ledger HARD/SOFT says how each number is measured; validity "
         "grades govern whether to trust it here."
     )
+    # The ledger headline covers the printed aggregate only. The
+    # validity table above grades matcher proxies (contains, regex,
+    # json_schema, exact_match): their ledger entries are audited
+    # only when a validation run measured them, so a "1/1 clean"
+    # headline never certifies the table's trust verdicts.
+    print(
+        "Ledger headline covers the printed aggregate only "
+        "(pass_rate, plus the validated matcher when --validity-labels "
+        "measured it). The validity table grades matcher proxies; "
+        "their ledger entries are audited only when a validation run "
+        "measured them."
+    )
     # --strict-ledger: a flagged audit fails the run (exit 2, the
     # same code as a failed --ci gate), so a flagged metric cannot
     # pass a gate silently. Default off, mirroring --strict-validity
@@ -548,6 +560,15 @@ def cmd_decide(args: list[str]) -> int:
         "Ledger HARD/SOFT says how each number is measured; validity "
         "grades govern whether to trust it here."
     )
+    # The ledger headline covers the printed dimensions only. The
+    # scorer table above grades matcher proxies: their ledger entries
+    # are audited only when a validation run measured them, so a
+    # "4/4 clean" headline never certifies the table's trust verdicts.
+    print(
+        "Ledger headline covers the printed dimensions only. The "
+        "scorer table grades matcher proxies; their ledger entries "
+        "are audited only when a validation run measured them."
+    )
     # --strict-validity is the enforcement switch: a GATE that rests on an
     # untrusted metric is downgraded to INVESTIGATE. Default off, because
     # replay mode structurally cannot trust reliability (see above), so a
@@ -590,6 +611,13 @@ def cmd_decide(args: list[str]) -> int:
             "validity": validity.to_dict(),
             "scorer_validity": scorer_report.to_dict(),
             "metric_ledger": ledger_audit.to_dict(),
+            "metric_ledger_scope": (
+                "The ledger headline covers the printed dimensions "
+                "only. The scorer table grades matcher proxies; their "
+                "ledger entries are audited only when a validation run "
+                "measured them — the scorer_validity object is a table "
+                "of validity grades, not a ledger metric."
+            ),
             "dimensions": {},
         }
         if evidence_action is not None:
@@ -799,12 +827,18 @@ def cmd_alt_test(args: list[str]) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     # Every metric this report prints lists its assumptions (arena#56):
-    # the leaderboard's winning rates (rho/omega) and the coverage
-    # board, derived from the report object actually printed.
-    ledger_audit = audit_measured({"alt_win_rate": True, "alt_coverage": True})
+    # the audited set follows the board actually printed. A refused
+    # ranking prints only the coverage-gated board (conservative
+    # scores + coverage), never rho/omega or per-annotator rho_f, so
+    # it audits only those two; a ranked board prints the winning
+    # rates, the per-annotator rho_f values, the conservative scores,
+    # and the coverage board, so it audits all four.
     try:
         require_ranking(board)
     except RankingRefused as e:
+        ledger_audit = audit_measured(
+            {"alt_conservative_score": True, "alt_coverage": True}
+        )
         # The gate runs BEFORE anything is printed or written: on
         # refusal there is no ungated leaderboard on stdout and no
         # --out file, because a leaderboard over tiny samples is not a
@@ -815,6 +849,14 @@ def cmd_alt_test(args: list[str]) -> int:
         print(ledger_audit.summary("alt-test"))
         print(f"Refused: {e}", file=sys.stderr)
         return 1
+    ledger_audit = audit_measured(
+        {
+            "alt_win_rate": True,
+            "alt_annotator_rho": True,
+            "alt_conservative_score": True,
+            "alt_coverage": True,
+        }
+    )
     print(render_text(report))
     print(render_ranked(board))
     print(ledger_audit.summary("alt-test"))
@@ -920,10 +962,15 @@ def cmd_simpson(args: list[str]) -> int:
             lines.append(f"  note: {note}")
     print("\n".join(lines))
     # Every metric this report prints lists its assumptions (arena#56):
-    # the per-stratum rates and the pooled delta, derived from the
-    # verdict object actually printed.
+    # the per-stratum rates, the treated share printed on each
+    # stratum line, and the pooled delta, derived from the verdict
+    # object actually printed.
     ledger_audit = audit_measured(
-        {"simpson_stratum_rate": True, "simpson_pooled_delta": True}
+        {
+            "simpson_stratum_rate": True,
+            "treated_share": True,
+            "simpson_pooled_delta": True,
+        }
     )
     print(ledger_audit.summary("simpson"))
     if out:
@@ -1086,25 +1133,52 @@ def cmd_calibrate(args: list[str]) -> int:
         return 1
     record = calibrate(judge, observations, policy)
     # Every metric this report prints lists its assumptions (arena#56):
-    # the agreement rate and the calibration gap (ECE is the
-    # bin-weighted aggregate of the same gap), derived from the record
-    # actually printed. The gap is filed UNBACKED on purpose — it is
-    # computed from the agreement rate itself — so the audit flags it
-    # in every report; the flag is the honesty, not a defect.
-    ledger_audit = audit_measured(
-        {"agreement_rate": True, "calibration_gap": True}
-    )
+    # the audit is derived from the record actually printed — the
+    # agreement rate and the per-bin gap only when bins were printed,
+    # ECE only when it was computed. With too few observations no bin
+    # and no ECE is printed, so nothing is audited and the summary
+    # says so instead of certifying an agreement rate the report
+    # never showed. ECE is its own entry: the per-bin gap compares
+    # confidence against the Wilson lower bound of agreement, ECE is
+    # the bin-weighted mean absolute difference. The gap is filed
+    # UNBACKED on purpose — it is computed from the agreement rate
+    # itself — so the audit flags it in every report that prints it;
+    # the flag is the honesty, not a defect.
+    reported: dict[str, bool] = {}
+    if record.bins:
+        reported["agreement_rate"] = True
+        reported["calibration_gap"] = True
+    if record.ece is not None:
+        reported["ece"] = True
+    ledger_audit = audit_measured(reported)
     ledger_json = ledger_audit.to_dict()
+    flagged = bool(ledger_audit.flagged)
+    # The grade is the bin-check outcome (measured, and the live gate
+    # runs on it via require_calibrated); the ECE/gap number is
+    # unbacked and must never be quoted as verified. The headline
+    # therefore carries the flag next to the number, and the gating
+    # sentence scopes gating to the bin-check grade, never to ECE.
+    payload = record.to_dict()
+    payload["metric_ledger"] = ledger_json
+    if flagged:
+        payload["status_note"] = (
+            "Bin-check grade only: the calibration gap (ECE) is "
+            "unbacked — no independent hard measurement exists for "
+            "it. Do not quote ECE as verified, and do not gate on the "
+            "ECE number; gating runs on the bin-check grade via "
+            "require_calibrated."
+        )
     if as_json:
-        payload = record.to_dict()
-        payload["metric_ledger"] = ledger_json
         print(json.dumps(payload, indent=2))
     else:
         ece = "n/a" if record.ece is None else f"{record.ece:.3f}"
-        print(
+        headline = (
             f"judge {record.judge}: {record.status} "
             f"({record.n_total} observations, ECE {ece})"
         )
+        if flagged:
+            headline += " — ECE unbacked (see ledger): do not quote it as verified"
+        print(headline)
         if record.policy != default_calibration_policy():
             print(
                 "  policy (non-default): "
@@ -1127,15 +1201,21 @@ def cmd_calibrate(args: list[str]) -> int:
         for note in record.notes:
             print(f"  ~ {note}")
         if record.status == "calibrated":
-            print("This judge's scores may gate once a live judge transport calls require_calibrated.")
+            if flagged:
+                print(
+                    "This judge's scores may gate once a live judge transport "
+                    "calls require_calibrated — on the bin-check grade above, "
+                    "not on the ECE number: the calibration gap is flagged "
+                    "unbacked, so ECE must not be quoted as verified."
+                )
+            else:
+                print("This judge's scores may gate once a live judge transport calls require_calibrated.")
         else:
             print("This judge's scores must not gate: confidence is not evidence.")
         print(ledger_audit.summary("calibrate"))
     if out:
         try:
             with open(out, "w", encoding="utf-8") as f:
-                payload = record.to_dict()
-                payload["metric_ledger"] = ledger_json
                 f.write(json.dumps(payload, indent=2) + "\n")
         except OSError as e:
             print(f"Error: cannot write report: {e}", file=sys.stderr)
@@ -1477,15 +1557,44 @@ def cmd_perturb(args: list[str]) -> int:
     ):
         reported["perturbation_stability"] = True
     ledger_audit = audit_measured(reported)
+    stability_flagged = "perturbation_stability" in ledger_audit.flagged
+    # A STABLE verdict resting on the flagged stability label is
+    # downgraded in the artifact itself under --strict-ledger, not
+    # just in the exit code: a report a reader quotes must not say
+    # STABLE while its own ledger flags the label. In default mode
+    # the verdict line carries the flag next to STABLE instead, so
+    # the label is never quoted without its qualification.
+    downgraded = bool(
+        strict_ledger
+        and not ledger_audit.all_ok
+        and verdict.outcome == "stable"
+    )
+    display_outcome = "unstable" if downgraded else verdict.outcome
+    display_reasons = list(verdict.reasons)
+    if downgraded:
+        display_reasons.append(
+            "Ledger gate (strict): stability label unbacked — STABLE "
+            "downgraded to UNSTABLE"
+        )
+    verdict_payload = verdict.to_dict()
+    verdict_payload["outcome"] = display_outcome
+    verdict_payload["reasons"] = display_reasons
     payload = {
         "report": report.to_dict(),
-        "verdict": verdict.to_dict(),
+        "verdict": verdict_payload,
         "metric_ledger": ledger_audit.to_dict(),
         "scope": (
             "adversarial is a fixed 3-template prompt-injection "
             "battery, not an adaptive adversary"
         ),
     }
+    if stability_flagged and not downgraded:
+        payload["verdict_note"] = (
+            "Stability label unbacked: the drops above are measured "
+            "pass-rate differences, but the STABLE label itself has no "
+            "independent hard backup — do not quote STABLE as verified "
+            "stability."
+        )
     if as_json:
         print(json.dumps(payload, indent=2))
     else:
@@ -1519,8 +1628,11 @@ def cmd_perturb(args: list[str]) -> int:
             f"  drops: clean->light {_pct(verdict.clean_to_light_drop)}, "
             f"clean->adversarial {_pct(verdict.clean_to_adversarial_drop)}"
         )
-        print(f"  verdict: {verdict.outcome.upper()}")
-        for reason in verdict.reasons:
+        verdict_line = f"  verdict: {display_outcome.upper()}"
+        if stability_flagged and display_outcome == "stable":
+            verdict_line += " (stability label unbacked — see ledger)"
+        print(verdict_line)
+        for reason in display_reasons:
             print(f"  ! {reason}")
         print(
             "  note: adversarial is a fixed 3-template prompt-injection "
@@ -1538,15 +1650,16 @@ def cmd_perturb(args: list[str]) -> int:
     # --strict-ledger: a STABLE verdict resting on a flagged metric is
     # downgraded to UNSTABLE (exit 1), so a flagged stability number
     # cannot gate a release. Default off; other outcomes already exit
-    # non-zero.
-    if strict_ledger and not ledger_audit.all_ok and verdict.outcome == "stable":
+    # non-zero. The downgrade is applied to the artifact above, so
+    # this only reports it and sets the exit code.
+    if downgraded:
         print(
             "Ledger gate (strict): STABLE downgraded to UNSTABLE — "
             "flagged metrics: " + ", ".join(ledger_audit.flagged),
             file=sys.stderr,
         )
         return 1
-    return {"stable": 0, "unstable": 1, "unmeasured": 2}[verdict.outcome]
+    return {"stable": 0, "unstable": 1, "unmeasured": 2}[display_outcome]
 
 
 def cmd_ship(args: list[str]) -> int:
@@ -2087,16 +2200,20 @@ def cmd_snapshot(args: list[str]) -> int:
             print(f"feedback loop: {meta.feedback_loop}")
         print(f"cases: {len(suite.cases)}  "
               f"baseline: pass_rate {base.pass_rate:.1%} (agent={base.agent}, seed={base.seed})")
-        # Every metric this report prints lists its assumptions
-        # (arena#56): the baseline pass_rate, derived from the
-        # version object actually printed.
-        print(audit_measured({"pass_rate": True}).summary("snapshot show"))
         if version.promotions:
             print(f"promotions ({len(version.promotions)}):")
             for p in version.promotions:
                 print(f"  - {p.get('promoted_case_id')} "
                       f"<- {p.get('kind')}:{p.get('failure_id')} "
                       f"(prior_score={p.get('prior_score')})")
+        # Every metric this report prints lists its assumptions
+        # (arena#56): the baseline pass_rate, plus the prior scores
+        # printed as promotion provenance, derived from the version
+        # object actually printed.
+        reported = {"pass_rate": True}
+        if version.promotions:
+            reported["prior_score"] = True
+        print(audit_measured(reported).summary("snapshot show"))
         return 0
     if sub == "compare":
         return _snapshot_compare(rest)
@@ -2474,8 +2591,11 @@ def cmd_tiered(args: list[str]) -> int:
         print(f"mutation score: {report.mutation_score:.0%}")
         tiered_metrics["mutation_score"] = True
     ledger_audit = audit_measured(tiered_metrics)
-    if tiered_metrics:
-        print(ledger_audit.summary("tiered"))
+    # The summary prints even when the phase measured nothing: an
+    # empty audit says "no metrics measured", never silence and never
+    # "0/0 metrics clean" — and an empty audit passes --strict-ledger
+    # through, so the gate phase cannot fail naming zero metrics.
+    print(ledger_audit.summary("tiered"))
     print(f"verdict: {report.verdict}")
     if out:
         try:
@@ -2702,13 +2822,51 @@ def _tracebench_regress(args: list[str]) -> int:
     print(f"Report: {result.report_path}")
     print(f"Action ledger: {result.actions_path}")
     print(f"Manifest: {result.manifest_path}")
-    print(
-        "Note: the regression aggregates above (mined/new/updated/"
-        "retired counts and the gate verdict) are not yet covered by "
-        "the metric ledger — the candidate pass_rate behind the "
-        "verdict is audited in the snapshot-compare step (see "
-        "docs/METRIC-LEDGER.md)."
+    # Every metric this report prints lists its assumptions (arena#56):
+    # the candidate pass rate behind the gate verdict — read back
+    # from the comparison object actually written to report.json, so
+    # the audit covers the number the verdict rests on — plus the
+    # mined/new/updated/retired counts and the consecutive-failure
+    # streak the rollback action dispatches on. The corpus trace
+    # count is a pipeline input count, a component of the mined
+    # counts, not a scored metric. The ledger is written back into
+    # report.json, so the filed artifact carries it.
+    try:
+        with open(result.report_path, encoding="utf-8") as f:
+            report_doc = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Error: cannot read the regression report: {e}", file=sys.stderr)
+        return 1
+    comparison = report_doc.get("comparison", {})
+    if not isinstance(comparison, dict) or comparison.get("candidate_pass_rate") is None:
+        print(
+            "Error: the regression report carries no candidate "
+            "pass_rate — the gate verdict rests on a number the "
+            "report does not show",
+            file=sys.stderr,
+        )
+        return 1
+    ledger_audit = audit_measured(
+        {
+            "pass_rate": True,
+            "regression_counts": True,
+            "regression_streak": True,
+        }
     )
+    report_doc["metric_ledger"] = ledger_audit.to_dict()
+    try:
+        with open(result.report_path, "w", encoding="utf-8") as f:
+            f.write(
+                json.dumps(report_doc, sort_keys=True, indent=2, ensure_ascii=False)
+                + "\n"
+            )
+    except OSError as e:
+        print(
+            f"Error: cannot write the ledger into the report: {e}",
+            file=sys.stderr,
+        )
+        return 1
+    print(ledger_audit.summary("tracebench regress"))
     return 0 if result.verdict == "GATE_PASS" else 2
 
 
@@ -2853,6 +3011,7 @@ def main() -> None:
         print("                                [--min-bin-n 5] [--tolerance 0.10]")
         print("                                [--json] [--out report.json]")
         print("                                (exit 0 calibrated, 2 mis/uncalibrated, 1 bad input)")
+        print("                                (--strict-ledger always refuses: the gap is unbacked by design)")
         print("       agenteval-bench diverge --candidates <file.json>")
         print("                                [--max-pair-similarity 0.80]")
         print("                                [--p-tolerance 0.15]")
@@ -2865,6 +3024,7 @@ def main() -> None:
         print("                                [--emit-inputs] [--json] [--out report.json]")
         print("                                (exit 0 STABLE, 1 UNSTABLE, 2 UNMEASURED, 3 bad input)")
         print("                                (adversarial = fixed 3-template battery, not adaptive)")
+        print("                                (--strict-ledger downgrades STABLE to UNSTABLE: stability unbacked by design)")
         print("       agenteval-bench ship --design <file.json> --evidence <file.json>")
         print("                                [--registry plans/experiments.jsonl]")
         print("                                [--json] [--out report.json]")
