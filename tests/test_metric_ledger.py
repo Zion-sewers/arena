@@ -322,6 +322,32 @@ class TestSoftNeedsHardBackup:
         assert "soft" in summary
         assert audit.to_dict()["metrics"]["sneaky_soft"]["kind"] == "soft"
 
+    def test_audit_raises_on_bypassed_junk_assumption_items(self) -> None:
+        # Round-5 N1 (impl): a MetricSpec built by bypassing
+        # __post_init__ with a proper kind and a tuple of
+        # non-MetricAssumption items must raise loudly at audit time,
+        # never audit clean and crash at render time.
+        sneaky = object.__new__(MetricSpec)
+        object.__setattr__(sneaky, "name", "mixed")
+        object.__setattr__(sneaky, "kind", MetricKind.HARD)
+        object.__setattr__(sneaky, "phenomenon", "a count of things")
+        object.__setattr__(
+            sneaky, "assumptions", (_assumption(), "junk")
+        )
+        object.__setattr__(sneaky, "hard_backup", None)
+        with pytest.raises(TypeError, match="MetricAssumption"):
+            audit_measured({"mixed": True}, ledger={"mixed": sneaky})
+
+    def test_validated_share_is_hard_and_audits_clean(self) -> None:
+        # Round-5 (arch B2): bugsmith's validated share is a reported
+        # proportion over recorded candidate reports — HARD, no backup.
+        audit = audit_measured({"validated_share": True})
+        assert audit.all_ok
+        assert audit.flagged == []
+        spec = METRIC_LEDGER["validated_share"]
+        assert spec.kind is MetricKind.HARD
+        assert spec.hard_backup is None
+
     def test_audit_raises_on_bypassed_garbage_kind(self) -> None:
         sneaky = object.__new__(MetricSpec)
         object.__setattr__(sneaky, "name", "sneaky")

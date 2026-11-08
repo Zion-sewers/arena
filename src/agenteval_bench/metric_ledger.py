@@ -7,15 +7,23 @@ reports print.
 
 The hard/soft line
 ------------------
-HARD: the number is a deterministic function (a count, a sum, or a
-proportion) of recorded observations. Any judgment the count depends on
-— a matcher verdict, a dimension tag, a ground-truth label — is named
-in the metric's assumptions; the count itself adds no further
-inference. SOFT: the number is produced by an inference beyond that
-function — a judge's grade, a gap between a self-report and a
-measurement, an assessment, or a proxy for a phenomenon. The Wilson
-interval is the uncertainty carried WITH a hard proportion, not a
-separate soft metric.
+HARD: the number is a descriptive statistic computed only from
+recorded observations — a count, a sum, a proportion, or a weighted
+mean of recorded values — with no inferential step. SOFT: the
+number's computation consumes an inferred quantity about something
+unobserved — a judge's grade, an interval bound, a label, an
+assessment, or a proxy for a phenomenon. Determinism is not the
+test: a confidence bound is a deterministic function of the sample
+and still an inference. The test is what the number is computed
+FROM. A gap against a recorded measurement is HARD: ECE is the
+bin-weighted mean absolute difference between mean judge confidence
+and the measured agreement rate, both recorded. A gap against an
+inferred quantity is SOFT: the calibration gap compares mean
+confidence against the Wilson lower bound of agreement, a 95%
+interval estimate of the true agreement rate, not a recorded value.
+The Wilson interval is the uncertainty carried WITH a hard
+proportion, not a separate soft metric — unless a number is computed
+from the bound itself, as the gap is.
 
 What "backed by" means, operationally
 -------------------------------------
@@ -94,8 +102,11 @@ raises TypeError, mirroring the parser boundary) and re-validate
 each spec they audit — kind is coerced to ``MetricKind``, so a
 hand-built spec that bypassed ``__post_init__`` with a plain-string
 kind is audited as the kind it names, and a garbage kind raises
-instead of auditing clean. The audit stores the re-validated specs,
-so the summary can never crash on a hand-built kind.
+instead of auditing clean; every assumption item is re-checked to
+be a ``MetricAssumption``, so a bypass-built spec with junk items
+raises instead of auditing clean and crashing at render time. The
+audit stores the re-validated specs, so the summary can never
+crash on a hand-built kind or a hand-built assumption item.
 
 Acceptance (arena#56), enforced here, not in prose:
 - every reported metric lists its assumptions — ``MetricSpec`` refuses
@@ -117,33 +128,44 @@ reports; prespec assumptions gate an analysis plan.
 
 Scope: the ledger covers every metric printed by ``run``, ``decide``,
 ``calibrate``, ``perturb``, ``tiered``, ``simpson``, ``diverge``,
-``ship``, ``alt-test``, ``snapshot`` (show / publish / compare),
-``flywheel``, and ``tracebench regress``; each of those commands
-prints the audit of the metrics it measured (or, for ``flywheel``
-with no runs yet and for a command that measured nothing, says no
-metric was measured) and carries ``metric_ledger`` in its JSON report
-where it writes one. ``baseline`` freezes per-case scores, not an
-aggregate metric: it prints a notice saying so. ``tracebench mine``
-writes benchmark artifacts, not a metric report: it prints an
-in-report notice that the ledger does not apply to its output. The
-judge-allocation command (``judges``) prints no scored metric and is
-out of scope. ``novelty_score`` has no CLI print site and is not in
-the ledger until one exists.
+``ship``, ``alt-test``, ``snapshot`` (show / publish / compare /
+verify / list / check / repair), ``flywheel``, ``bugsmith``, and
+``tracebench regress``; each of those commands prints the audit of
+the metrics it measured (or, for ``flywheel`` with no runs yet and
+for a command that measured nothing, says no metric was measured)
+and carries ``metric_ledger`` in its JSON report where it writes
+one. ``baseline`` freezes per-case scores, not an aggregate metric:
+it prints a notice saying so. ``tracebench mine`` writes benchmark
+artifacts, not a metric report: it prints an in-report notice that
+the ledger does not apply to its output. The judge-allocation
+command (``judges``) prints no scored metric and is out of scope.
+``replay`` prints case counts and a bit-exact verdict, no metric:
+its counts are pipeline bookkeeping, covered by a scan test.
+``register-design``, ``prespec``, and ``register-analysis-plan``
+print a registration digest and a review verdict, no metric: each
+carries a scan test proving no numeric metric line. Coverage is
+enforced by the dispatch test (tests/test_metric_ledger_cli.py):
+it enumerates every command ``main()`` can reach and requires each
+to have a scan test or an explicit out-of-scope notice, so a new
+command fails the test until it is classified. ``novelty_score``
+has no CLI print site and is not in the ledger until one exists.
 
 Flagged verdicts are qualified at the point of the verdict, never
 certified alongside the flag. A report whose audit flags a metric
 must not headline the flagged verdict as a certification: the
-``calibrate`` headline carries the unbacked-gap flag next to the ECE
-number and its gating sentence scopes gating to the bin-check grade
-(the live ``require_calibrated`` gate), never to the ECE number; the
-``perturb`` verdict line carries the unbacked-stability flag next to
-STABLE, and under ``--strict-ledger`` the artifact itself is
-downgraded to UNSTABLE. The grade (bin checks passed, drops within
-policy) is a measured fact and stays; what the report must not do
-is present the flagged number as verified. The validity tables in
-``run`` and ``decide`` grade matcher proxies; the ledger headline
-covers the printed aggregates/dimensions only, and the report says
-so in its own text.
+``calibrate`` headline carries the unbacked-gap flag next to the
+grade and its gating sentence scopes gating to the bin-check grade
+(the live ``require_calibrated`` gate), never to the gap; the
+calibrate JSON qualifies ``status`` itself when flagged and, under
+``--strict-ledger``, writes ``status`` as refused with the grade
+preserved in ``grade``. The ``perturb`` verdict line carries the
+unbacked-stability flag next to STABLE, and under
+``--strict-ledger`` the artifact itself is downgraded to UNSTABLE.
+The grade (bin checks passed, drops within policy) is a measured
+fact and stays; what the report must not do is present the flagged
+number as verified. The validity tables in ``run`` and ``decide``
+grade matcher proxies; the ledger headline covers the printed
+aggregates/dimensions only, and the report says so in its own text.
 """
 
 from __future__ import annotations
@@ -536,11 +558,13 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
                     "a confidence value is quoted as a measured accuracy",
                 ),
                 _a(
-                    "The gap is computed from the same recorded "
-                    "observations as the agreement rate, so the "
-                    "agreement rate cannot independently check it: this "
-                    "metric is filed UNBACKED on purpose, and the audit "
-                    "flags it in every report that prints it",
+                    "The gap consumes an inferred quantity — the Wilson "
+                    "lower bound, a 95% interval estimate of the true "
+                    "agreement rate — so it is SOFT under the ledger "
+                    "rule, and the agreement rate cannot independently "
+                    "check it: this metric is filed UNBACKED on purpose, "
+                    "and the audit flags it in every report that prints "
+                    "it",
                     "the gap is quoted as verified against an independent "
                     "hard measurement",
                 ),
@@ -561,9 +585,10 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
             "(expected calibration error)",
             assumptions=(
                 _a(
-                    "ECE is a deterministic function of the recorded "
-                    "observations: each bin contributes its share of "
-                    "the total, weighted by its count",
+                    "ECE is a descriptive statistic of the recorded "
+                    "sample: each bin contributes its share of the "
+                    "total, weighted by its count, and no inferred "
+                    "quantity enters the computation",
                     "ECE changes when the same observations are "
                     "re-binned without re-measuring",
                 ),
@@ -982,6 +1007,28 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
                 ),
             ),
         ),
+        "validated_share": MetricSpec(
+            name="validated_share",
+            kind=MetricKind.HARD,
+            phenomenon="fraction of mined bugsmith candidate reports "
+            "that break at least one test (the validated share of the "
+            "mining run)",
+            assumptions=(
+                _a(
+                    "The test suite is the oracle: a candidate breaks "
+                    "a test only when the seeded fault changes the "
+                    "outcome",
+                    "a candidate is counted validated on a test that "
+                    "fails for an unrelated reason",
+                ),
+                _a(
+                    "The denominator is the candidate reports this run "
+                    "mined, never reports from another run",
+                    "the share is quoted for candidates the run never "
+                    "mined",
+                ),
+            ),
+        ),
         "prior_score": MetricSpec(
             name="prior_score",
             kind=MetricKind.HARD,
@@ -1177,11 +1224,19 @@ def _normalized_spec(name: str, spec: object) -> MetricSpec:
     raises TypeError, mirroring ``audit_ledger``) and coerces the
     kind: a spec built by bypassing ``__post_init__`` with a plain
     ``"soft"`` string is audited as SOFT, and a garbage kind raises
-    ValueError instead of auditing clean. Rebuilding through
-    ``dataclasses.replace`` re-runs ``__post_init__``, so a
-    hand-built spec is re-checked wholesale (name, phenomenon,
-    assumptions, backup) and the audit stores only valid specs —
-    the summary can never crash on a hand-built kind.
+    ValueError instead of auditing clean. The spec is rebuilt through
+    ``dataclasses.replace`` — which re-runs ``__post_init__`` — when
+    the kind differs, when the assumptions are not a tuple, or when
+    any assumption item is not a ``MetricAssumption``: a bypass-built
+    spec with junk assumption items raises TypeError here, loudly,
+    instead of auditing clean and crashing at render time. A
+    well-typed but misconfigured spec (a HARD metric carrying a
+    backup) is NOT rebuilt, so the audit flags it
+    ``FLAGGED_BAD_BACKUP`` instead of raising: flagging is the
+    audit's job for configuration defects, raising is for malformed
+    values. The audit stores the re-validated specs, so the summary
+    can never crash on a hand-built kind or a hand-built assumption
+    item.
     """
     if not isinstance(spec, MetricSpec):
         raise TypeError(
@@ -1195,7 +1250,11 @@ def _normalized_spec(name: str, spec: object) -> MetricSpec:
             f"metric {name!r}: field 'kind' must be 'hard' or "
             f"'soft', got {spec.kind!r}"
         ) from None
-    if kind is not spec.kind or not isinstance(spec.assumptions, tuple):
+    assumptions = spec.assumptions
+    items_ok = isinstance(assumptions, tuple) and all(
+        isinstance(item, MetricAssumption) for item in assumptions
+    )
+    if kind is not spec.kind or not items_ok:
         return _dataclass_replace(spec, kind=kind)
     return spec
 

@@ -1140,10 +1140,11 @@ def cmd_calibrate(args: list[str]) -> int:
     # says so instead of certifying an agreement rate the report
     # never showed. ECE is its own entry: the per-bin gap compares
     # confidence against the Wilson lower bound of agreement, ECE is
-    # the bin-weighted mean absolute difference. The gap is filed
-    # UNBACKED on purpose — it is computed from the agreement rate
-    # itself — so the audit flags it in every report that prints it;
-    # the flag is the honesty, not a defect.
+    # the bin-weighted mean absolute difference against the agreement
+    # rate itself. The gap is filed UNBACKED on purpose — it consumes
+    # the Wilson bound, an inferred quantity, so no independent hard
+    # measurement exists for it — and the audit flags it in every
+    # report that prints it; the flag is the honesty, not a defect.
     reported: dict[str, bool] = {}
     if record.bins:
         reported["agreement_rate"] = True
@@ -1154,19 +1155,35 @@ def cmd_calibrate(args: list[str]) -> int:
     ledger_json = ledger_audit.to_dict()
     flagged = bool(ledger_audit.flagged)
     # The grade is the bin-check outcome (measured, and the live gate
-    # runs on it via require_calibrated); the ECE/gap number is
+    # runs on it via require_calibrated); the calibration gap is
     # unbacked and must never be quoted as verified. The headline
-    # therefore carries the flag next to the number, and the gating
-    # sentence scopes gating to the bin-check grade, never to ECE.
+    # therefore carries the flag next to the grade, the JSON qualifies
+    # status itself when flagged, and the gating sentence scopes
+    # gating to the bin-check grade, never to the gap. Under
+    # --strict-ledger the written file says refused, not calibrated:
+    # the refusal is decided here, before --out is written, so the
+    # artifact on disk never certifies a refused run.
     payload = record.to_dict()
     payload["metric_ledger"] = ledger_json
+    refused = bool(strict_ledger and not ledger_audit.all_ok)
+    if refused:
+        payload["status"] = "refused (ledger gate)"
+        payload["grade"] = record.status
+    elif flagged:
+        payload["status"] = (
+            f"{record.status} (flagged: "
+            + ", ".join(
+                f"{name} unbacked" for name in ledger_audit.flagged
+            )
+            + ")"
+        )
+        payload["grade"] = record.status
     if flagged:
         payload["status_note"] = (
-            "Bin-check grade only: the calibration gap (ECE) is "
-            "unbacked — no independent hard measurement exists for "
-            "it. Do not quote ECE as verified, and do not gate on the "
-            "ECE number; gating runs on the bin-check grade via "
-            "require_calibrated."
+            "Bin-check grade only: the calibration gap is unbacked — "
+            "no independent hard measurement exists for it. Do not "
+            "quote the gap as verified, and do not gate on the gap; "
+            "gating runs on the bin-check grade via require_calibrated."
         )
     if as_json:
         print(json.dumps(payload, indent=2))
@@ -1177,7 +1194,10 @@ def cmd_calibrate(args: list[str]) -> int:
             f"({record.n_total} observations, ECE {ece})"
         )
         if flagged:
-            headline += " — ECE unbacked (see ledger): do not quote it as verified"
+            headline += (
+                " — calibration gap unbacked (see ledger): "
+                "do not quote it as verified"
+            )
         print(headline)
         if record.policy != default_calibration_policy():
             print(
@@ -1193,7 +1213,7 @@ def cmd_calibrate(args: list[str]) -> int:
                 f"mean confidence {b.mean_confidence:.2f}, measured agreement "
                 f"{b.agreement_rate:.2f} "
                 f"(Wilson 95% [{b.agreement_interval[0]:.2f}, "
-                f"{b.agreement_interval[1]:.2f}]) -> "
+                f"{b.agreement_interval[1]:.2f}]) gap {b.gap:.2f} -> "
                 f"{'pass' if b.passed else 'FAIL'}"
             )
         for reason in record.reasons:
@@ -1205,8 +1225,8 @@ def cmd_calibrate(args: list[str]) -> int:
                 print(
                     "This judge's scores may gate once a live judge transport "
                     "calls require_calibrated — on the bin-check grade above, "
-                    "not on the ECE number: the calibration gap is flagged "
-                    "unbacked, so ECE must not be quoted as verified."
+                    "not on the calibration gap: the gap is flagged "
+                    "unbacked, so do not quote it as verified."
                 )
             else:
                 print("This judge's scores may gate once a live judge transport calls require_calibrated.")
@@ -1588,12 +1608,18 @@ def cmd_perturb(args: list[str]) -> int:
             "battery, not an adaptive adversary"
         ),
     }
-    if stability_flagged and not downgraded:
+    if stability_flagged:
         payload["verdict_note"] = (
             "Stability label unbacked: the drops above are measured "
             "pass-rate differences, but the STABLE label itself has no "
             "independent hard backup — do not quote STABLE as verified "
             "stability."
+            + (
+                " Under --strict-ledger the verdict was downgraded to "
+                "UNSTABLE."
+                if downgraded
+                else ""
+            )
         )
     if as_json:
         print(json.dumps(payload, indent=2))
@@ -2086,6 +2112,12 @@ def cmd_bugsmith(args: list[str]) -> int:
                           f"({c.record.site_description}): {e}", file=sys.stderr)
             valid = [r for r in reports if r.is_valid_instance]
             print(f"validated: {len(valid)}/{len(reports)} instances break >= 1 test")
+            # Every metric this report prints lists its assumptions
+            # (arena#56): the validated share is the one proportion
+            # this command reports; the baseline/curated counts are
+            # pipeline bookkeeping, components of it.
+            bugsmith_audit = audit_measured({"validated_share": True})
+            print(bugsmith_audit.summary("bugsmith"))
             subset = select_subset(config, reports, digest)
             print(f"curated: {len(subset)} instances")
 
@@ -2122,6 +2154,7 @@ def cmd_bugsmith(args: list[str]) -> int:
                 "candidates": len(candidates),
                 "valid_instances": len(valid),
                 "curated": [i.instance_id for i in subset],
+                "metric_ledger": bugsmith_audit.to_dict(),
             }
             (out / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"

@@ -11,17 +11,19 @@ Executable form: `src/agenteval_bench/metric_ledger.py`, demo
 `tests/test_metric_ledger_cli.py` (per-command CLI coverage). The
 ledger audit prints in every covered report and is carried in the
 JSON reports of `decide`, `calibrate`, `perturb`, `tiered`,
-`simpson`, `diverge`, `ship`, `alt-test`, and `tracebench regress`.
+`simpson`, `diverge`, `ship`, `alt-test`, `tracebench regress`, and
+`bugsmith` (manifest.json).
 
 ## The hard/soft line
 
 | Kind | Meaning |
 |---|---|
-| `hard` | The number is a deterministic function (a count, a sum, or a proportion) of recorded observations. Any judgment the count depends on — a matcher verdict, a dimension tag, a ground-truth label — is named in the metric's assumptions; the count itself adds no further inference. |
-| `soft` | The number is produced by an inference beyond that function: a gap between a self-report and a measurement, an assessment, or a proxy for a phenomenon. |
+| `hard` | The number is a descriptive statistic computed only from recorded observations — a count, a sum, a proportion, or a weighted mean of recorded values — with no inferential step. Any judgment the count depends on — a matcher verdict, a dimension tag, a ground-truth label — is named in the metric's assumptions; the count itself adds no further inference. |
+| `soft` | The number's computation consumes an inferred quantity about something unobserved — a judge's grade, an interval bound, a label, an assessment, or a proxy for a phenomenon. Determinism is not the test: a confidence bound is a deterministic function of the sample and still an inference. The test is what the number is computed FROM. A gap against a recorded measurement is HARD: ECE is the bin-weighted mean absolute difference between mean judge confidence and the measured agreement rate, both recorded. A gap against an inferred quantity is SOFT: the calibration gap compares mean confidence against the Wilson lower bound of agreement, a 95% interval estimate of the true agreement rate, not a recorded value. |
 
 The Wilson interval is the uncertainty carried WITH a hard
-proportion, not a separate soft metric.
+proportion, not a separate soft metric — unless a number is computed
+from the bound itself, as the calibration gap is.
 
 ## Components are not metrics
 
@@ -35,14 +37,12 @@ timestamp that the report does not present as a result, it is a
 component; if the report presents it as a result (a rate, a score,
 a z, a delta, a share), it is a metric and needs an entry. The
 growth-scan test enforces the boundary at the observable surface
-(see Enforcement): every decimal/percentage/z/chi2 rendering must
-match a declared pattern tied to an audited metric or a declared
-component. Integer pipeline counts are the documented boundary of
-that scan — they are asserted by the per-command audit tests, not
-the scan — except the three regress integer shapes (mined/new/
-updated/retired counts, corpus trace count, failure streak), which
-the scan does cover because the counts are the audited metric
-there.
+(see Enforcement): every decimal, integer-percent, fraction,
+integer+unit count, or labeled bare-integer rendering must match a
+declared pattern tied to an audited metric or a declared component.
+The scan is format-blind by design: a new metric printed as an
+integer percent or a fraction is caught the same way as one printed
+as a decimal.
 
 ## What "backed by" means
 
@@ -109,6 +109,7 @@ tables print together in `run` and `decide` for this reason.
 | `regression_counts` | hard | — | Cases mined, new, updated, and retired in one scheduled tracebench regression run |
 | `regression_streak` | hard | — | Consecutive failed scheduled regression runs (the rollback streak) |
 | `gate_catch_rate` | hard | — | Fraction of sampled flywheel payloads the gate caught |
+| `validated_share` | hard | — | Fraction of mined bugsmith candidate reports that break at least one test |
 | `calibration_gap` | soft | UNBACKED (flagged) | Per-bin mean judge confidence minus the Wilson lower bound of measured agreement (ECE is a different aggregate and has its own entry) |
 | `perturbation_stability` | soft | UNBACKED (flagged) | Whether the agent's verdict survives input perturbation |
 | `p_conventional` | soft | `conventional_share` | Declared probability the conventional answer is right |
@@ -193,18 +194,23 @@ the honest filing, and the report says so in its own text.
 
 A report may print a flagged metric — that is what the flag is
 for — but the artifact must not certify what it flags. The
-headline carries the flag next to the number (`calibrate` appends
-"ECE unbacked (see ledger): do not quote it as verified"; `perturb`
+headline carries the flag next to the grade (`calibrate` appends
+"calibration gap unbacked (see ledger): do not quote it as verified";
+`perturb`
 appends "(stability label unbacked — see ledger)" to the verdict
 line), the gating sentence scopes gating to the measured grade
 (the bin-check grade for calibrate), never to the flagged number,
 and the JSON carries a `status_note` / `verdict_note` next to the
-grade. The grade itself stays: the bin-check grade and the
+grade. `calibrate` JSON qualifies `status` itself when flagged
+(`"calibrated (flagged: calibration_gap unbacked)"`) and, under
+`--strict-ledger`, writes `status` as `"refused (ledger gate)"`
+with the bin-check grade preserved in `grade`. The grade itself stays: the bin-check grade and the
 drop-threshold verdict are measured facts, and the live gate
 (`require_calibrated` / `check_stability`) is the Python API, not
 the CLI text. Under `--strict-ledger` the artifact itself is
 downgraded (`perturb` STABLE becomes UNSTABLE in stdout, JSON, and
-exit code; `calibrate` already refuses with exit 2).
+exit code; `calibrate` refuses with exit 2 and its written file
+says refused, not calibrated).
 
 The validity table is graded, not audited: `run` and `decide` print
 a scope line in their own text stating the headline covers the
@@ -232,9 +238,11 @@ are covered by the audit it prints.
   reported metric with no entry. It refuses a bare string.
   `audit_measured` and `_audit_entry` re-validate every spec
   through `_normalized_spec` (isinstance check against
-  `MetricSpec`, kind coercion to `MetricKind`): a hand-built spec
+  `MetricSpec`, kind coercion to `MetricKind`, every assumption item
+  re-checked to be a `MetricAssumption`): a hand-built spec
   with a duck-typed shape raises TypeError, a garbage kind raises
-  ValueError, and a bypassed-but-valid kind is coerced and audited
+  ValueError, a bypass-built spec with junk assumption items raises
+  TypeError, and a bypassed-but-valid kind is coerced and audited
   normally — the audit can never certify a spec it never validated.
 - The growth-scan test (`_assert_stdout_covered` in
   `tests/test_metric_ledger_cli.py`) parses each command's stdout:
@@ -245,7 +253,14 @@ are covered by the audit it prints.
   that grows a printed metric without a ledger entry fails here —
   the audit alone cannot catch it, because the audit can only flag
   metrics it is told about. The arch reviewer's exact mutation
-  line is pinned as a failing case.
+  line is pinned as a failing case, along with its integer-percent
+  (`87%`), fraction (`4/5`), and integer-count (`12 tests`) twins.
+- The dispatch test (`test_dispatch_every_command_is_classified`
+  in the same file) parses `main()` plus the `tracebench` and
+  `snapshot` subcommand dispatch and requires every reachable
+  command to have a scan test or an explicit out-of-scope notice:
+  a new command, or a new subcommand, fails the test until it is
+  classified, so coverage cannot silently go stale.
 - `spec_from_dict()` / `ledger_from_dicts()` apply the same rules at
   the untrusted-input boundary, refuse unknown keys (including
   inside assumption mappings) and duplicate assumptions, and use
@@ -292,12 +307,21 @@ is 0.62 fails the same way: quote the hard count, not the soft score.
 
 Covered: every metric printed by `run`, `decide`, `calibrate`,
 `perturb`, `tiered`, `simpson`, `diverge`, `ship`, `alt-test`,
-`snapshot`, `flywheel`, and `tracebench regress` — each prints its
+`snapshot` (show / publish / compare / verify / list / check /
+repair), `flywheel`, `bugsmith`, and `tracebench regress` — each prints its
 audit, and the JSON reports carry `metric_ledger`. NOT covered, with
 an in-report notice instead of silence: `tracebench mine` (gate
 verdict and case counts, not scored metrics) and `baseline` (frozen
 per-case scores, not an aggregate metric). The judge-allocation
 command (`judges`) prints no scored metric and is out of scope.
+`replay` prints case counts and a bit-exact verdict, no metric;
+`register-design`, `prespec`, and `register-analysis-plan` print a
+registration digest and a review verdict, no metric — each carries
+a scan test proving no numeric metric line. Coverage is enforced by
+the dispatch test (`tests/test_metric_ledger_cli.py`): it enumerates
+every command `main()` can reach and requires each to have a scan
+test or an explicit out-of-scope notice, so a new command fails the
+test until it is classified.
 `novelty_score` has no CLI print site and is not in the ledger until
 one exists.
 

@@ -660,7 +660,13 @@ def test_cli_writes_json_report(tmp_path: Path) -> None:
     code = cmd_calibrate(["--observations", str(path), "--json", "--out", str(out)])
     assert code == 0
     report = json.loads(out.read_text(encoding="utf-8"))
-    assert report["status"] == "calibrated" and report["n_total"] == 200
+    # Round-5 (arena#56): the CLI payload qualifies status when the
+    # ledger flags the calibration gap; the record grade stays in
+    # "grade". The record-level to_dict still says "calibrated"
+    # (see test_record_round_trips_through_json).
+    assert report["status"] == "calibrated (flagged: calibration_gap unbacked)"
+    assert report["grade"] == "calibrated"
+    assert report["n_total"] == 200
 
 
 def test_cli_json_stdout_stays_parseable_with_out(
@@ -672,7 +678,10 @@ def test_cli_json_stdout_stays_parseable_with_out(
     assert code == 0
     captured = capsys.readouterr()
     parsed = json.loads(captured.out)  # must not raise "Extra data"
-    assert parsed["status"] == "calibrated"
+    # Round-5 (arena#56): status is qualified when the ledger flags
+    # the gap; the grade is preserved alongside it.
+    assert parsed["status"] == "calibrated (flagged: calibration_gap unbacked)"
+    assert parsed["grade"] == "calibrated"
     assert f"Report: {out}" in captured.err
 
 
