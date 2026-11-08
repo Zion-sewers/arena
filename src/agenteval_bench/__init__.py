@@ -91,6 +91,8 @@ from agenteval_bench.judges import (
     registry_from_json,
 )
 from agenteval_bench.metric_ledger import (
+    METRIC_LEDGER,
+    REPORT_METRIC_SETS,
     LedgerAudit,
     LedgerFinding,
     LedgerStatus,
@@ -98,6 +100,7 @@ from agenteval_bench.metric_ledger import (
     MetricKind,
     MetricSpec,
     audit_ledger,
+    audit_report,
     ledger_from_dicts,
     require_ledger_ok,
     spec_from_dict,
@@ -138,7 +141,9 @@ from agenteval_bench.validity import (
 
 __all__ = [
     "ADVERSARIAL_MARKER",
+    "METRIC_LEDGER",
     "REGIMES",
+    "REPORT_METRIC_SETS",
     "UNKNOWN_FAMILY",
     "AllocationReport",
     "CalibrationBin",
@@ -214,6 +219,7 @@ __all__ = [
     "assess_ranking",
     "assess_scorer",
     "audit_ledger",
+    "audit_report",
     "build_diverge_set",
     "calibrate",
     "candidates_from_json",

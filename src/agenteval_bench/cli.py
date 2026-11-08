@@ -13,6 +13,11 @@ from typing import Any
 
 from agenteval_bench.decision import DecisionPolicy, RiskLevel
 from agenteval_bench.engine import DEFAULT_SEED, EvalRunner
+from agenteval_bench.metric_ledger import (
+    REPORT_METRIC_SETS,
+    audit_report,
+    require_ledger_ok,
+)
 from agenteval_bench.models import EvalSuite
 from agenteval_bench.replay import ReplayCase, ReplayLog, find_mismatches, suite_digest
 
@@ -258,13 +263,17 @@ def cmd_run(args: list[str]) -> int:
         print(f"Validity labels: {labels_path} — {measured.metric} measured: {measured.basis}")
     print(scorer_report.summary())
 
-    # Every reported metric lists its assumptions (arena#56): the
-    # metric-assumption ledger audit prints next to the validity table,
-    # so a soft metric without a hard backup is flagged in the report,
-    # never silently presented.
-    from agenteval_bench.metric_ledger import audit_ledger
-
-    print(audit_ledger().summary())
+    # Every metric this report prints lists its assumptions (arena#56):
+    # the ledger audit is fed exactly the metrics the run printed —
+    # pass_rate plus the scorer's matchers — with each metric's
+    # assumption texts, so a soft metric without a hard backup is
+    # flagged in the report, never silently presented.
+    ledger_audit = audit_report(REPORT_METRIC_SETS["run"])
+    print(ledger_audit.summary("run"))
+    print(
+        "Ledger HARD/SOFT says how each number is measured; validity "
+        "grades govern whether to trust it here."
+    )
 
     if replay_log:
         log = _build_log(suite, suite_path, digest, result, outputs, seed)
@@ -393,6 +402,11 @@ def cmd_decide(args: list[str]) -> int:
     the validity report is untrusted. Default off: replay mode cannot
     trust reliability by construction, so a strict default would make
     `decide` unable to gate at all.
+
+    --strict-ledger downgrades a GATE to INVESTIGATE when the ledger
+    audit for this report's metrics is flagged (a soft metric without
+    a hard backup, or a reported metric with no ledger entry). Default
+    off, mirroring --strict-validity.
     """
     from agenteval_bench.decision import (
         CostEvidence,
@@ -412,6 +426,7 @@ def cmd_decide(args: list[str]) -> int:
     args, reliability_runs_s = _flag(args, "--reliability-runs", "2")
     args, out = _flag(args, "--out")
     args, strict_validity = _has(args, "--strict-validity")
+    args, strict_ledger = _has(args, "--strict-ledger")
     if not suite_path:
         print("Error: decide needs --suite <file>", file=sys.stderr)
         return 3
@@ -496,13 +511,17 @@ def cmd_decide(args: list[str]) -> int:
     # is printed in the same output, so the two grades are never read apart.
     scorer_report = assess_scorer()
     print(scorer_report.summary())
-    # Every reported metric lists its assumptions (arena#56): the ledger
-    # audit prints with the validity tables and is carried in the JSON
-    # report, so the decision's metrics are never read without theirs.
-    from agenteval_bench.metric_ledger import audit_ledger
-
-    ledger_audit = audit_ledger()
-    print(ledger_audit.summary())
+    # Every metric this report prints lists its assumptions (arena#56):
+    # the ledger audit is fed exactly the metrics the decision printed
+    # — the four dimensions plus the scorer's matchers — with each
+    # metric's assumption texts, and is carried in the JSON report, so
+    # the decision's metrics are never read without theirs.
+    ledger_audit = audit_report(REPORT_METRIC_SETS["decide"])
+    print(ledger_audit.summary("decide"))
+    print(
+        "Ledger HARD/SOFT says how each number is measured; validity "
+        "grades govern whether to trust it here."
+    )
     # --strict-validity is the enforcement switch: a GATE that rests on an
     # untrusted metric is downgraded to INVESTIGATE. Default off, because
     # replay mode structurally cannot trust reliability (see above), so a
@@ -518,6 +537,17 @@ def cmd_decide(args: list[str]) -> int:
             "Validity gate (strict): GATE downgraded to INVESTIGATE — "
             f"untrusted: {', '.join(validity.untrusted_metrics())}"
         )
+    # --strict-ledger is the same switch for the metric ledger: a GATE
+    # that rests on a flagged metric (a soft metric without a hard
+    # backup, or a reported metric with no ledger entry) is downgraded
+    # to INVESTIGATE. Default off, mirroring --strict-validity.
+    if strict_ledger and action is DecisionAction.GATE:
+        try:
+            require_ledger_ok(ledger_audit)
+        except ValueError as exc:
+            evidence_action = action
+            action = DecisionAction.INVESTIGATE
+            print(f"Ledger gate (strict): GATE downgraded to INVESTIGATE — {exc}")
     print(
         "Note: reliability here is replay-agreement (recorded outputs "
         "re-scored across runs); it cannot detect live-agent flakiness."
@@ -1008,8 +1038,17 @@ def cmd_calibrate(args: list[str]) -> int:
         print(f"Error: unusable observations: {e}", file=sys.stderr)
         return 1
     record = calibrate(judge, observations, policy)
+    # Every metric this report prints lists its assumptions (arena#56):
+    # the ledger audit is fed exactly the metrics calibrate printed —
+    # the agreement rate and the calibration gap — with each metric's
+    # assumption texts. Under --json the audit travels in the JSON
+    # itself, so stdout stays parseable.
+    ledger_audit = audit_report(REPORT_METRIC_SETS["calibrate"])
+    ledger_json = ledger_audit.to_dict()
     if as_json:
-        print(json.dumps(record.to_dict(), indent=2))
+        payload = record.to_dict()
+        payload["metric_ledger"] = ledger_json
+        print(json.dumps(payload, indent=2))
     else:
         ece = "n/a" if record.ece is None else f"{record.ece:.3f}"
         print(
@@ -1041,10 +1080,13 @@ def cmd_calibrate(args: list[str]) -> int:
             print("This judge's scores may gate once a live judge transport calls require_calibrated.")
         else:
             print("This judge's scores must not gate: confidence is not evidence.")
+        print(ledger_audit.summary("calibrate"))
     if out:
         try:
             with open(out, "w", encoding="utf-8") as f:
-                f.write(json.dumps(record.to_dict(), indent=2) + "\n")
+                payload = record.to_dict()
+                payload["metric_ledger"] = ledger_json
+                f.write(json.dumps(payload, indent=2) + "\n")
         except OSError as e:
             print(f"Error: cannot write report: {e}", file=sys.stderr)
             return 1
@@ -1338,9 +1380,16 @@ def cmd_perturb(args: list[str]) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 3
     verdict = check_stability(report, policy)
+    # Every metric this report prints lists its assumptions (arena#56):
+    # the ledger audit is fed exactly the metrics perturb printed —
+    # the per-regime pass rates and the stability verdict — with each
+    # metric's assumption texts. Under --json the audit travels in the
+    # JSON payload itself, so stdout stays parseable.
+    ledger_audit = audit_report(REPORT_METRIC_SETS["perturb"])
     payload = {
         "report": report.to_dict(),
         "verdict": verdict.to_dict(),
+        "metric_ledger": ledger_audit.to_dict(),
         "scope": (
             "adversarial is a fixed 3-template prompt-injection "
             "battery, not an adaptive adversary"
@@ -1388,6 +1437,7 @@ def cmd_perturb(args: list[str]) -> int:
             "  note: adversarial is a fixed 3-template prompt-injection "
             "battery, not an adaptive adversary."
         )
+        print(ledger_audit.summary("perturb"))
     if out:
         try:
             with open(out, "w", encoding="utf-8") as f:
@@ -2281,10 +2331,19 @@ def cmd_tiered(args: list[str]) -> int:
         print(f"phase {p.phase}: {p.status.upper()} ({p.duration_s:.1f}s)")
         for note in p.notes:
             print(f"  note: {note}")
+    # Every metric this report prints lists its assumptions (arena#56):
+    # the ledger audit is fed exactly the metrics tiered printed —
+    # coverage and mutation score, when the phase measured them — with
+    # each metric's assumption texts.
+    tiered_metrics: list[str] = []
     if report.coverage_percent is not None:
         print(f"coverage: {report.coverage_percent:.1f}%")
+        tiered_metrics.append("coverage_pct")
     if report.mutation_score is not None:
         print(f"mutation score: {report.mutation_score:.0%}")
+        tiered_metrics.append("mutation_score")
+    if tiered_metrics:
+        print(audit_report(tiered_metrics).summary("tiered"))
     print(f"verdict: {report.verdict}")
     if out:
         try:
