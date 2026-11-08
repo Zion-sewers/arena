@@ -142,7 +142,8 @@ def main() -> int:
     _expect(
         mdl.winner.name == "judge-tiny-code",
         "unbanded, the tiny code wins: it costs 500 x 0.055 = 27.5 bits "
-        "of fit and saves 1075 total bits, total 325 vs 1400",
+        "of fit and saves 1075 total bits vs the band winner, total "
+        "325 vs 1400 (8872.5 vs the best fit)",
     )
     _expect(
         report.winner.name != mdl.winner.name,
@@ -237,24 +238,25 @@ def main() -> int:
 
     # 6. The worked path from real artifacts: two recorded repo
     # artifacts are measured by the module itself (from_artifact),
-    # their held-out log-loss is computed from scored pairs, and the
-    # selection runs on those measured numbers — no hand-supplied bit
-    # counts anywhere. The report round-trips through strict JSON.
+    # each version's held-out log-loss is computed from its OWN scored
+    # pairs, and the selection runs on those measured numbers — no
+    # hand-supplied bit counts anywhere. The report round-trips
+    # through strict JSON.
     examples_dir = Path(__file__).resolve().parents[2] / "examples"
-    scored = [(0.9, True), (0.8, True), (0.7, False), (0.6, True), (0.95, True)]
-    fit = mean_log_loss_bits(scored)
+    registry_scored = [(0.9, True), (0.8, True), (0.7, False), (0.6, True), (0.95, True)]
+    calibration_scored = [(0.85, True), (0.75, True), (0.65, False), (0.55, True), (0.9, True)]
     registry_version = ModelVersion.from_artifact(
         "judges-registry",
         json.loads((examples_dir / "judges-registry.json").read_text()),
-        held_out_n=len(scored),
-        held_out_mean_log_loss_bits=fit,
+        held_out_n=len(registry_scored),
+        held_out_mean_log_loss_bits=mean_log_loss_bits(registry_scored),
         held_out_set="demo-held-out",
     )
     calibration_version = ModelVersion.from_artifact(
         "calibration-observations",
         json.loads((examples_dir / "calibration-observations.json").read_text()),
-        held_out_n=len(scored),
-        held_out_mean_log_loss_bits=fit,
+        held_out_n=len(calibration_scored),
+        held_out_mean_log_loss_bits=mean_log_loss_bits(calibration_scored),
         held_out_set="demo-held-out",
     )
     _expect(

@@ -24,6 +24,17 @@ The selection rule, in executable form:
   more code than it costs in fit, and the report names that trade in
   bits both ways.
 
+The equivalence band is a POINT-ESTIMATE comparison with no sampling
+claim: it compares mean held-out log-losses as numbers, and "equal
+performance" means the point estimates lie within the band, not that
+the versions are statistically indistinguishable. The standard error
+of a mean log-loss over n held-out items can exceed the default
+0.01-bit band, especially at small n, so a band that is wide enough
+at n=10000 may declare noise "equal" at n=100. Callers who need an
+uncertainty-aware comparison should scale the band with n (for
+example with the standard error of the mean log-loss) instead of
+relying on the default.
+
 What "description length" means here, honestly (established MDL
 practice): the length of the version's fitted artifact under a FIXED,
 stated compressor — canonical JSON serialisation
@@ -99,6 +110,9 @@ COMPRESSOR = "zlib-9 over canonical JSON (sort_keys, compact separators)"
 
 #: Default equivalence band in mean held-out log-loss bits per item:
 #: versions within this of the best fit count as "equal performance".
+#: A POINT-ESTIMATE band with no sampling claim (see module docstring):
+#: the standard error of a mean over n held-out items can exceed it,
+#: so scale the band with n when the comparison needs uncertainty.
 DEFAULT_EQUIVALENCE_BAND_BITS = 0.01
 
 #: Default patience: the number of consecutive checkpoints in the
@@ -126,6 +140,10 @@ def measure_description_bits(artifact: Mapping[str, object]) -> int:
     must be JSON-serialisable; anything else refuses loudly instead of
     silently dropping fields into a shorter code.
     """
+    if not isinstance(artifact, Mapping):
+        raise TypeError(
+            f"cannot measure description length: artifact must be a mapping, got {type(artifact).__name__}"
+        )
     try:
         canonical = json.dumps(
             artifact,
@@ -252,7 +270,12 @@ class ModelVersion:
     @property
     def total_description_bits(self) -> float:
         """Two-part code length: model bits + data-given-model bits."""
-        return self.description_bits + self.held_out_total_log_loss_bits
+        try:
+            return self.description_bits + self.held_out_total_log_loss_bits
+        except OverflowError as e:
+            raise ValueError(
+                f"total description length overflows for description_bits={self.description_bits}"
+            ) from e
 
 
 def mean_log_loss_bits(pairs: Sequence[tuple[float, bool]]) -> float:
@@ -270,6 +293,8 @@ def mean_log_loss_bits(pairs: Sequence[tuple[float, bool]]) -> float:
     for p, label in scored:
         if isinstance(p, bool) or not isinstance(p, (int, float)):
             raise TypeError(f"predicted probability must be a number, got {p!r}")
+        if not isinstance(label, bool):
+            raise TypeError(f"label must be a bool, got {label!r}")
         if not 0.0 < p <= 1.0:
             raise ValueError(f"predicted probability must lie in (0, 1], got {p}")
         q = p if label else 1.0 - p
@@ -292,10 +317,13 @@ class SelectionReport:
     ``code_saving_bits`` is how much shorter the winner's code is than
     the best-fitting version's, in total bits (0 when the winner is
     the best fit). ``equivalent`` holds the versions that counted as
-    equal performance under the band; ``rule`` names which selection
-    rule ran. ``equivalence_band_bits`` is None for the pure rule,
-    which has no band. The rationale states the trade in one sentence
-    so the decision is auditable without re-running the selection.
+    equal performance under the band; for the pure rule, which has no
+    band, it holds just the winner — nothing else was judged equal
+    performance, and the full considered set is ``candidates``.
+    ``rule`` names which selection rule ran. ``equivalence_band_bits``
+    is None for the pure rule, which has no band. The rationale states
+    the trade in one sentence so the decision is auditable without
+    re-running the selection.
     """
 
     winner: ModelVersion
@@ -316,10 +344,14 @@ class SelectionReport:
             raise ValueError("the best fit must be one of the candidates")
         if not set(self.equivalent) <= set(self.candidates):
             raise ValueError("equivalent versions must be among the candidates")
-        if self.fit_deficit_bits < 0:
-            raise ValueError(f"fit_deficit_bits must be >= 0, got {self.fit_deficit_bits}")
-        if self.code_saving_bits < 0:
-            raise ValueError(f"code_saving_bits must be >= 0, got {self.code_saving_bits}")
+        if not math.isfinite(self.fit_deficit_bits) or self.fit_deficit_bits < 0:
+            raise ValueError(
+                f"fit_deficit_bits must be finite and >= 0, got {self.fit_deficit_bits}"
+            )
+        if not math.isfinite(self.code_saving_bits) or self.code_saving_bits < 0:
+            raise ValueError(
+                f"code_saving_bits must be finite and >= 0, got {self.code_saving_bits}"
+            )
         if self.equivalence_band_bits is not None and (
             not math.isfinite(self.equivalence_band_bits) or self.equivalence_band_bits < 0
         ):
@@ -442,9 +474,12 @@ def select_version(
 
     Versions within ``equivalence_band_bits`` (mean held-out log-loss
     bits per item) of the best fit count as equal performance; among
-    them the minimum total description length wins. The report names
-    the fit deficit the winner accepted and the code it saved, so a
-    selection that trades fit for compression is visible, not silent.
+    them the minimum total description length wins. The band is a
+    point-estimate comparison with no sampling claim (see the module
+    docstring): "equal performance" means the point estimates lie
+    within the band. The report names the fit deficit the winner
+    accepted and the code it saved, so a selection that trades fit
+    for compression is visible, not silent.
     """
     if not math.isfinite(equivalence_band_bits) or equivalence_band_bits < 0:
         raise ValueError(
@@ -479,7 +514,9 @@ def select_by_total_length(
     shortest, whatever its fit. This is the rule
     :func:`select_version` reduces to when the band covers every
     version; it is exposed separately so callers that want the
-    unbanded trade state that choice explicitly.
+    unbanded trade state that choice explicitly. The report's
+    ``equivalent`` holds just the winner: with no band, nothing else
+    was judged equal performance.
     """
     ordered = _require_versions(versions)
     best = _best_fit(ordered)
@@ -487,7 +524,7 @@ def select_by_total_length(
     return SelectionReport(
         winner=winner,
         candidates=ordered,
-        equivalent=ordered,
+        equivalent=(winner,),
         best_fit=best,
         fit_deficit_bits=winner.held_out_mean_log_loss_bits - best.held_out_mean_log_loss_bits,
         code_saving_bits=float(best.total_description_bits - winner.total_description_bits),
@@ -516,14 +553,20 @@ class CapacityReading:
     train_mean_log_loss_bits: float
 
     def __post_init__(self) -> None:
+        if isinstance(self.step, bool) or not isinstance(self.step, int):
+            raise TypeError(f"step must be an int, got {self.step!r}")
         if self.step < 0:
             raise ValueError(f"step must be >= 0, got {self.step}")
+        if isinstance(self.capacity_bits, bool) or not isinstance(self.capacity_bits, int):
+            raise TypeError(f"capacity_bits must be an int, got {self.capacity_bits!r}")
         if self.capacity_bits < 0:
             raise ValueError(f"capacity_bits must be >= 0, got {self.capacity_bits}")
         for label, value in (
             ("held_out_mean_log_loss_bits", self.held_out_mean_log_loss_bits),
             ("train_mean_log_loss_bits", self.train_mean_log_loss_bits),
         ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{label} must be a number, got {value!r}")
             if not math.isfinite(value):
                 raise ValueError(f"{label} must be finite, got {value}")
             if value < 0:

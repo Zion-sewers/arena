@@ -103,6 +103,11 @@ def test_measure_refuses_nan_and_infinity() -> None:
         measure_description_bits({"x": float("inf")})
 
 
+def test_measure_refuses_non_mapping() -> None:
+    with pytest.raises(TypeError, match="must be a mapping"):
+        measure_description_bits(["a", "b"])  # type: ignore[arg-type]
+
+
 def test_measure_empty_artifact_is_positive() -> None:
     # zlib overhead: even an empty artifact has a code length.
     assert measure_description_bits({}) > 0
@@ -155,6 +160,12 @@ def test_held_out_total_log_loss_refuses_overflow() -> None:
         _ = version.held_out_total_log_loss_bits
 
 
+def test_total_description_bits_refuses_overflow() -> None:
+    version = _version("v", description_bits=10**400, mean_log_loss=0.4)
+    with pytest.raises(ValueError, match="overflows"):
+        _ = version.total_description_bits
+
+
 def test_from_artifact_measures_and_records_compressor() -> None:
     artifact = {"rules": [{"match": "x", "route": "local"}] * 20}
     version = ModelVersion.from_artifact(
@@ -180,6 +191,8 @@ def test_mean_log_loss_bits_refuses_bad_pairs() -> None:
         mean_log_loss_bits([(1.5, True)])
     with pytest.raises(ValueError, match="infinite log-loss"):
         mean_log_loss_bits([(1.0, False)])
+    with pytest.raises(TypeError, match="label must be a bool"):
+        mean_log_loss_bits([(0.9, 1)])  # type: ignore[list-item]
 
 
 # --- selection ----------------------------------------------------------
@@ -245,6 +258,9 @@ def test_band_rule_refuses_large_fit_loss_that_mdl_accepts() -> None:
     unbanded = select_by_total_length(versions)
     assert unbanded.winner.name == "tiny"
     assert unbanded.equivalence_band_bits is None
+    # The pure rule has no band, so nothing else was judged equal
+    # performance: equivalent holds just the winner, not all candidates.
+    assert unbanded.equivalent == (unbanded.winner,)
 
 
 def test_selection_outside_band_keeps_the_better_fit() -> None:
@@ -343,6 +359,10 @@ def test_selection_report_refuses_bad_reports() -> None:
     }
     with pytest.raises(ValueError, match="code_saving_bits"):
         SelectionReport(**{**base, "code_saving_bits": -1.0})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="code_saving_bits"):
+        SelectionReport(**{**base, "code_saving_bits": math.nan})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fit_deficit_bits"):
+        SelectionReport(**{**base, "fit_deficit_bits": math.nan})  # type: ignore[arg-type]
     phantom = _version("ghost", 50, 0.2)
     with pytest.raises(ValueError, match="equivalent"):
         SelectionReport(**{**base, "equivalent": (phantom,)})  # type: ignore[arg-type]
@@ -553,6 +573,35 @@ def test_meter_refuses_bad_series() -> None:
         assess_capacity(list(reversed(_stalling_series())))
     with pytest.raises(ValueError, match="patience"):
         assess_capacity(_stalling_series(), patience=1)
+
+
+def test_capacity_reading_refuses_wrong_types() -> None:
+    base: dict[str, object] = {
+        "step": 0,
+        "capacity_bits": 100,
+        "held_out_mean_log_loss_bits": 0.4,
+        "train_mean_log_loss_bits": 0.4,
+    }
+    for kwargs in [
+        {"step": True},
+        {"step": 1.5},
+        {"capacity_bits": 100.5},
+        {"capacity_bits": True},
+        {"held_out_mean_log_loss_bits": True},
+        {"train_mean_log_loss_bits": "0.4"},
+    ]:
+        with pytest.raises(TypeError):
+            CapacityReading(**{**base, **kwargs})  # type: ignore[arg-type]
+
+
+def test_band_is_documented_as_point_estimate() -> None:
+    # Architecture B1: the band must not overstate what was measured.
+    import agenteval_bench.code_length as module
+
+    doc = " ".join(module.__doc__.split()).lower()
+    assert "point-estimate" in doc
+    assert "no sampling claim" in doc
+    assert "point-estimate" in select_version.__doc__.lower()
 
 
 def test_meter_verdict_to_dict() -> None:
