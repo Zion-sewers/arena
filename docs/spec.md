@@ -54,6 +54,10 @@ src/agenteval_bench/
   decision.py     # Decision system: evidence -> uncertainty -> threshold -> action
                   #   (Dimension/RiskLevel/DecisionAction, Wilson intervals, decide)
   decision_demo.py # Seeded end-to-end demo of the decision system
+  promotion.py    # Version promotion gate: evidence gain, not accuracy gain
+                  #   (VersionSpec/VersionEvidence, r = L/n, promote;
+                  #   PROMOTE / HOLD / REJECT; accuracy-only promotion refused)
+  promotion_demo.py # Seeded end-to-end demo of the promotion gate
   validity.py     # Measurement validity: every metric carries a reliability
                   #   column (ValidityGrade, validate_proxy, ValidityReport)
   validity_demo.py # Seeded end-to-end demo of measurement validity
@@ -128,6 +132,7 @@ docs/             # Specifications, archive, roadmap references
 | `ShipVerdict`        | OEC + guardrails + trust gates (SRM, A/A, replication); SHIP only when all pass. |
 | `ReviewGateReport`   | Analysis pre-specification: 10-question gate over a finding vs its registered plan; CONFIRMED / EXPLORATORY_ONLY / REFUSED. |
 | `Selection`          | /diverge selection record: winner vs conventional scores, margin, closed outcome, reason from measured facts; only a token-level-diverse selection graded under the canonical policy with a non-overconfident p may decide on high stakes. |
+| `PromotionVerdict`   | Version promotion gate: PROMOTE only on measured log-evidence gain clearing the margin; accuracy gain never promotes; complexity reported as r = L/n. |
 | `cli.main`           | Parse argv, load suite, build replay `agent_fn`, print summary + gate. |
 
 ### 4.3 Data-flow diagram
@@ -296,6 +301,7 @@ print(result.summary())
 | OEC ship gate (OEC + guardrails + trust gates) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Analysis pre-specification (10-question review gate) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Anti-mode-collapse /diverge (5 candidates + p_conventional) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
+| Evidence-gate version promotion (evidence gain, not accuracy; L/n reported) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |
