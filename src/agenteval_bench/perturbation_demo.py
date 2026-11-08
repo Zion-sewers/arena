@@ -18,6 +18,12 @@ acceptance expectation holds:
   raises SingleRegimeError;
 - a suite missing one adversarial recording grades UNMEASURED,
   naming the case — the regime is never silently dropped;
+- a suite whose recordings answer the wrong inputs (the clean input
+  copy-pasted into all three input fields) is refused outright —
+  one regime's evidence cannot be relabelled as another's;
+- a degenerate stability policy (a zero threshold, or a 1.0 max
+  drop) is refused outright — no gate can accept on the adversarial
+  regime alone;
 - the CLI `perturb` command on examples/perturbation-triple.yaml
   exits 0 with a STABLE verdict and writes the report JSON;
 - the CLI on a naive-recordings suite exits 1 (UNSTABLE).
@@ -40,7 +46,9 @@ from agenteval_bench.models import EvalCase, EvalSuite, ExpectedOutput
 from agenteval_bench.perturbation import (
     ADVERSARIAL_MARKER,
     SingleRegimeError,
+    StabilityPolicy,
     check_stability,
+    emit_triple_inputs,
     require_triple_regime,
     run_triple_regime,
     run_triple_regime_replay,
@@ -125,57 +133,69 @@ def _check(condition: bool, message: str) -> None:
 
 
 def _replay_suite_correct() -> EvalSuite:
-    """The demo suite as a replay suite with correct per-case recordings."""
-    return EvalSuite(
-        name="perturbation-demo",
-        cases=[
-            dataclasses.replace(
-                case,
-                output=ANSWERS[case.id],
-                output_light=ANSWERS[case.id],
-                output_adversarial=ANSWERS[case.id],
-            )
-            for case in SUITE.cases
-        ],
+    """The demo suite as a replay suite with correct per-case recordings.
+
+    Recorded inputs come from emit_triple_inputs (seed 42): the
+    replay runner verifies each recorded input equals perturb_input()
+    for the seed before scoring, so the suite must carry them.
+    """
+    return emit_triple_inputs(
+        EvalSuite(
+            name="perturbation-demo",
+            cases=[
+                dataclasses.replace(
+                    case,
+                    output=ANSWERS[case.id],
+                    output_light=ANSWERS[case.id],
+                    output_adversarial=ANSWERS[case.id],
+                )
+                for case in SUITE.cases
+            ],
+        ),
+        seed=42,
     )
 
 
 def _replay_suite(adversarial_answer: str) -> EvalSuite:
     """The demo suite as a replay suite with one shared adversarial recording."""
-    return EvalSuite(
-        name="perturbation-demo",
-        cases=[
-            dataclasses.replace(
-                case,
-                output=ANSWERS[case.id],
-                output_light=ANSWERS[case.id],
-                output_adversarial=adversarial_answer,
-            )
-            for case in SUITE.cases
-        ],
+    return emit_triple_inputs(
+        EvalSuite(
+            name="perturbation-demo",
+            cases=[
+                dataclasses.replace(
+                    case,
+                    output=ANSWERS[case.id],
+                    output_light=ANSWERS[case.id],
+                    output_adversarial=adversarial_answer,
+                )
+                for case in SUITE.cases
+            ],
+        ),
+        seed=42,
     )
 
 
 def _suite_yaml(suite: EvalSuite) -> str:
-    """Minimal YAML serialisation for the CLI invocations."""
-    lines = [f"name: {suite.name}", "cases:"]
-    for case in suite.cases:
-        lines.append(f"  - id: {case.id}")
-        lines.append(f"    input: {case.input!r}")
-        lines.append(f"    output: {case.output!r}")
-        lines.append(f"    output_light: {case.output_light!r}")
-        lines.append(f"    output_adversarial: {case.output_adversarial!r}")
-        expected = case.expected
-        lines.append("    expected:")
-        if expected.contains:
-            needles = ", ".join(repr(n) for n in expected.contains)
-            lines.append(f"      contains: [{needles}]")
-        if expected.json_schema:
-            lines.append("      json_schema:")
-            lines.append('        required: ["order_id", "status"]')
-        if expected.regex:
-            lines.append(f"      regex: {expected.regex!r}")
-    return "\n".join(lines) + "\n"
+    """Minimal YAML serialisation for the CLI invocations.
+
+    Serialised through yaml.safe_dump, not Python repr: the recorded
+    perturbed inputs contain real newlines (the light trailing
+    newline, the adversarial templates), and a repr-style
+    single-quoted '...\\n...' would round-trip as a literal
+    backslash-n, so the replay runner would refuse the recordings
+    as answering a different input.
+    """
+    import yaml
+
+    from agenteval_bench.cli import _suite_to_yaml_dict
+
+    text: str = yaml.safe_dump(
+        _suite_to_yaml_dict(suite),
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+    )
+    return text
 
 
 def main() -> int:
@@ -241,6 +261,30 @@ def main() -> int:
     )
     _check(verdict.outcome == "unmeasured", f"verdict {verdict.outcome}")
     print("missing recording: UNMEASURED (case 'order' named)")
+
+    # 5b. Copied recordings are refused: the clean input in every
+    # input field answers a different input than the regime defines.
+    copied = dataclasses.replace(
+        full,
+        cases=[
+            dataclasses.replace(case, input_light=case.input,
+                                 input_adversarial=case.input)
+            for case in full.cases
+        ],
+    )
+    try:
+        run_triple_regime_replay(copied)
+        _fail("replay accepted recordings answering the wrong inputs")
+    except ValueError:
+        print("copied recordings refused (recorded input != perturb_input)")
+
+    # 5c. A degenerate policy is refused, not graded under.
+    try:
+        StabilityPolicy(clean_threshold=0.0, light_threshold=0.0,
+                        max_adversarial_drop=1.0)
+        _fail("degenerate policy was accepted")
+    except ValueError:
+        print("degenerate policy refused (zero thresholds / 1.0 max drop)")
 
     # 6. CLI on the shipped triple-regime example: exit 0, STABLE.
     repo_root = Path(__file__).resolve().parents[2]  # src/agenteval_bench/ -> repo

@@ -103,11 +103,14 @@ src/agenteval_bench/
                   #   StabilityReport, StabilityPolicy, StabilityVerdict,
                   #   perturb_input, run_triple_regime,
                   #   run_triple_regime_replay, check_stability,
-                  #   require_triple_regime; light = seeded surface edits
+                  #   require_triple_regime, emit_triple_inputs,
+                  #   verify_stability_report; light = seeded surface edits
                   #   with digit-bearing tokens byte-identical, adversarial
                   #   = seeded prompt-injection battery with a fixed marker;
-                  #   a regime missing a recording is UNMEASURED, never
-                  #   dropped; single-regime gating refused)
+                  #   a regime missing a recording or a recorded input is
+                  #   UNMEASURED, never dropped; recordings are verified
+                  #   against perturb_input() for the seed; degenerate
+                  #   policies refused; single-regime gating refused)
   perturbation_demo.py # Seeded end-to-end demo of perturbation stability
   regression.py   # Production failures -> frozen versions -> release gate
   snapshots.py    # Immutable benchmark snapshots (hash-verified store)
@@ -258,7 +261,7 @@ table:
 | `calibrate` | calibrated | bad input | mis/uncalibrated | — |
 | `ship` | SHIP | NO_SHIP / NEEDS_REPLICATION | bad input | — |
 | `diverge` | selection made | bad input | refused (paraphrase set / overconfident p / single sample on high stakes) | — |
-| `perturb` | STABLE | UNSTABLE | UNMEASURED (a regime is missing a recording) | bad input |
+| `perturb` | STABLE | UNSTABLE | UNMEASURED (a regime is missing a recording or a recorded input) | bad input / bad policy / recording answers the wrong input |
 | `register-design` | registered | — | bad input | — |
 
 > The `compare` and `report` subcommands described in earlier drafts are **`planned`**

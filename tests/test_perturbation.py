@@ -25,10 +25,12 @@ from agenteval_bench.perturbation import (
     StabilityPolicy,
     StabilityReport,
     check_stability,
+    emit_triple_inputs,
     perturb_input,
     require_triple_regime,
     run_triple_regime,
     run_triple_regime_replay,
+    verify_stability_report,
 )
 
 SUITE = EvalSuite(
@@ -292,11 +294,24 @@ def test_skipped_cases_are_unmeasured_not_unstable():
 
 def test_policy_thresholds_are_enforced_and_validated():
     report = run_triple_regime(SUITE, naive_agent, seed=42)
-    # A policy that tolerates a total adversarial collapse accepts the
-    # naive agent; the canonical policy does not.
-    lax = StabilityPolicy(clean_threshold=0.9, light_threshold=0.9,
-                          max_adversarial_drop=1.0)
-    assert check_stability(report, lax).outcome == "stable"
+    # A policy that tolerates a total adversarial collapse can no
+    # longer be constructed: max_adversarial_drop=1.0 is refused,
+    # and so are zero clean/light thresholds — a degenerate policy
+    # would let a CI gate reading only the exit code accept on the
+    # adversarial regime alone (or on nothing at all).
+    for kwargs in (
+        {"clean_threshold": 0.0},
+        {"light_threshold": 0.0},
+        {"max_adversarial_drop": 1.0},
+    ):
+        with pytest.raises(ValueError):
+            StabilityPolicy(**kwargs)
+    # A legal permissive policy still grades the naive agent
+    # unstable on the drop (1.0 > 0.99); the canonical policy agrees.
+    permissive = StabilityPolicy(
+        clean_threshold=0.5, light_threshold=0.5, max_adversarial_drop=0.99
+    )
+    assert check_stability(report, permissive).outcome == "unstable"
     assert check_stability(report).outcome == "unstable"
     with pytest.raises(ValueError):
         StabilityPolicy(clean_threshold=1.5)
@@ -470,7 +485,9 @@ def test_replay_skipped_case_is_skipped_in_all_regimes():
             skip=True,
         )
     )
-    report = run_triple_regime_replay(EvalSuite(name="s", cases=cases))
+    report = run_triple_regime_replay(
+        emit_triple_inputs(EvalSuite(name="s", cases=cases))
+    )
     assert report.clean.skipped == 1
     assert report.light.skipped == 1
     assert report.adversarial.skipped == 1
@@ -508,7 +525,10 @@ def _replay_suite(missing_adversarial_for: str | None = None) -> EvalSuite:
                 ),
             )
         )
-    return EvalSuite(name="perturb-test", cases=cases)
+    # Recorded inputs are part of the replay contract: the runner
+    # verifies each one equals perturb_input() for the seed before
+    # scoring (default seed 42 on both sides here).
+    return emit_triple_inputs(EvalSuite(name="perturb-test", cases=cases))
 
 
 def test_replay_with_full_recordings_is_stable():
@@ -539,6 +559,8 @@ def test_yaml_round_trip_reads_per_regime_recordings(tmp_path):
         "    output: \"clean out\"\n"
         "    output_light: \"light out\"\n"
         "    output_adversarial: \"adv out\"\n"
+        "    input_light: \"light q\"\n"
+        "    input_adversarial: \"adv q\"\n"
         "    expected:\n"
         "      contains: [\"out\"]\n"
     )
@@ -546,6 +568,8 @@ def test_yaml_round_trip_reads_per_regime_recordings(tmp_path):
     assert suite.cases[0].output == "clean out"
     assert suite.cases[0].output_light == "light out"
     assert suite.cases[0].output_adversarial == "adv out"
+    assert suite.cases[0].input_light == "light q"
+    assert suite.cases[0].input_adversarial == "adv q"
 
 
 # --- CLI --------------------------------------------------------------------
@@ -570,26 +594,40 @@ def _run(argv, monkeypatch, capsys):
 
 
 def _suite_yaml(recordings: dict[str, dict[str, str]]) -> str:
-    lines = ["name: cli-test", "cases:"]
+    """Serialise a CLI-test suite, with recorded inputs emitted.
+
+    Serialised through yaml.safe_dump, not Python repr: the recorded
+    perturbed inputs contain real newlines (the light trailing
+    newline, the adversarial templates), and a repr-style
+    single-quoted '...\\n...' would round-trip as a literal
+    backslash-n, so the replay runner would refuse the recordings
+    as answering a different input. Seed 42 on both sides: the CLI
+    default seed, so verification passes.
+    """
+    import yaml
+
+    from agenteval_bench.cli import _suite_to_yaml_dict
+
+    cases = []
     for case in SUITE.cases:
         rec = recordings[case.id]
-        lines.append(f"  - id: {case.id}")
-        lines.append(f"    input: {case.input!r}")
-        for key in ("output", "output_light", "output_adversarial"):
-            if key in rec:
-                lines.append(f"    {key}: {rec[key]!r}")
-        if case.expected.contains:
-            needles = ", ".join(repr(n) for n in case.expected.contains)
-            lines.append("    expected:")
-            lines.append(f"      contains: [{needles}]")
-        elif case.expected.json_schema:
-            lines.append("    expected:")
-            lines.append("      json_schema:")
-            lines.append("        required: [\"order_id\", \"status\"]")
-        else:
-            lines.append("    expected:")
-            lines.append(f"      regex: {case.expected.regex!r}")
-    return "\n".join(lines) + "\n"
+        cases.append(
+            EvalCase(
+                id=case.id,
+                input=case.input,
+                expected=case.expected,
+                output=rec.get("output"),
+                output_light=rec.get("output_light"),
+                output_adversarial=rec.get("output_adversarial"),
+            )
+        )
+    emitted = emit_triple_inputs(EvalSuite(name="cli-test", cases=cases), seed=42)
+    return yaml.safe_dump(
+        _suite_to_yaml_dict(emitted),
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+    )
 
 
 def test_cli_stable_suite_exits_zero(monkeypatch, capsys):
@@ -669,5 +707,296 @@ def test_cli_json_and_out_flag(monkeypatch, capsys, tmp_path):
         assert code == 0
         assert '"outcome": "stable"' in out
         assert os.path.exists(out_path)
+    finally:
+        os.unlink(path)
+
+
+# --- fix-forward: critique round 1 (arena#53) ------------------------------
+# Each test pins one blocking finding from the three FAIL critiques
+# on PR #150 head a499c3ca, so a regression re-opens the same FAIL.
+
+
+def test_light_case_flip_never_touches_digit_bearing_tokens():
+    import random
+
+    from agenteval_bench.perturbation import _light_case_flip
+
+    # The exact counterexample from the implementation critique:
+    # seed 0 / case c7 used to return "ORDER-5512".
+    perturbed = perturb_input(
+        "Return order-5512 status", Regime.LIGHT, 0, "c7"
+    )
+    assert _digit_tokens(perturbed.input) == ["order-5512"]
+    for seed in range(20):
+        rng = random.Random(seed)
+        flipped = _light_case_flip("Return order-5512 status", rng)
+        if flipped is not None:
+            assert _digit_tokens(flipped) == ["order-5512"]
+        for text in ("item-42 here", "order_5512 done", "order.5512 ok"):
+            rng = random.Random(seed)
+            flipped = _light_case_flip(text, rng)
+            if flipped is not None:
+                assert _digit_tokens(flipped) == _digit_tokens(text)
+
+
+def test_echo_agent_holds_light_on_hyphenated_order_id():
+    import re
+
+    def echo_agent(prompt: str) -> str:
+        match = re.search(r"order-\d+", prompt)
+        return f"status of {match.group(0)}" if match else "I don't know."
+
+    suite = EvalSuite(
+        name="echo",
+        cases=[
+            EvalCase(
+                id="c7",
+                input="Return order-5512 status",
+                expected=ExpectedOutput(contains=["order-5512"]),
+            )
+        ],
+    )
+    report = run_triple_regime(suite, echo_agent, seed=0)
+    assert report.clean.pass_rate == 1.0
+    assert report.light.pass_rate == 1.0
+    assert check_stability(report).outcome == "stable"
+
+
+def test_replay_copied_recordings_refused():
+    import dataclasses
+
+    good = _replay_suite()
+    copied = dataclasses.replace(
+        good,
+        cases=[
+            dataclasses.replace(
+                case, input_light=case.input, input_adversarial=case.input
+            )
+            for case in good.cases
+        ],
+    )
+    with pytest.raises(ValueError, match="does not match perturb_input"):
+        run_triple_regime_replay(copied)
+
+
+def test_replay_missing_recorded_input_is_unmeasured():
+    import dataclasses
+
+    good = _replay_suite()
+    missing = dataclasses.replace(
+        good,
+        cases=[
+            dataclasses.replace(case, input_light=None)
+            if case.id == "order"
+            else case
+            for case in good.cases
+        ],
+    )
+    report = run_triple_regime_replay(missing)
+    assert not report.light.measured
+    assert report.light.missing_case_ids == ("order",)
+    verdict = check_stability(report)
+    assert verdict.outcome == "unmeasured"
+    assert any("light regime unmeasured" in r for r in verdict.reasons)
+
+
+def test_unmeasured_verdict_rates_are_none_not_zero():
+    report = run_triple_regime_replay(_replay_suite(missing_adversarial_for="order"))
+    verdict = check_stability(report)
+    assert verdict.outcome == "unmeasured"
+    assert verdict.adversarial_pass_rate is None
+    assert verdict.clean_to_adversarial_drop is None
+    assert verdict.clean_to_light_drop == 0.0
+    assert verdict.clean_pass_rate == 1.0
+
+
+def test_fingerprint_binds_verdicts():
+    from agenteval_bench.perturbation import _build_regime_report
+
+    suite = _replay_suite()
+    perturbed = {case.id: case.input for case in suite.cases}
+    first = _build_regime_report(
+        Regime.CLEAN, suite, 42, perturbed,
+        tuple((case.id, True) for case in suite.cases), 0,
+    )
+    flipped = _build_regime_report(
+        Regime.CLEAN, suite, 42, perturbed,
+        tuple((case.id, case.id != "refund") for case in suite.cases), 0,
+    )
+    assert first.fingerprint != flipped.fingerprint
+
+
+def test_verify_stability_report_catches_edited_verdict():
+    import dataclasses
+
+    good = run_triple_regime(SUITE, robust_agent, seed=42)
+    assert verify_stability_report(SUITE, good, seed=42) == ()
+    edited_clean = dataclasses.replace(
+        good.clean,
+        passed=3,
+        failed=1,
+        pass_rate=0.75,
+        verdicts=tuple(
+            (cid, cid != "refund") for cid, _ in good.clean.verdicts
+        ),
+    )
+    edited = StabilityReport(
+        suite_name=good.suite_name,
+        seed=good.seed,
+        clean=edited_clean,
+        light=good.light,
+        adversarial=good.adversarial,
+        fingerprint=good.fingerprint,
+    )
+    problems = verify_stability_report(SUITE, edited, seed=42)
+    assert problems
+    assert any("fingerprint mismatch" in p for p in problems)
+
+
+def test_verify_stability_report_catches_rescore_mismatch():
+    import dataclasses
+
+    good = _replay_suite()
+    report = run_triple_regime_replay(good)
+    assert verify_stability_report(good, report, seed=42) == ()
+    tampered = dataclasses.replace(
+        good,
+        cases=[
+            dataclasses.replace(case, output="wrong answer entirely")
+            if case.id == "refund"
+            else case
+            for case in good.cases
+        ],
+    )
+    problems = verify_stability_report(tampered, report, seed=42)
+    assert problems
+    assert any("re-scored" in p for p in problems)
+
+
+def test_policy_fingerprint_is_spelling_canonical():
+    assert StabilityPolicy(1, 1, 0.5).fingerprint() == StabilityPolicy(
+        1.0, 1.0, 0.5
+    ).fingerprint()
+
+
+def test_marker_matcher_refused_not_just_literal_marker():
+    regex_suite = EvalSuite(
+        name="regex-marker",
+        cases=[
+            EvalCase(
+                id="a", input="q", expected=ExpectedOutput(regex=".*")
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="adversarial marker"):
+        run_triple_regime(regex_suite, robust_agent)
+    needle_suite = EvalSuite(
+        name="needle-marker",
+        cases=[
+            EvalCase(
+                id="a", input="q", expected=ExpectedOutput(contains=["R"])
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="adversarial marker"):
+        run_triple_regime(needle_suite, robust_agent)
+
+
+def test_regime_report_to_dict_carries_verdicts():
+    report = run_triple_regime(SUITE, robust_agent, seed=42)
+    assert report.clean.to_dict()["verdicts"] == [
+        [case.id, True] for case in SUITE.cases
+    ]
+
+
+def test_cli_degenerate_policy_exits_three(monkeypatch, capsys):
+    recordings = {cid: {"output": a, "output_light": a, "output_adversarial": a}
+                  for cid, a in ANSWERS.items()}
+    path = _write(_suite_yaml(recordings))
+    try:
+        for flags in (
+            ["--clean-threshold", "0"],
+            ["--light-threshold", "0"],
+            ["--max-adversarial-drop", "1.0"],
+            ["--clean-threshold", "0", "--light-threshold", "0",
+             "--max-adversarial-drop", "1.0"],
+        ):
+            code, _, err = _run(
+                ["perturb", "--suite", path, *flags], monkeypatch, capsys
+            )
+            assert code == 3
+            assert "invalid stability policy" in err
+    finally:
+        os.unlink(path)
+
+
+def test_cli_emit_inputs_round_trip(monkeypatch, capsys, tmp_path):
+    import yaml
+
+    # No recordings: emit must fill only the inputs, and the emitted
+    # suite grades UNMEASURED until the recordings are added.
+    path = _write(_suite_yaml({cid: {} for cid in ANSWERS}))
+    emitted_path = str(tmp_path / "emitted.yaml")
+    try:
+        code, _, err = _run(
+            ["perturb", "--suite", path, "--emit-inputs", "--out", emitted_path],
+            monkeypatch, capsys,
+        )
+        assert code == 0
+        assert "Emitted perturbed inputs" in err
+        emitted = EvalSuite.from_yaml(emitted_path)
+        assert all(c.input_light is not None for c in emitted.cases)
+        assert all(c.input_adversarial is not None for c in emitted.cases)
+        # A suite emitted this way grades UNMEASURED until recordings
+        # are added; with the answers filled in, it grades STABLE.
+        code, out, _ = _run(
+            ["perturb", "--suite", emitted_path], monkeypatch, capsys
+        )
+        assert code == 2
+        assert "verdict: UNMEASURED" in out
+        with open(emitted_path) as f:
+            data = yaml.safe_load(f)
+        for case_data in data["cases"]:
+            answer = ANSWERS[case_data["id"]]
+            case_data["output"] = answer
+            case_data["output_light"] = answer
+            case_data["output_adversarial"] = answer
+        filled_path = str(tmp_path / "filled.yaml")
+        with open(filled_path, "w") as f:
+            yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+        code, out, _ = _run(
+            ["perturb", "--suite", filled_path], monkeypatch, capsys
+        )
+        assert code == 0
+        assert "verdict: STABLE" in out
+    finally:
+        os.unlink(path)
+
+
+def test_cli_run_ci_warns_on_triple_suite(monkeypatch, capsys):
+    recordings = {cid: {"output": a, "output_light": a, "output_adversarial": a}
+                  for cid, a in ANSWERS.items()}
+    path = _write(_suite_yaml(recordings))
+    try:
+        code, out, _ = _run(
+            ["run", "--suite", path, "--ci", "--threshold", "1.0"],
+            monkeypatch, capsys,
+        )
+        assert code == 0
+        assert "triple-regime recordings" in out
+        assert "agenteval-bench perturb" in out
+    finally:
+        os.unlink(path)
+
+
+def test_cli_decide_warns_on_triple_suite(monkeypatch, capsys):
+    recordings = {cid: {"output": a, "output_light": a, "output_adversarial": a}
+                  for cid, a in ANSWERS.items()}
+    path = _write(_suite_yaml(recordings))
+    try:
+        code, out, _ = _run(["decide", "--suite", path], monkeypatch, capsys)
+        assert code in (0, 1, 2)
+        assert "triple-regime recordings" in out
+        assert "agenteval-bench perturb" in out
     finally:
         os.unlink(path)

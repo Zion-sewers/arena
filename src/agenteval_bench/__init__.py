@@ -93,6 +93,7 @@ from agenteval_bench.judges import (
 from agenteval_bench.models import EvalCase, EvalResult, EvalSuite, RunResult
 from agenteval_bench.perturbation import (
     ADVERSARIAL_MARKER,
+    REGIMES,
     PerturbedInput,
     Regime,
     RegimeReport,
@@ -103,10 +104,12 @@ from agenteval_bench.perturbation import (
     StabilityVerdict,
     check_stability,
     default_stability_policy,
+    emit_triple_inputs,
     perturb_input,
     require_triple_regime,
     run_triple_regime,
     run_triple_regime_replay,
+    verify_stability_report,
 )
 from agenteval_bench.scoring import DeterministicScorer
 from agenteval_bench.validity import (
@@ -123,6 +126,7 @@ from agenteval_bench.validity import (
 
 __all__ = [
     "ADVERSARIAL_MARKER",
+    "REGIMES",
     "UNKNOWN_FAMILY",
     "AllocationReport",
     "CalibrationBin",
@@ -204,6 +208,7 @@ __all__ = [
     "default_policy",
     "default_stability_policy",
     "default_validity_policy",
+    "emit_triple_inputs",
     "hard_tokens",
     "load_registry",
     "may_decide_high_stakes",
@@ -229,4 +234,5 @@ __all__ = [
     "select_version",
     "validate_matcher_labels",
     "validate_proxy",
+    "verify_stability_report",
 ]

@@ -87,6 +87,88 @@ def _build_log(suite: EvalSuite, suite_path: str, digest: str,
     )
 
 
+def _warn_triple_regime_suite(suite: EvalSuite) -> None:
+    """Warn loudly when a suite carries triple-regime recordings.
+
+    `run --ci` and `decide` score the clean recording only, so a
+    suite that also carries light/adversarial recordings must be
+    gated with `perturb`, not here — otherwise the gate accepts on
+    a single regime while a triple gate exists for the artifact.
+    """
+    if any(
+        c.output_light is not None
+        or c.output_adversarial is not None
+        or c.input_light is not None
+        or c.input_adversarial is not None
+        for c in suite.cases
+    ):
+        print(
+            "Warning: this suite carries triple-regime recordings "
+            "(output_light / output_adversarial); this command scores "
+            "the clean recording only. Gate stability with "
+            "`agenteval-bench perturb` instead — a clean-only PASS "
+            "here says nothing about light or adversarial stability."
+        )
+
+
+def _suite_to_yaml_dict(suite: EvalSuite) -> dict[str, Any]:
+    """Serialize a suite back to YAML-ready data (for --emit-inputs).
+
+    Only fields that carry a value are written, so an emitted suite
+    keeps the shape a hand-written one has; expected / rubric /
+    dimension / cost round-trip unchanged.
+    """
+    cases: list[dict[str, Any]] = []
+    for case in suite.cases:
+        data: dict[str, Any] = {"id": case.id, "input": case.input}
+        if case.output is not None:
+            data["output"] = case.output
+        if case.output_light is not None:
+            data["output_light"] = case.output_light
+        if case.output_adversarial is not None:
+            data["output_adversarial"] = case.output_adversarial
+        if case.input_light is not None:
+            data["input_light"] = case.input_light
+        if case.input_adversarial is not None:
+            data["input_adversarial"] = case.input_adversarial
+        if case.skip:
+            data["skip"] = True
+        expected: dict[str, Any] = {}
+        if case.expected.exact is not None:
+            expected["exact"] = case.expected.exact
+        if case.expected.contains:
+            expected["contains"] = list(case.expected.contains)
+        if case.expected.regex is not None:
+            expected["regex"] = case.expected.regex
+        if case.expected.json_schema is not None:
+            expected["json_schema"] = case.expected.json_schema
+        if expected:
+            data["expected"] = expected
+        if case.rubric:
+            data["rubric"] = [
+                {
+                    "criterion": r.criterion,
+                    "weight": r.weight,
+                    "description": r.description,
+                }
+                for r in case.rubric
+            ]
+        if case.dimension != "quality":
+            data["dimension"] = case.dimension
+        if case.cost is not None:
+            data["cost"] = case.cost
+        cases.append(data)
+    return {
+        "name": suite.name,
+        "version": suite.version,
+        "cost_bound": {
+            "max_input_tokens": suite.cost_bound.max_input_tokens,
+            "max_output_tokens": suite.cost_bound.max_output_tokens,
+        },
+        "cases": cases,
+    }
+
+
 def cmd_run(args: list[str]) -> int:
     args, suite_path = _flag(args, "--suite")
     args, ci_mode = _has(args, "--ci")
@@ -114,6 +196,8 @@ def cmd_run(args: list[str]) -> int:
         return 1
 
     suite, recorded, missing, digest = _load_suite_for_replay(suite_path)
+    if ci_mode:
+        _warn_triple_regime_suite(suite)
     # Standalone CLI scores a replay suite: each case carries a recorded
     # `output`. Cases without one are skipped (a live agent would fill them
     # via the Python API). This is what CI runs against a golden set.
@@ -333,6 +417,7 @@ def cmd_decide(args: list[str]) -> int:
         return 3
     if missing:
         print(f"Note: {len(missing)} case(s) had no recorded output and were skipped.")
+    _warn_triple_regime_suite(suite)
     inputs = [c.input for c in suite.cases if not c.skip]
     if len(set(inputs)) != len(inputs):
         print(
@@ -1054,23 +1139,44 @@ def cmd_perturb(args: list[str]) -> int:
     Reads a suite (--suite file.yaml) where each case carries three
     recorded outputs — ``output`` (clean), ``output_light`` and
     ``output_adversarial`` — produced by running the agent on the
-    three inputs outside the CLI, scores all three regimes with the
-    same deterministic matchers, and grades stability: STABLE /
-    UNSTABLE / UNMEASURED. Exit 0 = STABLE, 1 = UNSTABLE,
-    2 = UNMEASURED (a regime is missing a recording), 3 = bad input
-    or bad policy. A replay agent is never run under perturbed inputs:
-    it would return the same recording in every regime and the gaps
-    would be 0 by construction, which measures nothing.
+    three inputs outside the CLI, plus the recorded perturbed inputs
+    (``input_light`` / ``input_adversarial``) those recordings answer.
+    Scores all three regimes with the same deterministic matchers
+    and grades stability: STABLE / UNSTABLE / UNMEASURED. Exit 0 =
+    STABLE, 1 = UNSTABLE, 2 = UNMEASURED (a regime is missing a
+    recording or a recorded input), 3 = bad input or bad policy.
+    A replay agent is never run under perturbed inputs: it would
+    return the same recording in every regime and the gaps would be
+    0 by construction, which measures nothing.
+
+    ``--emit-inputs`` is the generation step for the replay
+    workflow: it writes a copy of the suite with ``input_light`` /
+    ``input_adversarial`` filled in from ``perturb_input()`` for the
+    seed (--out <file>, or stdout when --out is absent) and exits 0
+    without grading. Fill the recordings by running the agent on
+    those inputs, then grade with plain ``perturb``.
+
+    Degenerate policies are refused, not warned about: a zero clean
+    or light threshold, or a 1.0 max adversarial drop, voids the
+    stability signal the issue requires and would let a CI gate
+    reading only the exit code accept on the adversarial regime
+    alone (or on nothing). Exit 3.
+
+    Scope note (also printed with every text report): adversarial
+    is a fixed battery of three prompt-injection templates, not an
+    adaptive adversary.
     """
     from agenteval_bench.perturbation import (
         StabilityPolicy,
         check_stability,
+        emit_triple_inputs,
         run_triple_regime_replay,
     )
 
     args, suite_path = _flag(args, "--suite")
     args, out = _flag(args, "--out")
     args, as_json = _has(args, "--json")
+    args, emit_inputs = _has(args, "--emit-inputs")
     args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
     args, clean_s = _flag(args, "--clean-threshold", "0.9")
     args, light_s = _flag(args, "--light-threshold", "0.9")
@@ -1100,6 +1206,38 @@ def cmd_perturb(args: list[str]) -> int:
     except ValueError:
         print(f"Error: --seed must be an integer, got {seed_s}", file=sys.stderr)
         return 3
+    try:
+        suite = EvalSuite.from_yaml(suite_path)
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"Error: cannot load suite {suite_path}: {exc}", file=sys.stderr)
+        return 3
+    if emit_inputs:
+        import yaml
+
+        emitted = emit_triple_inputs(suite, seed=seed)
+        text = yaml.safe_dump(
+            _suite_to_yaml_dict(emitted),
+            sort_keys=False,
+            allow_unicode=True,
+            default_flow_style=False,
+        )
+        if out:
+            try:
+                with open(out, "w", encoding="utf-8") as f:
+                    f.write(text)
+            except OSError as exc:
+                print(f"Error: cannot write suite: {exc}", file=sys.stderr)
+                return 3
+            print(f"Emitted perturbed inputs (seed={seed}): {out}", file=sys.stderr)
+        else:
+            print(text, end="")
+        print(
+            "Fill output_light / output_adversarial by running the "
+            "agent on the emitted inputs (same seed), then grade with "
+            "`agenteval-bench perturb`.",
+            file=sys.stderr,
+        )
+        return 0
     clean_threshold = _number(clean_s, "--clean-threshold", 0.9)
     light_threshold = _number(light_s, "--light-threshold", 0.9)
     max_drop = _number(drop_s, "--max-adversarial-drop", 0.5)
@@ -1113,11 +1251,6 @@ def cmd_perturb(args: list[str]) -> int:
         )
     except (TypeError, ValueError) as exc:
         print(f"Error: invalid stability policy: {exc}", file=sys.stderr)
-        return 3
-    try:
-        suite = EvalSuite.from_yaml(suite_path)
-    except (OSError, ValueError, TypeError) as exc:
-        print(f"Error: cannot load suite {suite_path}: {exc}", file=sys.stderr)
         return 3
     try:
         report = run_triple_regime_replay(suite, seed=seed)
@@ -1134,6 +1267,9 @@ def cmd_perturb(args: list[str]) -> int:
     else:
         from agenteval_bench.perturbation import REGIMES
 
+        def _pct(value: float | None) -> str:
+            return f"{value:.1%}" if value is not None else "n/a"
+
         print(f"Suite: {report.suite_name} (seed={seed})")
         for regime in REGIMES:
             sub = report.by_regime(regime)
@@ -1145,16 +1281,20 @@ def cmd_perturb(args: list[str]) -> int:
                 )
             else:
                 print(
-                    f"  {regime.value}: UNMEASURED — missing recorded output for "
-                    f"{', '.join(sub.missing_case_ids)}"
+                    f"  {regime.value}: UNMEASURED — missing recorded output "
+                    f"or recorded input for {', '.join(sub.missing_case_ids)}"
                 )
         print(
-            f"  drops: clean->light {verdict.clean_to_light_drop:.1%}, "
-            f"clean->adversarial {verdict.clean_to_adversarial_drop:.1%}"
+            f"  drops: clean->light {_pct(verdict.clean_to_light_drop)}, "
+            f"clean->adversarial {_pct(verdict.clean_to_adversarial_drop)}"
         )
         print(f"  verdict: {verdict.outcome.upper()}")
         for reason in verdict.reasons:
             print(f"  ! {reason}")
+        print(
+            "  note: adversarial is a fixed 3-template prompt-injection "
+            "battery, not an adaptive adversary."
+        )
     if out:
         try:
             with open(out, "w", encoding="utf-8") as f:
@@ -2393,8 +2533,9 @@ def main() -> None:
         print("                                [--seed 42] [--clean-threshold 0.9]")
         print("                                [--light-threshold 0.9]")
         print("                                [--max-adversarial-drop 0.5]")
-        print("                                [--json] [--out report.json]")
+        print("                                [--emit-inputs] [--json] [--out report.json]")
         print("                                (exit 0 STABLE, 1 UNSTABLE, 2 UNMEASURED, 3 bad input)")
+        print("                                (adversarial = fixed 3-template battery, not adaptive)")
         print("       agenteval-bench ship --design <file.json> --evidence <file.json>")
         print("                                [--registry plans/experiments.jsonl]")
         print("                                [--json] [--out report.json]")
