@@ -85,7 +85,7 @@ class VersionSpec:
     width: int  # n: hidden width
 
     def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name:
+        if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("version name must be a non-empty string")
         _check_int(self.depth, "depth")
         _check_int(self.width, "width")
@@ -130,8 +130,14 @@ class VersionEvidence:
             se = _check_finite(self.log_evidence_se, "log_evidence_se")
             if se < 0.0:
                 raise ValueError(f"log_evidence_se must be >= 0, got {se}")
-        if not isinstance(self.evidence_split, str) or not self.evidence_split:
+        if not isinstance(self.evidence_split, str) or not self.evidence_split.strip():
             raise ValueError("evidence_split must be a non-empty string")
+        # Counts are real ints, never bools or floats: a True silently
+        # becoming 1 success would corrupt the reported accuracy and
+        # accuracy_gain in every verdict. Validated here, not in
+        # wilson_interval, which only checks range.
+        _check_int(self.accuracy_successes, "accuracy_successes")
+        _check_int(self.accuracy_trials, "accuracy_trials")
         # Validates the accuracy counts (raises on empty sample or
         # out-of-range successes); the interval itself is computed on demand.
         wilson_interval(self.accuracy_successes, self.accuracy_trials)

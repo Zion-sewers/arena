@@ -76,6 +76,13 @@ def test_empty_version_name_rejected() -> None:
         VersionSpec("", 12, 768)
 
 
+def test_whitespace_only_name_or_split_rejected() -> None:
+    with pytest.raises(ValueError):
+        VersionSpec(" ", 12, 768)
+    with pytest.raises(ValueError):
+        _version(split=" ")
+
+
 # ---------------------------------------------------------------- VersionEvidence
 
 
@@ -108,12 +115,26 @@ def test_bad_accuracy_counts_rejected(successes: int, trials: int) -> None:
         _version(successes=successes, trials=trials)
 
 
+@pytest.mark.parametrize(
+    "successes,trials", [(True, 100), (80.5, 100), (80, 100.0), (80, True)]
+)
+def test_bool_or_float_accuracy_counts_rejected(
+    successes: object, trials: object
+) -> None:
+    # A True success count would silently become 1 success and corrupt
+    # the reported accuracy and accuracy_gain in every verdict.
+    with pytest.raises(TypeError):
+        _version(successes=successes, trials=trials)  # type: ignore[arg-type]
+
+
 def test_accuracy_interval_is_wilson() -> None:
     evidence = _version(successes=95, trials=100)
     lo, hi = evidence.accuracy_interval
     assert evidence.accuracy == 0.95
-    assert lo < 0.95 < hi
-    assert 0.0 <= lo and hi <= 1.0
+    # Exact Wilson interval for 95/100 at z=1.96 (hardcoded literals,
+    # not recomputed from the implementation under test).
+    assert lo == pytest.approx(0.888248, abs=1e-6)
+    assert hi == pytest.approx(0.978457, abs=1e-6)
 
 
 def test_unmeasured_flag() -> None:
