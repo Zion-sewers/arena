@@ -98,6 +98,17 @@ src/agenteval_bench/
                   #   cluster's share; single-sample generation refused on
                   #   high stakes; the high-stakes gate requires exactly 5)
   diverge_demo.py # Seeded end-to-end demo of /diverge
+  perturbation.py # Perturbation stability: clean / light / adversarial
+                  #   (arena#53; Regime, PerturbedInput, RegimeReport,
+                  #   StabilityReport, StabilityPolicy, StabilityVerdict,
+                  #   perturb_input, run_triple_regime,
+                  #   run_triple_regime_replay, check_stability,
+                  #   require_triple_regime; light = seeded surface edits
+                  #   with digit-bearing tokens byte-identical, adversarial
+                  #   = seeded prompt-injection battery with a fixed marker;
+                  #   a regime missing a recording is UNMEASURED, never
+                  #   dropped; single-regime gating refused)
+  perturbation_demo.py # Seeded end-to-end demo of perturbation stability
   regression.py   # Production failures -> frozen versions -> release gate
   snapshots.py    # Immutable benchmark snapshots (hash-verified store)
   replay.py       # Deterministic seeded replay logs (bit-exact re-runs)
@@ -247,6 +258,7 @@ table:
 | `calibrate` | calibrated | bad input | mis/uncalibrated | — |
 | `ship` | SHIP | NO_SHIP / NEEDS_REPLICATION | bad input | — |
 | `diverge` | selection made | bad input | refused (paraphrase set / overconfident p / single sample on high stakes) | — |
+| `perturb` | STABLE | UNSTABLE | UNMEASURED (a regime is missing a recording) | bad input |
 | `register-design` | registered | — | bad input | — |
 
 > The `compare` and `report` subcommands described in earlier drafts are **`planned`**
@@ -310,6 +322,7 @@ print(result.summary())
 | OEC ship gate (OEC + guardrails + trust gates) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Analysis pre-specification (10-question review gate) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Anti-mode-collapse /diverge (5 candidates + p_conventional) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
+| Perturbation stability (clean / light / adversarial triple-regime) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |

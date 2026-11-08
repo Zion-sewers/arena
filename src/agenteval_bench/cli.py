@@ -1048,6 +1048,124 @@ def cmd_diverge(args: list[str]) -> int:
     return 0
 
 
+def cmd_perturb(args: list[str]) -> int:
+    """Grade a triple-regime replay suite for perturbation stability (arena#53).
+
+    Reads a suite (--suite file.yaml) where each case carries three
+    recorded outputs — ``output`` (clean), ``output_light`` and
+    ``output_adversarial`` — produced by running the agent on the
+    three inputs outside the CLI, scores all three regimes with the
+    same deterministic matchers, and grades stability: STABLE /
+    UNSTABLE / UNMEASURED. Exit 0 = STABLE, 1 = UNSTABLE,
+    2 = UNMEASURED (a regime is missing a recording), 3 = bad input
+    or bad policy. A replay agent is never run under perturbed inputs:
+    it would return the same recording in every regime and the gaps
+    would be 0 by construction, which measures nothing.
+    """
+    from agenteval_bench.perturbation import (
+        StabilityPolicy,
+        check_stability,
+        run_triple_regime_replay,
+    )
+
+    args, suite_path = _flag(args, "--suite")
+    args, out = _flag(args, "--out")
+    args, as_json = _has(args, "--json")
+    args, seed_s = _flag(args, "--seed", str(DEFAULT_SEED))
+    args, clean_s = _flag(args, "--clean-threshold", "0.9")
+    args, light_s = _flag(args, "--light-threshold", "0.9")
+    args, drop_s = _flag(args, "--max-adversarial-drop", "0.5")
+    if not suite_path:
+        print("Error: --suite <file> is required", file=sys.stderr)
+        return 3
+
+    def _number(raw: str | None, name: str, default: float) -> float | None:
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            print(f"Error: {name} must be a number, got {raw}", file=sys.stderr)
+            return None
+        if not 0.0 <= value <= 1.0:
+            print(
+                f"Error: {name} must be between 0.0 and 1.0, got {raw}",
+                file=sys.stderr,
+            )
+            return None
+        return value
+
+    try:
+        seed = int(seed_s or str(DEFAULT_SEED))
+    except ValueError:
+        print(f"Error: --seed must be an integer, got {seed_s}", file=sys.stderr)
+        return 3
+    clean_threshold = _number(clean_s, "--clean-threshold", 0.9)
+    light_threshold = _number(light_s, "--light-threshold", 0.9)
+    max_drop = _number(drop_s, "--max-adversarial-drop", 0.5)
+    if clean_threshold is None or light_threshold is None or max_drop is None:
+        return 3
+    try:
+        policy = StabilityPolicy(
+            clean_threshold=clean_threshold,
+            light_threshold=light_threshold,
+            max_adversarial_drop=max_drop,
+        )
+    except (TypeError, ValueError) as exc:
+        print(f"Error: invalid stability policy: {exc}", file=sys.stderr)
+        return 3
+    try:
+        suite = EvalSuite.from_yaml(suite_path)
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"Error: cannot load suite {suite_path}: {exc}", file=sys.stderr)
+        return 3
+    try:
+        report = run_triple_regime_replay(suite, seed=seed)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 3
+    verdict = check_stability(report, policy)
+    payload = {
+        "report": report.to_dict(),
+        "verdict": verdict.to_dict(),
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        from agenteval_bench.perturbation import REGIMES
+
+        print(f"Suite: {report.suite_name} (seed={seed})")
+        for regime in REGIMES:
+            sub = report.by_regime(regime)
+            if sub.measured:
+                print(
+                    f"  {regime.value}: pass rate {sub.pass_rate:.1%} "
+                    f"({sub.passed}/{sub.passed + sub.failed} scored, "
+                    f"{sub.skipped} skipped)"
+                )
+            else:
+                print(
+                    f"  {regime.value}: UNMEASURED — missing recorded output for "
+                    f"{', '.join(sub.missing_case_ids)}"
+                )
+        print(
+            f"  drops: clean->light {verdict.clean_to_light_drop:.1%}, "
+            f"clean->adversarial {verdict.clean_to_adversarial_drop:.1%}"
+        )
+        print(f"  verdict: {verdict.outcome.upper()}")
+        for reason in verdict.reasons:
+            print(f"  ! {reason}")
+    if out:
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload, indent=2) + "\n")
+        except OSError as exc:
+            print(f"Error: cannot write report: {exc}", file=sys.stderr)
+            return 3
+        print(f"Report: {out}", file=sys.stderr if as_json else sys.stdout)
+    return {"stable": 0, "unstable": 1, "unmeasured": 2}[verdict.outcome]
+
+
 def cmd_ship(args: list[str]) -> int:
     """Rule SHIP / NO_SHIP / NEEDS_REPLICATION for one agent change (arena#46).
 
@@ -2271,6 +2389,12 @@ def main() -> None:
         print("                                [--p-tolerance 0.15]")
         print("                                [--json] [--out report.json]")
         print("                                (exit 0 selection made, 2 refused, 1 bad input)")
+        print("       agenteval-bench perturb --suite <file.yaml>")
+        print("                                [--seed 42] [--clean-threshold 0.9]")
+        print("                                [--light-threshold 0.9]")
+        print("                                [--max-adversarial-drop 0.5]")
+        print("                                [--json] [--out report.json]")
+        print("                                (exit 0 STABLE, 1 UNSTABLE, 2 UNMEASURED, 3 bad input)")
         print("       agenteval-bench ship --design <file.json> --evidence <file.json>")
         print("                                [--registry plans/experiments.jsonl]")
         print("                                [--json] [--out report.json]")
@@ -2334,6 +2458,8 @@ def main() -> None:
         sys.exit(cmd_calibrate(rest))
     elif cmd == "diverge":
         sys.exit(cmd_diverge(rest))
+    elif cmd == "perturb":
+        sys.exit(cmd_perturb(rest))
     elif cmd == "ship":
         sys.exit(cmd_ship(rest))
     elif cmd == "register-design":
