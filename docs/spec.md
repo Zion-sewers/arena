@@ -54,10 +54,6 @@ src/agenteval_bench/
   decision.py     # Decision system: evidence -> uncertainty -> threshold -> action
                   #   (Dimension/RiskLevel/DecisionAction, Wilson intervals, decide)
   decision_demo.py # Seeded end-to-end demo of the decision system
-  promotion.py    # Version promotion gate: evidence gain, not accuracy gain
-                  #   (VersionSpec/VersionEvidence, r = L/n, promote;
-                  #   PROMOTE / HOLD / REJECT; accuracy-only promotion refused)
-  promotion_demo.py # Seeded end-to-end demo of the promotion gate
   validity.py     # Measurement validity: every metric carries a reliability
                   #   column (ValidityGrade, validate_proxy, ValidityReport)
   validity_demo.py # Seeded end-to-end demo of measurement validity
@@ -79,6 +75,20 @@ src/agenteval_bench/
                   #   masked, Wilson-lower-bound conservative fallback;
                   #   alt-test bridge: (judge, annotator) cells)
   coverage_demo.py # Seeded end-to-end demo of coverage-gated ranking
+  code_length.py  # Model/version selection by code length; capacity meter
+                  #   (ModelVersion, SelectionReport, select_version,
+                  #   select_by_total_length, CapacityReading,
+                  #   CapacityVerdict, assess_capacity, mean_log_loss_bits;
+                  #   two-part code length = measured description bits under
+                  #   one fixed compressor + held-out log-loss, candidates
+                  #   enforced to share one held-out n, one held-out set,
+                  #   and one compressor; parameter count is diagnostic
+                  #   only, never a complexity argument; the meter REPORTS
+                  #   stop on capacity growth without generalisation
+                  #   improvement over a patience window — a STOP report
+                  #   only, no shipped loop stops on it)
+  code_length_demo.py # Seeded end-to-end demo of code-length selection
+                  #   and the capacity meter
   diverge.py      # Anti-mode-collapse: /diverge with 5 candidates +
                   #   p_conventional (Candidate, DivergeSet, DiversityReport,
                   #   check_p_conventional, select, require_high_stakes_decision;
@@ -132,7 +142,6 @@ docs/             # Specifications, archive, roadmap references
 | `ShipVerdict`        | OEC + guardrails + trust gates (SRM, A/A, replication); SHIP only when all pass. |
 | `ReviewGateReport`   | Analysis pre-specification: 10-question gate over a finding vs its registered plan; CONFIRMED / EXPLORATORY_ONLY / REFUSED. |
 | `Selection`          | /diverge selection record: winner vs conventional scores, margin, closed outcome, reason from measured facts; only a token-level-diverse selection graded under the canonical policy with a non-overconfident p may decide on high stakes. |
-| `PromotionVerdict`   | Version promotion gate: PROMOTE only on measured log-evidence gain clearing the margin; accuracy gain never promotes; complexity reported as r = L/n. |
 | `cli.main`           | Parse argv, load suite, build replay `agent_fn`, print summary + gate. |
 
 ### 4.3 Data-flow diagram
@@ -249,8 +258,8 @@ table:
 from agenteval_bench import EvalSuite, EvalRunner, DeterministicScorer
 
 suite = EvalSuite.from_yaml("eval.yaml")
-runner = EvalRunner()                       # or EvalRunner(DeterministicScorer())
-result = runner.run(suite, agent_fn=lambda q: "...")   # Callable[[str], str]
+runner = EvalRunner()  # or EvalRunner(DeterministicScorer())
+result = runner.run(suite, agent_fn=lambda q: "...")  # Callable[[str], str]
 print(result.summary())
 ```
 
@@ -301,7 +310,6 @@ print(result.summary())
 | OEC ship gate (OEC + guardrails + trust gates) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Analysis pre-specification (10-question review gate) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Anti-mode-collapse /diverge (5 candidates + p_conventional) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
-| Evidence-gate version promotion (evidence gain, not accuracy; L/n reported) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | CLI `run` + CI gate    | ✅ shipped  | v0.1.0         |
 | Golden replay suites   | ✅ shipped  | v0.1.0         |
 | alt-test benchmark     | ✅ shipped  | v0.1.0         |
