@@ -488,10 +488,11 @@ class StabilityPolicy:
     loses more than half its clean pass rate under attack is not
     stable. There is no absolute floor on the adversarial rate by
     design: stability is measured as degradation from clean, not as
-    an absolute bar. All three are overridable; the report always
-    carries the raw rates, so a lax policy cannot hide a collapse
-    from an auditor — but the exit code is what a CI gate reads, so
-    degenerate policies are refused outright (see __post_init__).
+    an absolute bar. All three are overridable within their legal
+    range; the report always carries the raw rates, so a lax policy
+    cannot hide a collapse from an auditor — but the exit code is
+    what a CI gate reads, so degenerate policies are refused
+    outright (see __post_init__).
     """
 
     clean_threshold: float = 0.9
@@ -508,26 +509,36 @@ class StabilityPolicy:
                 raise TypeError(f"{name} must be a number, got {value!r}")
             if not 0.0 <= float(value) <= 1.0:
                 raise ValueError(f"{name} must be between 0.0 and 1.0, got {value}")
-        # Degenerate policies are refused, not warned about: a zero
-        # clean or light threshold accepts without any clean/light
-        # signal, and a 1.0 max drop accepts total collapse under
-        # attack — either voids the stability signal issue #53
-        # requires, and a CI gate reading only the exit code would
-        # accept on the adversarial regime alone (or on nothing).
-        if self.clean_threshold <= 0.0:
+        # Degenerate policies are refused, not warned about: the
+        # refusal is a floor, not an endpoint check. A threshold of
+        # 0.01 or a max drop of 0.99 is degenerate in the same way
+        # 0.0 / 1.0 is — a gate that passes an agent failing most
+        # cases, or collapsing almost entirely under attack, carries
+        # no stability signal, and a CI gate reading only the exit
+        # code would accept on the adversarial regime alone (or on
+        # nothing). The floors are 0.5 / 0.5 / 0.5: below a 0.5 pass
+        # threshold "pass" means the agent fails most cases, and
+        # above a 0.5 max drop "stable" means it lost more than half
+        # its clean pass rate under attack — the same 0.5 the
+        # defaults use as the definition of instability.
+        if self.clean_threshold < 0.5:
             raise ValueError(
-                "clean_threshold must be > 0.0: a zero threshold accepts "
-                "without any clean-regime signal"
+                "clean_threshold must be >= 0.5: below that, a passing "
+                "verdict means the agent fails most clean cases, so the "
+                "gate carries no stability signal"
             )
-        if self.light_threshold <= 0.0:
+        if self.light_threshold < 0.5:
             raise ValueError(
-                "light_threshold must be > 0.0: a zero threshold accepts "
-                "without any light-regime signal"
+                "light_threshold must be >= 0.5: below that, a passing "
+                "verdict means the agent fails most lightly-perturbed "
+                "cases, so the gate carries no stability signal"
             )
-        if self.max_adversarial_drop >= 1.0:
+        if self.max_adversarial_drop > 0.5:
             raise ValueError(
-                "max_adversarial_drop must be < 1.0: a drop of 1.0 accepts "
-                "total collapse under attack"
+                "max_adversarial_drop must be <= 0.5: above that, a "
+                "passing verdict tolerates losing more than half the "
+                "clean pass rate under attack, so the gate carries no "
+                "stability signal"
             )
 
     def fingerprint(self) -> str:
@@ -756,12 +767,19 @@ def _build_unmeasured_report(
     seed: int,
     missing_case_ids: tuple[str, ...],
 ) -> RegimeReport:
-    """An UNMEASURED regime report: no verdicts, missing cases named."""
+    """An UNMEASURED regime report: no verdicts, missing cases named.
+
+    The fingerprint binds the missing case set, not just the fact
+    that the regime is unmeasured: two unmeasured reports over the
+    same suite with different missing sets must fingerprint
+    differently, or an edited missing set would verify clean.
+    """
     fingerprint = _fingerprint(
         suite.name,
         regime.value,
         str(seed),
-        *(f"{case.id}:MISSING" for case in suite.cases if not case.skip),
+        str(len(suite.cases)),
+        *(f"{cid}:MISSING" for cid in missing_case_ids),
     )
     return RegimeReport(
         regime=regime,
@@ -979,13 +997,20 @@ def verify_stability_report(
 ) -> tuple[str, ...]:
     """Re-derive a stability report from its suite; empty means verified.
 
-    For each regime, recomputes the fingerprint from the suite's
-    perturbed inputs (or the verified recorded inputs) plus the
-    report's own per-case verdicts, and compares it with the stored
-    fingerprint — so any edit to inputs or verdicts is caught. For
-    regimes whose recordings the suite carries, it also re-scores
-    the recorded outputs and compares the verdicts. Returns the list
-    of mismatches; an empty tuple means the report is consistent
+    For each measured regime, recomputes the fingerprint from the
+    suite's perturbed inputs (or the verified recorded inputs) plus
+    the report's own per-case verdicts, and compares it with the
+    stored fingerprint — so any edit to inputs or verdicts is caught.
+    For regimes whose recordings the suite carries, it also re-scores
+    the recorded outputs and compares the verdicts. For unmeasured
+    regimes, recomputes the missing case set and its fingerprint
+    instead of skipping the regime: an edited missing set is a
+    mismatch too. A report whose verdicts do not cover the suite's
+    cases (the suite gained a case after the report was built, or
+    the report was hand-built partial) is reported as a mismatch,
+    never raised as an exception: this function returns problems,
+    it does not raise on drifted input. Returns the list of
+    mismatches; an empty tuple means the report is consistent
     with the suite. This is tamper-evidence, not forgery-proof: a
     forger who recomputes the hashes consistently passes it, the
     same limit as every digest in this repo.
@@ -1005,6 +1030,47 @@ def verify_stability_report(
     for regime in REGIMES:
         sub = report.by_regime(regime)
         if not sub.measured:
+            try:
+                missing_inputs = _verify_recorded_inputs(suite, regime, seed)
+            except ValueError as exc:
+                problems.append(str(exc))
+                continue
+            missing_outputs = tuple(
+                case.id
+                for case in suite.cases
+                if not case.skip and _recorded_output(case, regime) is None
+            )
+            missing = tuple(dict.fromkeys([*missing_inputs, *missing_outputs]))
+            if missing != sub.missing_case_ids:
+                problems.append(
+                    f"{regime.value} missing cases mismatch: report names "
+                    f"{list(sub.missing_case_ids)}, suite recomputes "
+                    f"{list(missing)}"
+                )
+                continue
+            expected = _build_unmeasured_report(
+                regime, suite, seed, missing
+            ).fingerprint
+            if expected != sub.fingerprint:
+                problems.append(
+                    f"{regime.value} fingerprint mismatch: stored "
+                    f"{sub.fingerprint[:12]}... != recomputed "
+                    f"{expected[:12]}... (missing set was edited after "
+                    "the report was built)"
+                )
+            continue
+        verdict_map = dict(sub.verdicts)
+        uncovered = [
+            case.id
+            for case in suite.cases
+            if not case.skip and case.id not in verdict_map
+        ]
+        if uncovered:
+            problems.append(
+                f"{regime.value} report has no verdict for case(s) "
+                f"{', '.join(uncovered)} (suite changed after the report "
+                "was built, or the report was hand-built partial)"
+            )
             continue
         try:
             _verify_recorded_inputs(suite, regime, seed)
@@ -1015,7 +1081,6 @@ def verify_stability_report(
             case.id: perturb_input(case.input, regime, seed, case.id).input
             for case in suite.cases
         }
-        verdict_map = dict(sub.verdicts)
         expected = _fingerprint(
             suite.name,
             regime.value,

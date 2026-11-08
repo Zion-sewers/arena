@@ -87,6 +87,21 @@ def _build_log(suite: EvalSuite, suite_path: str, digest: str,
     )
 
 
+def _has_triple_regime_recordings(suite: EvalSuite) -> bool:
+    """True when any case carries triple-regime recordings.
+
+    The gate for such a suite is `perturb`, not `run --ci` or
+    `decide`: those commands score the clean recording only.
+    """
+    return any(
+        c.output_light is not None
+        or c.output_adversarial is not None
+        or c.input_light is not None
+        or c.input_adversarial is not None
+        for c in suite.cases
+    )
+
+
 def _warn_triple_regime_suite(suite: EvalSuite) -> None:
     """Warn loudly when a suite carries triple-regime recordings.
 
@@ -95,13 +110,7 @@ def _warn_triple_regime_suite(suite: EvalSuite) -> None:
     gated with `perturb`, not here — otherwise the gate accepts on
     a single regime while a triple gate exists for the artifact.
     """
-    if any(
-        c.output_light is not None
-        or c.output_adversarial is not None
-        or c.input_light is not None
-        or c.input_adversarial is not None
-        for c in suite.cases
-    ):
+    if _has_triple_regime_recordings(suite):
         print(
             "Warning: this suite carries triple-regime recordings "
             "(output_light / output_adversarial); this command scores "
@@ -109,6 +118,24 @@ def _warn_triple_regime_suite(suite: EvalSuite) -> None:
             "`agenteval-bench perturb` instead — a clean-only PASS "
             "here says nothing about light or adversarial stability."
         )
+
+
+def _refuse_triple_regime_suite(command: str, exit_code: int) -> int:
+    """Refuse to gate a triple-regime suite on the clean regime alone.
+
+    A warning is not a stop: a CI pipeline reading only the exit
+    code would still accept on the clean recording while `perturb`
+    grades the same suite UNSTABLE. The command exits non-zero
+    and names the gate that can grade the artifact.
+    """
+    print(
+        f"Error: this suite carries triple-regime recordings "
+        f"(output_light / output_adversarial); `{command}` scores the "
+        "clean recording only and cannot gate it. Gate stability with "
+        "`agenteval-bench perturb` instead.",
+        file=sys.stderr,
+    )
+    return exit_code
 
 
 def _suite_to_yaml_dict(suite: EvalSuite) -> dict[str, Any]:
@@ -197,6 +224,9 @@ def cmd_run(args: list[str]) -> int:
 
     suite, recorded, missing, digest = _load_suite_for_replay(suite_path)
     if ci_mode:
+        if _has_triple_regime_recordings(suite):
+            return _refuse_triple_regime_suite("run --ci", 1)
+    else:
         _warn_triple_regime_suite(suite)
     # Standalone CLI scores a replay suite: each case carries a recorded
     # `output`. Cases without one are skipped (a live agent would fill them
@@ -417,7 +447,8 @@ def cmd_decide(args: list[str]) -> int:
         return 3
     if missing:
         print(f"Note: {len(missing)} case(s) had no recorded output and were skipped.")
-    _warn_triple_regime_suite(suite)
+    if _has_triple_regime_recordings(suite):
+        return _refuse_triple_regime_suite("decide", 3)
     inputs = [c.input for c in suite.cases if not c.skip]
     if len(set(inputs)) != len(inputs):
         print(
@@ -1261,6 +1292,10 @@ def cmd_perturb(args: list[str]) -> int:
     payload = {
         "report": report.to_dict(),
         "verdict": verdict.to_dict(),
+        "scope": (
+            "adversarial is a fixed 3-template prompt-injection "
+            "battery, not an adaptive adversary"
+        ),
     }
     if as_json:
         print(json.dumps(payload, indent=2))

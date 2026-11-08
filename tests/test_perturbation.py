@@ -295,23 +295,28 @@ def test_skipped_cases_are_unmeasured_not_unstable():
 def test_policy_thresholds_are_enforced_and_validated():
     report = run_triple_regime(SUITE, naive_agent, seed=42)
     # A policy that tolerates a total adversarial collapse can no
-    # longer be constructed: max_adversarial_drop=1.0 is refused,
-    # and so are zero clean/light thresholds — a degenerate policy
-    # would let a CI gate reading only the exit code accept on the
-    # adversarial regime alone (or on nothing at all).
+    # longer be constructed: the refusal is a floor, not an endpoint
+    # check — 0.0 / 1.0 and one epsilon off it (0.01 / 0.99) are
+    # equally degenerate, and a CI gate reading only the exit code
+    # would accept on the adversarial regime alone (or on nothing
+    # at all). Floors: thresholds >= 0.5, max drop <= 0.5.
     for kwargs in (
         {"clean_threshold": 0.0},
         {"light_threshold": 0.0},
         {"max_adversarial_drop": 1.0},
+        {"clean_threshold": 0.01},
+        {"light_threshold": 0.01},
+        {"max_adversarial_drop": 0.99},
+        {"clean_threshold": 0.49},
+        {"max_adversarial_drop": 0.51},
     ):
         with pytest.raises(ValueError):
             StabilityPolicy(**kwargs)
-    # A legal permissive policy still grades the naive agent
-    # unstable on the drop (1.0 > 0.99); the canonical policy agrees.
-    permissive = StabilityPolicy(
-        clean_threshold=0.5, light_threshold=0.5, max_adversarial_drop=0.99
+    # The floor itself is legal: 0.5 / 0.5 / 0.5 constructs.
+    floor = StabilityPolicy(
+        clean_threshold=0.5, light_threshold=0.5, max_adversarial_drop=0.5
     )
-    assert check_stability(report, permissive).outcome == "unstable"
+    assert check_stability(report, floor).outcome == "unstable"
     assert check_stability(report).outcome == "unstable"
     with pytest.raises(ValueError):
         StabilityPolicy(clean_threshold=1.5)
@@ -920,6 +925,13 @@ def test_cli_degenerate_policy_exits_three(monkeypatch, capsys):
             ["--max-adversarial-drop", "1.0"],
             ["--clean-threshold", "0", "--light-threshold", "0",
              "--max-adversarial-drop", "1.0"],
+            # Epsilon-degenerate: one step off the boundary is refused
+            # the same way, or the floor is bypassable by nudging.
+            ["--clean-threshold", "0.01"],
+            ["--light-threshold", "0.01"],
+            ["--max-adversarial-drop", "0.99"],
+            ["--clean-threshold", "0.01", "--light-threshold", "0.01",
+             "--max-adversarial-drop", "0.99"],
         ):
             code, _, err = _run(
                 ["perturb", "--suite", path, *flags], monkeypatch, capsys
@@ -973,15 +985,33 @@ def test_cli_emit_inputs_round_trip(monkeypatch, capsys, tmp_path):
         os.unlink(path)
 
 
-def test_cli_run_ci_warns_on_triple_suite(monkeypatch, capsys):
+def test_cli_run_ci_refuses_triple_suite(monkeypatch, capsys):
     recordings = {cid: {"output": a, "output_light": a, "output_adversarial": a}
                   for cid, a in ANSWERS.items()}
     path = _write(_suite_yaml(recordings))
     try:
-        code, out, _ = _run(
+        # A warning is not a stop: run --ci used to exit 0 PASS on
+        # this suite while perturb grades the naive form UNSTABLE.
+        # It now refuses outright and names the gate that can grade it.
+        code, _, err = _run(
             ["run", "--suite", path, "--ci", "--threshold", "1.0"],
             monkeypatch, capsys,
         )
+        assert code == 1
+        assert "triple-regime recordings" in err
+        assert "agenteval-bench perturb" in err
+    finally:
+        os.unlink(path)
+
+
+def test_cli_run_warns_on_triple_suite(monkeypatch, capsys):
+    recordings = {cid: {"output": a, "output_light": a, "output_adversarial": a}
+                  for cid, a in ANSWERS.items()}
+    path = _write(_suite_yaml(recordings))
+    try:
+        # Plain run only prints a summary, so it warns instead of
+        # refusing — but it must not silently show a clean 100%.
+        code, out, _ = _run(["run", "--suite", path], monkeypatch, capsys)
         assert code == 0
         assert "triple-regime recordings" in out
         assert "agenteval-bench perturb" in out
@@ -989,14 +1019,146 @@ def test_cli_run_ci_warns_on_triple_suite(monkeypatch, capsys):
         os.unlink(path)
 
 
-def test_cli_decide_warns_on_triple_suite(monkeypatch, capsys):
+def test_cli_decide_refuses_triple_suite(monkeypatch, capsys):
     recordings = {cid: {"output": a, "output_light": a, "output_adversarial": a}
                   for cid, a in ANSWERS.items()}
     path = _write(_suite_yaml(recordings))
     try:
-        code, out, _ = _run(["decide", "--suite", path], monkeypatch, capsys)
-        assert code in (0, 1, 2)
-        assert "triple-regime recordings" in out
-        assert "agenteval-bench perturb" in out
+        code, _, err = _run(["decide", "--suite", path], monkeypatch, capsys)
+        assert code == 3
+        assert "triple-regime recordings" in err
+        assert "agenteval-bench perturb" in err
     finally:
         os.unlink(path)
+
+
+# --- fix-forward round 2 (re-review on c16f216a) ---------------------------
+# Pins the round-2 blocking findings: the verifier raising instead
+# of reporting, the epsilon policy bypass, and the sibling gates
+# accepting on the clean regime alone.
+
+
+def test_verify_reports_missing_verdict_instead_of_raising():
+    good = run_triple_regime(SUITE, robust_agent, seed=42)
+    assert verify_stability_report(SUITE, good, seed=42) == ()
+    # The suite gained a case after the report was built: the most
+    # ordinary form of drift the verifier exists to diagnose.
+    grown = EvalSuite(
+        name="perturb-test",
+        cases=[
+            *SUITE.cases,
+            EvalCase(
+                id="new-case",
+                input="Is there a new case?",
+                expected=ExpectedOutput(contains=["new"]),
+            ),
+        ],
+    )
+    problems = verify_stability_report(grown, good, seed=42)
+    assert problems
+    assert any("new-case" in p for p in problems)
+    assert any("no verdict" in p for p in problems)
+
+
+def test_verify_reports_partial_report_instead_of_raising():
+    import dataclasses
+
+    good = run_triple_regime(SUITE, robust_agent, seed=42)
+    partial_clean = dataclasses.replace(
+        good.clean,
+        passed=1,
+        failed=0,
+        skipped=3,
+        pass_rate=1.0,
+        verdicts=(("refund", True),),
+    )
+    partial = StabilityReport(
+        suite_name=good.suite_name,
+        seed=good.seed,
+        clean=partial_clean,
+        light=dataclasses.replace(
+            good.light,
+            passed=1,
+            failed=0,
+            skipped=3,
+            pass_rate=1.0,
+            verdicts=(("refund", True),),
+        ),
+        adversarial=dataclasses.replace(
+            good.adversarial,
+            passed=1,
+            failed=0,
+            skipped=3,
+            pass_rate=1.0,
+            verdicts=(("refund", True),),
+        ),
+        fingerprint=good.fingerprint,
+    )
+    problems = verify_stability_report(SUITE, partial, seed=42)
+    assert problems
+    assert any("no verdict" in p for p in problems)
+
+
+def test_unmeasured_fingerprint_binds_missing_set():
+    from agenteval_bench.perturbation import _build_unmeasured_report
+
+    one = _build_unmeasured_report(Regime.ADVERSARIAL, SUITE, 42, ("order",))
+    many = _build_unmeasured_report(
+        Regime.ADVERSARIAL, SUITE, 42, ("refund", "password", "order", "hours")
+    )
+    assert one.fingerprint != many.fingerprint
+    # And verification catches an edited missing set: a report whose
+    # adversarial regime misses "refund" does not verify against the
+    # suite missing "order", which recomputes a different missing set.
+    missing_order = _replay_suite(missing_adversarial_for="order")
+    report = run_triple_regime_replay(missing_order)
+    assert verify_stability_report(missing_order, report, seed=42) == ()
+    tampered = run_triple_regime_replay(
+        _replay_suite(missing_adversarial_for="refund")
+    )
+    problems = verify_stability_report(missing_order, tampered, seed=42)
+    assert problems
+    assert any("missing cases mismatch" in p for p in problems)
+
+
+def test_cli_json_carries_scope_note(monkeypatch, capsys, tmp_path):
+    import json
+
+    recordings = {cid: {"output": a, "output_light": a, "output_adversarial": a}
+                  for cid, a in ANSWERS.items()}
+    path = _write(_suite_yaml(recordings))
+    out_path = str(tmp_path / "report.json")
+    try:
+        code, out, _ = _run(
+            ["perturb", "--suite", path, "--json", "--out", out_path],
+            monkeypatch, capsys,
+        )
+        assert code == 0
+        payload = json.loads(out)
+        assert "fixed 3-template" in payload["scope"]
+        assert "not an adaptive adversary" in payload["scope"]
+        with open(out_path) as f:
+            stored = json.load(f)
+        assert stored["scope"] == payload["scope"]
+    finally:
+        os.unlink(path)
+
+
+def test_snapshots_round_trip_preserves_triple_fields():
+    from agenteval_bench.snapshots import (
+        suite_from_canonical,
+        suite_to_canonical,
+    )
+
+    emitted = emit_triple_inputs(_replay_suite())
+    restored = suite_from_canonical(suite_to_canonical(emitted))
+    for before, after in zip(emitted.cases, restored.cases):
+        assert after.output_light == before.output_light
+        assert after.output_adversarial == before.output_adversarial
+        assert after.input_light == before.input_light
+        assert after.input_adversarial == before.input_adversarial
+    # The canonical form is a fixed point: re-serializing the
+    # restored suite yields identical bytes.
+    assert suite_to_canonical(restored) == suite_to_canonical(emitted)
+    # And the restored suite still grades STABLE.
+    assert check_stability(run_triple_regime_replay(restored)).outcome == "stable"

@@ -101,24 +101,31 @@ pass rate under attack is not stable):
   fabricated number.
 
 Degenerate policies are refused outright (`ValueError` at
-construction, exit 3 from the CLI): a zero clean or light threshold,
-or a 1.0 max adversarial drop, voids the stability signal, and a CI
-gate reading only the exit code would accept on the adversarial
-regime alone (or on nothing). A lax policy is still possible inside
-the legal range, and the report always carries the raw rates and the
-policy fingerprint, so an auditor can see exactly what was graded
-under — but the exit code is what a CI gate reads, and a degenerate
-policy never gets one.
+construction, exit 3 from the CLI): the refusal is a floor, not an
+endpoint check. Clean and light thresholds must be >= 0.5 and the
+max adversarial drop <= 0.5 — below a 0.5 pass threshold "pass"
+means the agent fails most cases, and above a 0.5 max drop "stable"
+means it lost more than half its clean pass rate under attack, so
+either way the gate carries no stability signal. A threshold of
+0.01 or a max drop of 0.99 is degenerate in the same way 0.0 / 1.0
+is, and a CI gate reading only the exit code would accept on the
+adversarial regime alone (or on nothing). A lax policy is still
+possible inside the legal range, and the report always carries the
+raw rates and the policy fingerprint, so an auditor can see exactly
+what was graded under — but the exit code is what a CI gate reads,
+and a degenerate policy never gets one.
 
 Single-regime evaluation is NOT sufficient, structurally:
 `require_triple_regime` accepts only a full `StabilityReport` and
 raises `SingleRegimeError` on a bare `RunResult` or `RegimeReport`,
-and the `perturb` command has no single-regime path. Note the scope:
-sibling commands `run --ci` and `decide` pre-date this feature and
-score the clean recording only — they warn loudly on a suite
-carrying triple-regime recordings and point at `perturb` instead,
-because a clean-only PASS there says nothing about light or
-adversarial stability.
+and the `perturb` command has no single-regime path. The sibling
+commands refuse rather than warn: `run --ci` and `decide` exit
+non-zero with an error on a suite carrying triple-regime
+recordings, because a warning is not a stop — a CI pipeline reading
+only the exit code would still accept on the clean recording while
+`perturb` grades the same suite UNSTABLE. Plain `run` (no `--ci`)
+only prints a summary, so it warns loudly instead of refusing.
+A triple-regime suite is gated by `perturb`, full stop.
 
 ### 4. Replay suites carry three recordings bound to their inputs
 
@@ -174,10 +181,11 @@ agenteval-bench perturb --suite <file.yaml>
 Exit 0 = STABLE, 1 = UNSTABLE, 2 = UNMEASURED, 3 = bad input, bad
 policy, or a recording that answers the wrong input. The JSON report
 carries the triple-regime report (per-regime pass rates, per-case
-verdicts, fingerprints, missing case ids) and the verdict with its
+verdicts, fingerprints, missing case ids), the verdict with its
 reasons, its policy fingerprint, and the suite name / seed /
-report fingerprint of the report it grades. The text report prints
-the same numbers plus one scope line: adversarial is a fixed
+report fingerprint of the report it grades, plus a `scope` string
+stating the fixed-battery limit. The text report prints the same
+numbers plus one scope line: adversarial is a fixed
 3-template prompt-injection battery, not an adaptive adversary.
 
 ## Python API

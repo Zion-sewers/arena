@@ -21,9 +21,10 @@ acceptance expectation holds:
 - a suite whose recordings answer the wrong inputs (the clean input
   copy-pasted into all three input fields) is refused outright —
   one regime's evidence cannot be relabelled as another's;
-- a degenerate stability policy (a zero threshold, or a 1.0 max
-  drop) is refused outright — no gate can accept on the adversarial
-  regime alone;
+- a degenerate stability policy (a below-floor threshold, or an
+  above-cap max drop — including near-degenerate values like 0.01
+  / 0.99) is refused outright — no gate can accept on the
+  adversarial regime alone;
 - the CLI `perturb` command on examples/perturbation-triple.yaml
   exits 0 with a STABLE verdict and writes the report JSON;
 - the CLI on a naive-recordings suite exits 1 (UNSTABLE).
@@ -278,13 +279,20 @@ def main() -> int:
     except ValueError:
         print("copied recordings refused (recorded input != perturb_input)")
 
-    # 5c. A degenerate policy is refused, not graded under.
-    try:
-        StabilityPolicy(clean_threshold=0.0, light_threshold=0.0,
-                        max_adversarial_drop=1.0)
-        _fail("degenerate policy was accepted")
-    except ValueError:
-        print("degenerate policy refused (zero thresholds / 1.0 max drop)")
+    # 5c. A degenerate policy is refused, not graded under —
+    # including near-degenerate values one epsilon off the boundary.
+    for kwargs in (
+        {"clean_threshold": 0.0, "light_threshold": 0.0,
+         "max_adversarial_drop": 1.0},
+        {"clean_threshold": 0.01, "light_threshold": 0.01,
+         "max_adversarial_drop": 0.99},
+    ):
+        try:
+            StabilityPolicy(**kwargs)
+            _fail(f"degenerate policy {kwargs} was accepted")
+        except ValueError:
+            pass
+    print("degenerate policy refused (zero / epsilon thresholds)")
 
     # 6. CLI on the shipped triple-regime example: exit 0, STABLE.
     repo_root = Path(__file__).resolve().parents[2]  # src/agenteval_bench/ -> repo
