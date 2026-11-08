@@ -32,14 +32,22 @@ measured on different data would be grading the split, not the version.
 The gain interval uses independent standard errors,
 SE_diff = sqrt(se_challenger^2 + se_champion^2). Evidence for two
 versions is usually estimated on the same split, so the errors are in
-fact correlated; correlation would only NARROW the interval, so the
-independent-SE interval is conservative — it is harder, never easier,
-to clear the margin. That is the fail-closed direction for a gate.
+fact correlated; assuming non-negative correlation, as expected when
+both evidences are estimated on the same split, correlation would only
+narrow the interval, so the independent-SE interval is conservative —
+it is harder, never easier, to clear the margin. That is the
+fail-closed direction for a gate. The non-negative-correlation
+assumption is stated, not verified: the gate cannot check it.
 
 The margin is a policy choice, default 0.0 (any positive evidence gain,
 after accounting for measurement error, promotes). Teams that want a
 stronger bar can use the Jeffreys scale for the log Bayes factor:
-1 = substantial, 3 = strong, 5 = decisive (established).
+1 = substantial, 3 = strong, 5 = decisive (established). The
+comparison is strict: a lower bound exactly equal to the margin does
+not promote (with measurement error left it HOLDs; with exact evidence
+it REJECTs). This differs from decision.py, where a lower bound equal
+to the threshold GATEs; the promotion gate takes the stricter reading
+because equality is not a gain.
 
 This is a version-promotion gate (champion vs challenger). It is not
 the failure-promotion of regression.py (promoting production failures
@@ -54,9 +62,7 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 
-from agenteval_bench.decision import wilson_interval
-
-Z_95 = 1.96
+from agenteval_bench.decision import Z_95, wilson_interval
 
 
 def _check_int(value: int, field_name: str) -> int:
@@ -208,9 +214,16 @@ class PromotionVerdict:
     reason: str
 
     def summary(self) -> str:
-        """Human-readable verdict: action, evidence gain, accuracy, r=L/n."""
+        """Human-readable verdict: action, evidence gain, accuracy, r=L/n.
+
+        The summary is the audit artifact: it carries the split, the
+        SEs, and the accuracy intervals, not just the verdict, so a
+        pasted summary can be checked without the objects behind it.
+        """
         champ = self.champion
         cand = self.candidate
+        champ_lo, champ_hi = champ.accuracy_interval
+        cand_lo, cand_hi = cand.accuracy_interval
         lines = [
             (
                 f"Promotion: {self.action.value.upper()} "
@@ -222,6 +235,7 @@ class PromotionVerdict:
                 f"candidate {cand.version.complexity:.4f} "
                 f"(L={cand.version.depth}, n={cand.version.width})"
             ),
+            f"  evidence split: {champ.evidence_split}",
         ]
         if self.evidence_gain is None or self.gain_interval is None:
             lines.append("  evidence gain: UNMEASURED")
@@ -230,10 +244,19 @@ class PromotionVerdict:
             lines.append(
                 f"  evidence gain: {self.evidence_gain:+.3f} 95% CI=[{lo:+.3f}, {hi:+.3f}]"
             )
+            if champ.log_evidence_se is not None and cand.log_evidence_se is not None:
+                lines.append(
+                    f"  evidence SEs: champion {champ.log_evidence_se:.3f}, "
+                    f"candidate {cand.log_evidence_se:.3f}"
+                )
         lines.append(
             f"  accuracy gain: {self.accuracy_gain:+.3f} "
             f"(champion {champ.accuracy:.3f} -> "
             f"candidate {cand.accuracy:.3f})"
+        )
+        lines.append(
+            f"  accuracy 95% CIs: champion [{champ_lo:.3f}, {champ_hi:.3f}], "
+            f"candidate [{cand_lo:.3f}, {cand_hi:.3f}]"
         )
         lines.append(f"  reason: {self.reason}")
         return "\n".join(lines)

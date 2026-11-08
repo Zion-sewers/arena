@@ -28,6 +28,30 @@ accuracy gain never promotes on its own.
   successes/trials are supplied to `decision.py`. A gate that estimated
   evidence from benchmark scores would be the overfitting it exists to
   prevent.
+- **SE = 0 asserts exact measurement.** A caller asserting SE 0 with
+  any epsilon positive gain promotes, so SE 0 must only be used when
+  the evidence is genuinely exact (e.g. computed by exact enumeration,
+  not estimated). This differs deliberately from `decision.py`'s
+  `_judge_cost`, which refuses to gate on a single cost observation
+  carrying no measured uncertainty: some evidence genuinely has no
+  measurement error, and the gate accepts that claim. Teams should
+  adopt margin ≥ 1.0 (Jeffreys "substantial") as their working default
+  rather than 0.0.
+- **It cannot see re-measurement.** The gate is a pure stateless
+  function: a pipeline that re-measures until the interval clears is
+  shopping for evidence, not measuring it. The calling pipeline must
+  pre-register the measurement (one pre-registered estimate per version
+  pair) or log every `promote()` call.
+- **The split name is a caller assertion, not a verified held-out
+  guarantee.** Equal strings prove equal labels, not that the shared
+  split is held out or untuned-on; a contaminated shared split passes
+  silently.
+- **Accuracy counts carry no provenance.** Unlike the evidence, which
+  carries `evidence_split`, the accuracy counts carry no split or suite
+  digest, so a verdict's reported accuracy gain could come from
+  different data than its evidence gain without the gate noticing.
+  Accuracy never promotes, so this weakens the audit record, not the
+  decision; a future pipeline should carry an accuracy split/digest.
 - **It does not invent a complexity penalty.** The marginal likelihood
   already penalizes complexity (it integrates over parameters — the
   Occam factor, established). No coefficient in the literature maps a
@@ -40,10 +64,10 @@ accuracy gain never promotes on its own.
 ## Uncertainty handling
 
 - The gain interval is gain ± 1.96 · √(se_challenger² + se_champion²).
-  The independent-SE formula is conservative: evidence for two versions
-  is usually estimated on the same split, so the errors are correlated,
-  and correlation would only narrow the interval. The conservative
-  direction is the fail-closed direction for a gate.
+  The independent-SE formula is conservative assuming non-negative
+  correlation, as expected when both evidences are estimated on the
+  same split; the assumption is stated, not verified, and the gate
+  cannot check it.
 - The compared quantity is the interval LOWER bound, mirroring
   `decision.py`: a point estimate that clears the margin while its
   interval straddles it HOLDs.

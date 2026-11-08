@@ -115,12 +115,8 @@ def test_bad_accuracy_counts_rejected(successes: int, trials: int) -> None:
         _version(successes=successes, trials=trials)
 
 
-@pytest.mark.parametrize(
-    "successes,trials", [(True, 100), (80.5, 100), (80, 100.0), (80, True)]
-)
-def test_bool_or_float_accuracy_counts_rejected(
-    successes: object, trials: object
-) -> None:
+@pytest.mark.parametrize("successes,trials", [(True, 100), (80.5, 100), (80, 100.0), (80, True)])
+def test_bool_or_float_accuracy_counts_rejected(successes: object, trials: object) -> None:
     # A True success count would silently become 1 success and corrupt
     # the reported accuracy and accuracy_gain in every verdict.
     with pytest.raises(TypeError):
@@ -315,9 +311,18 @@ def test_verdict_summary_reports_complexity_and_reason() -> None:
     assert "accuracy gain: +0.080" in summary
     assert "evidence gain: -4.000" in summary
     assert "accuracy gain +0.080 does not promote" in summary
+    # Audit artifact: split, SEs, and accuracy intervals are printed,
+    # not just held on the objects.
+    assert "evidence split: heldout-v3" in summary
+    assert "evidence SEs: champion 0.500, candidate 0.500" in summary
+    assert "accuracy 95% CIs: champion [0.711, 0.867]" in summary
+    assert "candidate [0.802, 0.930]" in summary
 
 
 def test_verdict_summary_unmeasured_names_no_gain() -> None:
     candidate = _version(log_evidence=None, log_evidence_se=None, successes=100)
     verdict = promote(_champion(), candidate)
-    assert "evidence gain: UNMEASURED" in verdict.summary()
+    summary = verdict.summary()
+    assert "evidence gain: UNMEASURED" in summary
+    assert "evidence split: heldout-v3" in summary
+    assert "evidence SEs" not in summary
