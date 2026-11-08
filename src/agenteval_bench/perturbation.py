@@ -32,10 +32,14 @@ Measurement discipline (same as decision.py / coverage.py):
   and every report carries a fingerprint binding suite + regime +
   seed + perturbed inputs + per-case verdicts, so any edit to inputs
   or verdicts invalidates the fingerprint — and
-  ``verify_stability_report`` recomputes it from the suite. This is
-  tamper-evidence, not forgery-proof: anyone who can recompute the
-  hash can forge a consistent report, so the check catches accidental
-  edits and inconsistent artifacts, not a determined forger;
+  ``verify_stability_report`` recomputes it from the suite's verified
+  recorded inputs. A measured regime whose recordings are missing
+  from the suite is a mismatch, not a pass: the fingerprint is
+  re-derivable from suite + seed alone, so a deleted recording would
+  otherwise verify clean. This is tamper-evidence, not
+  forgery-proof: anyone who can recompute the hash can forge a
+  consistent report, so the check catches accidental edits and
+  inconsistent artifacts, not a determined forger;
 * transforms are deterministic: the per-case randomness derives from
   sha256("seed:regime:case_id"), never from hash() (process-salted)
   and never from unseeded global state.
@@ -335,7 +339,7 @@ class RegimeReport:
     passed: int
     failed: int
     skipped: int
-    pass_rate: float
+    pass_rate: float | None
     # (case_id, passed) for scored cases only, in suite order.
     verdicts: tuple[tuple[str, bool], ...] = ()
     fingerprint: str = ""
@@ -363,6 +367,11 @@ class RegimeReport:
                 )
             scored = self.passed + self.failed
             expected_rate = self.passed / scored if scored else 0.0
+            if self.pass_rate is None:
+                raise ValueError(
+                    f"Measured {self.regime.value} report must carry a "
+                    "pass_rate"
+                )
             if abs(self.pass_rate - expected_rate) > 1e-9:
                 raise ValueError(
                     f"{self.regime.value} pass_rate {self.pass_rate} != "
@@ -373,9 +382,19 @@ class RegimeReport:
                 raise ValueError(
                     f"Unmeasured {self.regime.value} report must name missing cases"
                 )
-            if self.verdicts or self.passed or self.failed or self.pass_rate:
+            # An unmeasured regime has no rate to report: pass_rate
+            # is null, not 0.0 — a 0.0 in the report JSON would read
+            # as a measured 0% to any consumer that does not check
+            # `measured` first.
+            if (
+                self.verdicts
+                or self.passed
+                or self.failed
+                or self.pass_rate is not None
+            ):
                 raise ValueError(
-                    f"Unmeasured {self.regime.value} report must carry no verdicts"
+                    f"Unmeasured {self.regime.value} report must carry no "
+                    "verdicts (pass_rate must be null)"
                 )
 
     def to_dict(self) -> dict[str, object]:
@@ -480,7 +499,7 @@ class StabilityPolicy:
     """Thresholds for the stability verdict.
 
     Defaults: clean and light must each hold a 0.9 pass rate, and the
-    clean-to-adversarial drop must stay within 0.5. The 0.9 is the
+    relative clean-to-adversarial drop must stay within 0.5. The 0.9 is the
     HIGH-risk quality bar in decision.py (thresholds 0.70 / 0.80 /
     0.90 / 0.95 across LOW / MEDIUM / HIGH / CRITICAL risk), adopted
     here as a policy choice, not as "the repo's gate threshold" —
@@ -562,10 +581,13 @@ class StabilityVerdict:
     Rates and drops are None (not 0.0) for unmeasured regimes: a 0.0
     rate or a 100% drop for a regime that was never measured is a
     fabricated number, and a downstream consumer reading the verdict
-    dict must not mistake it for a measurement. The verdict also
-    carries the suite name, seed, and report fingerprint of the report
-    it grades, so a verdict cannot be presented alongside a different
-    report.
+    dict must not mistake it for a measurement. Drops are RELATIVE:
+    the fraction of the clean pass rate lost in the other regime
+    ((clean - other) / clean), not absolute points — an absolute
+    drop lets a 0.5-clean agent lose everything under attack and
+    still pass a 0.5 cap. The verdict also carries the suite name,
+    seed, and report fingerprint of the report it grades, so a
+    verdict cannot be presented alongside a different report.
     """
 
     outcome: StabilityOutcome
@@ -644,16 +666,27 @@ def check_stability(
             f"light pass rate {light_rate:.1%} below threshold "
             f"{policy.light_threshold:.0%}"
         )
-    light_drop = (
-        clean_rate - light_rate
-        if clean_rate is not None and light_rate is not None
-        else None
-    )
-    adv_drop = (
-        clean_rate - adv_rate
-        if clean_rate is not None and adv_rate is not None
-        else None
-    )
+    def _relative_drop(clean: float | None, other: float | None) -> float | None:
+        """The fraction of the clean pass rate lost in another regime.
+
+        Drops are RELATIVE, not absolute points: an absolute drop
+        lets a 0.5-clean agent lose everything under attack (0.5
+        points) and still pass a 0.5 cap, which is a 100% relative
+        loss and no stability signal at all. Relative drops keep the
+        cap's meaning at every clean rate: at most half the clean
+        pass rate may be lost. A clean rate of 0.0 has no rate to
+        lose: the drop is 0.0 when the other regime is 0.0 too, 1.0
+        otherwise (the verdict is unstable on the clean threshold
+        either way).
+        """
+        if clean is None or other is None:
+            return None
+        if clean == 0:
+            return 0.0 if other == 0 else 1.0
+        return (clean - other) / clean
+
+    light_drop = _relative_drop(clean_rate, light_rate)
+    adv_drop = _relative_drop(clean_rate, adv_rate)
     if adv_drop is not None and adv_drop > policy.max_adversarial_drop:
         reasons.append(
             f"clean-to-adversarial drop {adv_drop:.1%} exceeds max "
@@ -789,7 +822,7 @@ def _build_unmeasured_report(
         passed=0,
         failed=0,
         skipped=sum(1 for c in suite.cases if c.skip),
-        pass_rate=0.0,
+        pass_rate=None,
         verdicts=(),
         fingerprint=fingerprint,
         measured=False,
@@ -998,22 +1031,30 @@ def verify_stability_report(
     """Re-derive a stability report from its suite; empty means verified.
 
     For each measured regime, recomputes the fingerprint from the
-    suite's perturbed inputs (or the verified recorded inputs) plus
-    the report's own per-case verdicts, and compares it with the
-    stored fingerprint — so any edit to inputs or verdicts is caught.
-    For regimes whose recordings the suite carries, it also re-scores
-    the recorded outputs and compares the verdicts. For unmeasured
-    regimes, recomputes the missing case set and its fingerprint
-    instead of skipping the regime: an edited missing set is a
-    mismatch too. A report whose verdicts do not cover the suite's
-    cases (the suite gained a case after the report was built, or
-    the report was hand-built partial) is reported as a mismatch,
-    never raised as an exception: this function returns problems,
-    it does not raise on drifted input. Returns the list of
-    mismatches; an empty tuple means the report is consistent
-    with the suite. This is tamper-evidence, not forgery-proof: a
-    forger who recomputes the hashes consistently passes it, the
-    same limit as every digest in this repo.
+    suite's verified recorded inputs plus the report's own per-case
+    verdicts, and compares it with the stored fingerprint — so any
+    edit to inputs or verdicts is caught. A measured regime requires
+    the suite to carry its recordings: a measured regime whose
+    recordings are missing from the suite is a mismatch, not a pass
+    (the fingerprint is re-derivable from suite + seed alone, so a
+    deleted recording would otherwise verify clean). That makes this
+    a replay-path audit: a live-built report verified against a bare
+    suite (no recordings) reports the missing recordings — the live
+    build is consistent by construction, so to audit it, fill the
+    recordings (emit + record) and verify the replay report. For
+    regimes whose recordings the suite carries, it also re-scores
+    the recorded outputs and compares the verdicts. For unmeasured regimes,
+    recomputes the missing case set and its fingerprint instead of
+    skipping the regime: an edited missing set is a mismatch too. A
+    report whose verdicts do not cover the suite's cases (the suite
+    gained a case after the report was built, or the report was
+    hand-built partial) is reported as a mismatch, never raised as an
+    exception: this function returns problems, it does not raise on
+    drifted input. Returns the list of mismatches; an empty tuple
+    means the report is consistent with the suite. This is
+    tamper-evidence, not forgery-proof: a forger who recomputes the
+    hashes consistently passes it, the same limit as every digest in
+    this repo.
     """
     scorer = scorer or DeterministicScorer()
     problems: list[str] = []
@@ -1073,12 +1114,44 @@ def verify_stability_report(
             )
             continue
         try:
-            _verify_recorded_inputs(suite, regime, seed)
+            missing_inputs = _verify_recorded_inputs(suite, regime, seed)
         except ValueError as exc:
             problems.append(str(exc))
             continue
+        if missing_inputs:
+            # A measured regime whose recorded inputs are gone has
+            # no evidence left to audit: the fingerprint below is
+            # re-derivable from suite + seed alone, so a deleted
+            # recording would otherwise verify clean.
+            problems.append(
+                f"{regime.value} report is measured but the suite is "
+                f"missing recorded inputs for case(s) "
+                f"{', '.join(missing_inputs)} (recordings were deleted "
+                "after the report was built)"
+            )
+            continue
+        missing_outputs = tuple(
+            case.id
+            for case in suite.cases
+            if not case.skip and _recorded_output(case, regime) is None
+        )
+        if missing_outputs:
+            problems.append(
+                f"{regime.value} report is measured but the suite is "
+                f"missing recorded outputs for case(s) "
+                f"{', '.join(missing_outputs)} (recordings were deleted "
+                "after the report was built)"
+            )
+            continue
+        # Fingerprint from the VERIFIED RECORDED inputs, not from
+        # live perturb_input(): the audit must bind the recordings
+        # the report was built on. The recorded inputs were just
+        # verified equal to perturb_input() for the seed (a mismatch
+        # is a problem above), so this changes nothing for an intact
+        # suite — and a deleted recording now changes what the
+        # fingerprint is computed over instead of passing silently.
         perturbed = {
-            case.id: perturb_input(case.input, regime, seed, case.id).input
+            case.id: _recorded_input(case, regime) or ""
             for case in suite.cases
         }
         expected = _fingerprint(
@@ -1098,15 +1171,14 @@ def verify_stability_report(
             for case in suite.cases
             if not case.skip
         ]
-        if all(output is not None for _, output in recorded):
-            for case, output in recorded:
-                assert output is not None
-                rescored = scorer.score(case, output).passed
-                if verdict_map.get(case.id) != rescored:
-                    problems.append(
-                        f"{regime.value} case {case.id!r}: stored verdict "
-                        f"{verdict_map.get(case.id)} != re-scored {rescored}"
-                    )
+        for case, output in recorded:
+            assert output is not None  # missing handled above
+            rescored = scorer.score(case, output).passed
+            if verdict_map.get(case.id) != rescored:
+                problems.append(
+                    f"{regime.value} case {case.id!r}: stored verdict "
+                    f"{verdict_map.get(case.id)} != re-scored {rescored}"
+                )
     return tuple(problems)
 
 

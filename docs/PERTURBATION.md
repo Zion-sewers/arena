@@ -74,9 +74,11 @@ A `StabilityReport` carries clean, light and adversarial
 `RegimeReport`s and a fingerprint binding suite + regime + seed +
 perturbed inputs + per-case verdicts, so any edit to inputs or
 verdicts invalidates the fingerprint. `verify_stability_report(suite,
-report, seed)` re-derives the fingerprint from the suite and
-re-scores the recorded outputs, returning the mismatches (empty
-means verified). This is tamper-evidence, not forgery-proof: anyone
+report, seed)` re-derives the fingerprint from the suite's verified
+recorded inputs and re-scores the recorded outputs, returning the
+mismatches (empty means verified) — and a measured regime whose
+recordings are missing from the suite is a mismatch, not a pass,
+because the fingerprint is re-derivable from suite + seed alone. This is tamper-evidence, not forgery-proof: anyone
 who can recompute the hash can forge a consistent report, so the
 check catches accidental edits and inconsistent artifacts, not a
 determined forger. Construction refuses mixed reports (different
@@ -91,14 +93,19 @@ threshold; the 0.5 says an agent that loses more than half its clean
 pass rate under attack is not stable):
 
 - STABLE: clean and light above threshold and the adversarial drop
-  within bound.
+  within bound. Drops are relative: the fraction of the clean pass
+  rate lost ((clean − other) / clean), not absolute points — an
+  absolute drop lets a 0.5-clean agent lose everything under attack
+  (0.5 points) and still pass a 0.5 cap, which is a 100% relative
+  loss and no stability signal at all.
 - UNSTABLE: any threshold missed or the drop exceeded, with the
   reason naming the measured number.
 - UNMEASURED: any regime unmeasured — a regime missing a recording
   or a recorded input, or a regime that scored no cases (all skipped).
   Rates and drops for an unmeasured regime are null, not 0.0: a 0.0
   rate or a 100% drop for a regime that was never measured is a
-  fabricated number.
+  fabricated number. That holds for the regime report too: its
+  `pass_rate` is null when unmeasured, not 0.0.
 
 Degenerate policies are refused outright (`ValueError` at
 construction, exit 3 from the CLI): the refusal is a floor, not an
@@ -119,12 +126,13 @@ Single-regime evaluation is NOT sufficient, structurally:
 `require_triple_regime` accepts only a full `StabilityReport` and
 raises `SingleRegimeError` on a bare `RunResult` or `RegimeReport`,
 and the `perturb` command has no single-regime path. The sibling
-commands refuse rather than warn: `run --ci` and `decide` exit
-non-zero with an error on a suite carrying triple-regime
-recordings, because a warning is not a stop — a CI pipeline reading
-only the exit code would still accept on the clean recording while
-`perturb` grades the same suite UNSTABLE. Plain `run` (no `--ci`)
-only prints a summary, so it warns loudly instead of refusing.
+commands refuse rather than warn: `run --ci`, `decide`, `snapshot
+publish`, `snapshot compare` and `baseline` exit non-zero with an
+error on a suite carrying triple-regime recordings, because a
+warning is not a stop — a CI pipeline reading only the exit code
+would still accept on the clean recording while `perturb` grades
+the same suite UNSTABLE. Plain `run` (no `--ci`) only prints a
+summary, so it warns loudly instead of refusing.
 A triple-regime suite is gated by `perturb`, full stop.
 
 ### 4. Replay suites carry three recordings bound to their inputs
@@ -202,12 +210,16 @@ suite = EvalSuite.from_yaml("eval.yaml")
 report = run_triple_regime(suite, agent_fn, seed=42)
 verdict = check_stability(report)
 assert verdict.outcome == "stable"
-assert verify_stability_report(suite, report, seed=42) == ()
 
 # Replay workflow: emit the inputs, run the agent on them, grade.
 emitted = emit_triple_inputs(suite, seed=42)
 # ... fill output_light / output_adversarial per case ...
 replay = run_triple_regime_replay(emitted, seed=42)
+# The verifier audits a report against the suite carrying its
+# recordings: a measured regime whose recordings are missing is a
+# mismatch, not a pass. A live-built report is consistent by
+# construction, so audit the replay report, not the live one.
+assert verify_stability_report(emitted, replay, seed=42) == ()
 ```
 
 ## Demo

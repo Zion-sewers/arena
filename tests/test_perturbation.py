@@ -834,8 +834,14 @@ def test_fingerprint_binds_verdicts():
 def test_verify_stability_report_catches_edited_verdict():
     import dataclasses
 
-    good = run_triple_regime(SUITE, robust_agent, seed=42)
-    assert verify_stability_report(SUITE, good, seed=42) == ()
+    # The report is built by the replay path on a suite carrying
+    # its recordings: the verifier is a replay-path audit, so a
+    # measured regime requires the suite to carry the recordings
+    # (a live-built report against a bare suite reports them
+    # missing — see test_verify_live_report_needs_recordings).
+    suite = _replay_suite()
+    good = run_triple_regime_replay(suite)
+    assert verify_stability_report(suite, good, seed=42) == ()
     edited_clean = dataclasses.replace(
         good.clean,
         passed=3,
@@ -853,7 +859,7 @@ def test_verify_stability_report_catches_edited_verdict():
         adversarial=good.adversarial,
         fingerprint=good.fingerprint,
     )
-    problems = verify_stability_report(SUITE, edited, seed=42)
+    problems = verify_stability_report(suite, edited, seed=42)
     assert problems
     assert any("fingerprint mismatch" in p for p in problems)
 
@@ -1039,14 +1045,18 @@ def test_cli_decide_refuses_triple_suite(monkeypatch, capsys):
 
 
 def test_verify_reports_missing_verdict_instead_of_raising():
-    good = run_triple_regime(SUITE, robust_agent, seed=42)
-    assert verify_stability_report(SUITE, good, seed=42) == ()
+    # Replay-path fixture, as in test_verify_stability_report_
+    # catches_edited_verdict: the verifier audits a report against
+    # the suite carrying its recordings.
+    suite = _replay_suite()
+    good = run_triple_regime_replay(suite)
+    assert verify_stability_report(suite, good, seed=42) == ()
     # The suite gained a case after the report was built: the most
     # ordinary form of drift the verifier exists to diagnose.
     grown = EvalSuite(
         name="perturb-test",
         cases=[
-            *SUITE.cases,
+            *suite.cases,
             EvalCase(
                 id="new-case",
                 input="Is there a new case?",
@@ -1162,3 +1172,339 @@ def test_snapshots_round_trip_preserves_triple_fields():
     assert suite_to_canonical(restored) == suite_to_canonical(emitted)
     # And the restored suite still grades STABLE.
     assert check_stability(run_triple_regime_replay(restored)).outcome == "stable"
+
+
+# --- fix-forward round 3 (re-review on b1faaf91) ---------------------------
+# Pins the round-3 blocking findings: the snapshot serializer dropping
+# the triple fields (already fixed by the cancelled run's partial
+# fix-forward, pinned here), the verifier passing deleted evidence,
+# the floor policy certifying total adversarial collapse, the
+# snapshot/baseline laundering path, and the malformed-input crash.
+
+
+def _floor_suite(adversarial_passes: int) -> EvalSuite:
+    """A 4-case replay suite: clean/light 2/4, adversarial N/4.
+
+    Cases a/b pass clean and light; c/d fail clean. Adversarial
+    passes the first ``adversarial_passes`` cases and obeys the
+    injection (marker output) on the rest.
+    """
+    cases = []
+    for i, cid in enumerate(("a", "b", "c", "d")):
+        good = i < 2
+        adv_good = i < adversarial_passes
+        cases.append(
+            EvalCase(
+                id=cid,
+                input=f"question {cid}",
+                expected=ExpectedOutput(contains=[f"answer-{cid}"]),
+                output=f"answer-{cid}" if good else "nothing relevant",
+                output_light=f"answer-{cid}" if good else "nothing relevant",
+                output_adversarial=(
+                    f"answer-{cid}" if adv_good else ADVERSARIAL_MARKER
+                ),
+            )
+        )
+    return emit_triple_inputs(
+        EvalSuite(name="floor-test", cases=cases), seed=42
+    )
+
+
+def test_floor_policy_cannot_certify_total_adversarial_collapse():
+    # The product counterexample on b1faaf91: the legal floor policy
+    # 0.5/0.5/0.5 graded clean 50% / adversarial 0% STABLE, because
+    # the drop was absolute points (0.5 <= 0.5 cap). Drops are
+    # relative now: losing all of a 0.5 clean rate is a 100% loss.
+    report = run_triple_regime_replay(_floor_suite(0))
+    floor = StabilityPolicy(
+        clean_threshold=0.5, light_threshold=0.5, max_adversarial_drop=0.5
+    )
+    verdict = check_stability(report, floor)
+    assert verdict.clean_pass_rate == 0.5
+    assert verdict.adversarial_pass_rate == 0.0
+    assert verdict.clean_to_adversarial_drop == 1.0
+    assert verdict.outcome == "unstable"
+    assert any("drop" in r for r in verdict.reasons)
+
+
+def test_relative_drop_boundary_is_stable_at_the_floor():
+    # Clean 0.5, adversarial 0.25: exactly half the clean rate is
+    # lost, which is exactly the 0.5 relative cap — STABLE at the
+    # floor policy. This pins the boundary semantics of the relative
+    # drop: the cap is a fraction of what the agent had, not points.
+    report = run_triple_regime_replay(_floor_suite(1))
+    floor = StabilityPolicy(
+        clean_threshold=0.5, light_threshold=0.5, max_adversarial_drop=0.5
+    )
+    verdict = check_stability(report, floor)
+    assert verdict.clean_to_adversarial_drop == 0.5
+    assert verdict.outcome == "stable"
+
+
+def test_cli_floor_policy_collapse_exits_one(monkeypatch, capsys):
+    recordings = {
+        cid: {"output": a, "output_light": a, "output_adversarial": a}
+        for cid, a in ANSWERS.items()
+    }
+    # Only refund/order pass clean and light; every adversarial
+    # output obeys the injection.
+    for cid in ("password", "hours"):
+        recordings[cid]["output"] = "nothing relevant here"
+        recordings[cid]["output_light"] = "nothing relevant here"
+    for cid in ANSWERS:
+        recordings[cid]["output_adversarial"] = ADVERSARIAL_MARKER
+    path = _write(_suite_yaml(recordings))
+    try:
+        code, out, _ = _run(
+            [
+                "perturb", "--suite", path,
+                "--clean-threshold", "0.5", "--light-threshold", "0.5",
+                "--max-adversarial-drop", "0.5",
+            ],
+            monkeypatch, capsys,
+        )
+        assert code == 1
+        assert "verdict: UNSTABLE" in out
+        assert "adversarial: pass rate 0.0%" in out
+    finally:
+        os.unlink(path)
+
+
+def test_verify_live_report_needs_recordings():
+    # Contract change (round-3 fix for the audit hole): a measured
+    # regime requires the suite to carry its recordings. A live-built
+    # report is consistent by construction, but verifying it against
+    # a bare suite cannot distinguish "recordings were never there"
+    # from "recordings were deleted" — so the verifier reports the
+    # missing recordings instead of passing silently. To audit a live
+    # report, fill the recordings and verify the replay report.
+    good = run_triple_regime(SUITE, robust_agent, seed=42)
+    problems = verify_stability_report(SUITE, good, seed=42)
+    assert problems
+    assert any("missing recorded inputs" in p for p in problems)
+    assert any("missing recorded outputs" in p for p in problems)
+
+
+def test_verify_reports_deleted_recorded_input():
+    import dataclasses
+
+    good = _replay_suite()
+    report = run_triple_regime_replay(good)
+    assert verify_stability_report(good, report, seed=42) == ()
+    # The architecture counterexample on b1faaf91: delete the
+    # recorded inputs and the verifier still returned ().
+    stripped = dataclasses.replace(
+        good,
+        cases=[
+            dataclasses.replace(case, input_light=None)
+            if case.id == "order"
+            else case
+            for case in good.cases
+        ],
+    )
+    problems = verify_stability_report(stripped, report, seed=42)
+    assert problems
+    assert any("missing recorded inputs" in p for p in problems)
+    assert any("order" in p for p in problems)
+
+
+def test_verify_reports_deleted_recorded_output():
+    import dataclasses
+
+    good = _replay_suite()
+    report = run_triple_regime_replay(good)
+    assert verify_stability_report(good, report, seed=42) == ()
+    # The implementation counterexample on b1faaf91: delete one
+    # recorded output and the verifier still returned () while a
+    # fresh replay re-derived the suite as unmeasured.
+    stripped = dataclasses.replace(
+        good,
+        cases=[
+            dataclasses.replace(case, output_adversarial=None)
+            if case.id == "order"
+            else case
+            for case in good.cases
+        ],
+    )
+    problems = verify_stability_report(stripped, report, seed=42)
+    assert problems
+    assert any("missing recorded outputs" in p for p in problems)
+    assert any("order" in p for p in problems)
+    assert run_triple_regime_replay(stripped).adversarial.measured is False
+
+
+def test_verify_reports_all_recordings_deleted():
+    import dataclasses
+
+    good = _replay_suite()
+    report = run_triple_regime_replay(good)
+    assert verify_stability_report(good, report, seed=42) == ()
+    # Delete every perturbed recording and input: a clean audit
+    # pass with zero replay evidence present.
+    stripped = dataclasses.replace(
+        good,
+        cases=[
+            dataclasses.replace(
+                case,
+                input_light=None,
+                input_adversarial=None,
+                output_light=None,
+                output_adversarial=None,
+            )
+            for case in good.cases
+        ],
+    )
+    problems = verify_stability_report(stripped, report, seed=42)
+    assert problems
+    assert any("light" in p for p in problems)
+    assert any("adversarial" in p for p in problems)
+
+
+def test_unmeasured_regime_report_pass_rate_is_null():
+    # The product advisory on b1faaf91: the report JSON carried
+    # pass_rate 0.0 for an unmeasured regime, contradicting the
+    # docs' "null, not 0.0" rule. The verdict already nulled it;
+    # the regime report now does too.
+    report = run_triple_regime_replay(_replay_suite(missing_adversarial_for="order"))
+    assert report.adversarial.pass_rate is None
+    assert report.adversarial.to_dict()["pass_rate"] is None
+    assert report.clean.pass_rate == 1.0
+    with pytest.raises(ValueError, match="pass_rate must be null"):
+        RegimeReport(
+            regime=Regime.ADVERSARIAL,
+            suite_name="s",
+            seed=42,
+            total=2,
+            passed=0,
+            failed=0,
+            skipped=0,
+            pass_rate=0.0,
+            verdicts=(),
+            fingerprint="f",
+            measured=False,
+            missing_case_ids=("a",),
+        )
+
+
+def test_cli_malformed_yaml_exits_three(monkeypatch, capsys):
+    path = _write("cases: [unclosed\n  - id: a\n")
+    try:
+        code, out, err = _run(["perturb", "--suite", path], monkeypatch, capsys)
+        assert code == 3
+        assert "cannot load suite" in err
+        assert "Traceback" not in out + err
+    finally:
+        os.unlink(path)
+
+
+def test_cli_invalid_regex_exits_three(monkeypatch, capsys):
+    import yaml
+
+    from agenteval_bench.cli import _suite_to_yaml_dict
+
+    suite = emit_triple_inputs(
+        EvalSuite(
+            name="bad-regex",
+            cases=[
+                EvalCase(
+                    id="a",
+                    input="q",
+                    expected=ExpectedOutput(regex="[invalid"),
+                    output="x",
+                    output_light="x",
+                    output_adversarial="x",
+                )
+            ],
+        ),
+        seed=42,
+    )
+    path = _write(
+        yaml.safe_dump(
+            _suite_to_yaml_dict(suite),
+            sort_keys=False,
+            allow_unicode=True,
+        )
+    )
+    try:
+        code, out, err = _run(["perturb", "--suite", path], monkeypatch, capsys)
+        assert code == 3
+        assert "Traceback" not in out + err
+    finally:
+        os.unlink(path)
+
+
+def test_cli_snapshot_publish_refuses_triple_suite(monkeypatch, capsys, tmp_path):
+    recordings = {cid: {"output": a, "output_light": a, "output_adversarial": a}
+                  for cid, a in ANSWERS.items()}
+    path = _write(_suite_yaml(recordings))
+    try:
+        code, _, err = _run(
+            [
+                "snapshot", "publish", "--suite", path,
+                "--store", str(tmp_path / "store"), "--version", "v1",
+                "--owner", "t", "--why", "test",
+            ],
+            monkeypatch, capsys,
+        )
+        assert code == 2
+        assert "triple-regime recordings" in err
+        assert "agenteval-bench perturb" in err
+    finally:
+        os.unlink(path)
+
+
+def test_cli_snapshot_compare_refuses_triple_suite(monkeypatch, capsys, tmp_path):
+    import json
+
+    from agenteval_bench.engine import EvalRunner
+    from agenteval_bench.snapshots import (
+        SnapshotStore,
+        VersionMeta,
+        baseline_from_run,
+    )
+
+    # Freeze a triple suite through the store API directly (the CLI
+    # publish refuses it now, so the store is seeded below the CLI):
+    # a clean-only candidate comparison must not release it.
+    suite = _replay_suite()
+    result = EvalRunner().run(
+        suite, lambda prompt: ANSWERS["refund"], seed=42
+    )
+    store = str(tmp_path / "store")
+    SnapshotStore(store).publish(
+        suite,
+        "v1",
+        VersionMeta(owner="t", why="test"),
+        baseline_from_run(result, seed=42, agent="recorded"),
+    )
+    cand = tmp_path / "cand.json"
+    cand.write_text(json.dumps({cid: a for cid, a in ANSWERS.items()}))
+    code, _, err = _run(
+        [
+            "snapshot", "compare", "--store", store, "--suite", "perturb-test",
+            "--version", "v1", "--candidate-outputs", str(cand),
+        ],
+        monkeypatch, capsys,
+    )
+    assert code == 2
+    assert "triple-regime recordings" in err
+    assert "agenteval-bench perturb" in err
+
+
+def test_cli_baseline_refuses_triple_suite(monkeypatch, capsys, tmp_path):
+    recordings = {cid: {"output": a, "output_light": a, "output_adversarial": a}
+                  for cid, a in ANSWERS.items()}
+    path = _write(_suite_yaml(recordings))
+    try:
+        code, _, err = _run(
+            [
+                "baseline", "--suite", path,
+                "--out", str(tmp_path / "baseline.json"),
+            ],
+            monkeypatch, capsys,
+        )
+        assert code == 1
+        assert "triple-regime recordings" in err
+        assert "agenteval-bench perturb" in err
+    finally:
+        os.unlink(path)

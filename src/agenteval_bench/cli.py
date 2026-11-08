@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -597,6 +598,8 @@ def cmd_baseline(args: list[str]) -> int:
         return 1
 
     suite, recorded, _missing, digest = _load_suite_for_replay(suite_path)
+    if _has_triple_regime_recordings(suite):
+        return _refuse_triple_regime_suite("baseline", 1)
     result, _ = _run_suite(suite, recorded, seed)
     scores = [
         {"case_id": r.case_id, "score": r.score, "passed": r.passed}
@@ -1197,6 +1200,8 @@ def cmd_perturb(args: list[str]) -> int:
     is a fixed battery of three prompt-injection templates, not an
     adaptive adversary.
     """
+    import yaml
+
     from agenteval_bench.perturbation import (
         StabilityPolicy,
         check_stability,
@@ -1239,12 +1244,13 @@ def cmd_perturb(args: list[str]) -> int:
         return 3
     try:
         suite = EvalSuite.from_yaml(suite_path)
-    except (OSError, ValueError, TypeError) as exc:
+    except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
+        # yaml.YAMLError is not a ValueError subclass: without it a
+        # malformed suite crashes with a traceback (exit 1) instead
+        # of the documented exit 3 for bad input.
         print(f"Error: cannot load suite {suite_path}: {exc}", file=sys.stderr)
         return 3
     if emit_inputs:
-        import yaml
-
         emitted = emit_triple_inputs(suite, seed=seed)
         text = yaml.safe_dump(
             _suite_to_yaml_dict(emitted),
@@ -1285,7 +1291,10 @@ def cmd_perturb(args: list[str]) -> int:
         return 3
     try:
         report = run_triple_regime_replay(suite, seed=seed)
-    except ValueError as exc:
+    except (ValueError, re.error) as exc:
+        # re.error: an invalid regex in a suite's expected output is
+        # bad input (exit 3), not a crash — the scorer raises it
+        # unguarded out of DeterministicScorer.score.
         print(f"Error: {exc}", file=sys.stderr)
         return 3
     verdict = check_stability(report, policy)
@@ -1994,6 +2003,12 @@ def _snapshot_publish(args: list[str]) -> int:
                 print(f"Error: invalid promotion record: {e}", file=sys.stderr)
                 return 2
         suite, recorded, missing, _digest = _load_suite_for_replay(suite_path)
+        if _has_triple_regime_recordings(suite):
+            # Publishing would silently freeze the clean recording
+            # only (the snapshot form carries no triple-regime
+            # gate), so a triple suite published here could later
+            # be released by `snapshot compare` on clean alone.
+            return _refuse_triple_regime_suite("snapshot publish", 2)
         result, _outputs = _run_suite(suite, recorded, seed)
         if missing:
             print(f"Note: {len(missing)} case(s) had no recorded output and were skipped.")
@@ -2089,6 +2104,13 @@ def _snapshot_compare(args: list[str]) -> int:
     except SnapshotError as e:
         print(f"CORRUPTED: {e}", file=sys.stderr)
         return 1
+
+    if _has_triple_regime_recordings(suite):
+        # The frozen suite carries triple-regime recordings, so a
+        # clean-only candidate comparison would release it on the
+        # clean regime alone. Exit 2 is the gate-fail code: the
+        # release is blocked, not granted.
+        return _refuse_triple_regime_suite("snapshot compare", 2)
 
     replay_ids = iter([c.id for c in suite.cases if not c.skip])
     ordered_ids = [c.id for c in suite.cases if not c.skip]
