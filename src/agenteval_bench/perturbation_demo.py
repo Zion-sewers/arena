@@ -139,40 +139,45 @@ def _replay_suite_correct() -> EvalSuite:
     Recorded inputs come from emit_triple_inputs (seed 42): the
     replay runner verifies each recorded input equals perturb_input()
     for the seed before scoring, so the suite must carry them.
+    Emit FIRST, then fill the recordings: emit drops any recording
+    that answers a different input than the one just emitted, so
+    filling before emitting would drop the recordings.
     """
-    return emit_triple_inputs(
-        EvalSuite(
-            name="perturbation-demo",
-            cases=[
-                dataclasses.replace(
-                    case,
-                    output=ANSWERS[case.id],
-                    output_light=ANSWERS[case.id],
-                    output_adversarial=ANSWERS[case.id],
-                )
-                for case in SUITE.cases
-            ],
-        ),
+    emitted = emit_triple_inputs(
+        EvalSuite(name="perturbation-demo", cases=list(SUITE.cases)),
         seed=42,
+    )
+    return dataclasses.replace(
+        emitted,
+        cases=[
+            dataclasses.replace(
+                case,
+                output=ANSWERS[case.id],
+                output_light=ANSWERS[case.id],
+                output_adversarial=ANSWERS[case.id],
+            )
+            for case in emitted.cases
+        ],
     )
 
 
 def _replay_suite(adversarial_answer: str) -> EvalSuite:
     """The demo suite as a replay suite with one shared adversarial recording."""
-    return emit_triple_inputs(
-        EvalSuite(
-            name="perturbation-demo",
-            cases=[
-                dataclasses.replace(
-                    case,
-                    output=ANSWERS[case.id],
-                    output_light=ANSWERS[case.id],
-                    output_adversarial=adversarial_answer,
-                )
-                for case in SUITE.cases
-            ],
-        ),
+    emitted = emit_triple_inputs(
+        EvalSuite(name="perturbation-demo", cases=list(SUITE.cases)),
         seed=42,
+    )
+    return dataclasses.replace(
+        emitted,
+        cases=[
+            dataclasses.replace(
+                case,
+                output=ANSWERS[case.id],
+                output_light=ANSWERS[case.id],
+                output_adversarial=adversarial_answer,
+            )
+            for case in emitted.cases
+        ],
     )
 
 

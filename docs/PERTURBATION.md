@@ -170,7 +170,12 @@ the operator only has to run the agent on those inputs and fill
 the recordings. A suite emitted this way grades UNMEASURED until
 the recordings are added, and the seed must match at grading time:
 re-emit with the grading seed, or the runner refuses the
-recordings as answering a different input.
+recordings as answering a different input. Re-emitting drops any
+recording that answers a different input than the one just
+emitted (a different seed, or a recording with no recorded input):
+a stale recording can never grade STABLE on evidence that never
+answered the graded inputs. Re-emitting with the same seed keeps
+the recordings, because the inputs are identical.
 
 A replay agent must never be run under perturbed inputs: it returns
 the same recording in every regime, so the gaps would be 0 by

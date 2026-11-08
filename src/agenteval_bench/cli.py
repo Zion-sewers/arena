@@ -1188,7 +1188,10 @@ def cmd_perturb(args: list[str]) -> int:
     ``input_adversarial`` filled in from ``perturb_input()`` for the
     seed (--out <file>, or stdout when --out is absent) and exits 0
     without grading. Fill the recordings by running the agent on
-    those inputs, then grade with plain ``perturb``.
+    those inputs, then grade with plain ``perturb``. Re-emitting
+    drops any recording that answers a different input than the one
+    just emitted (a different seed, or a recording with no recorded
+    input); re-emitting with the same seed keeps the recordings.
 
     Degenerate policies are refused, not warned about: a zero clean
     or light threshold, or a 1.0 max adversarial drop, voids the
@@ -1317,11 +1320,20 @@ def cmd_perturb(args: list[str]) -> int:
         print(f"Suite: {report.suite_name} (seed={seed})")
         for regime in REGIMES:
             sub = report.by_regime(regime)
-            if sub.measured:
+            if sub.measured and sub.verdicts:
+                rate = sub.pass_rate
+                assert rate is not None  # measured + scored => rate set
                 print(
-                    f"  {regime.value}: pass rate {sub.pass_rate:.1%} "
+                    f"  {regime.value}: pass rate {rate:.1%} "
                     f"({sub.passed}/{sub.passed + sub.failed} scored, "
                     f"{sub.skipped} skipped)"
+                )
+            elif sub.measured:
+                # Measured but nothing scored (all skipped): no rate
+                # exists — print UNMEASURED, never a 0.0% pass rate.
+                print(
+                    f"  {regime.value}: UNMEASURED — scored no cases "
+                    "(all skipped)"
                 )
             else:
                 print(

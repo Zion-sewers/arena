@@ -366,7 +366,19 @@ class RegimeReport:
                     f"{self.regime.value} verdicts do not match passed+failed"
                 )
             scored = self.passed + self.failed
-            expected_rate = self.passed / scored if scored else 0.0
+            if scored == 0:
+                # Nothing scored (all cases skipped): no rate exists —
+                # pass_rate is null, not 0.0. A 0.0 in the report JSON
+                # would read as a measured 0% to any consumer that
+                # does not check `measured` / the verdict first.
+                if self.pass_rate is not None:
+                    raise ValueError(
+                        f"{self.regime.value} scored no cases, so its "
+                        "pass_rate must be null, not "
+                        f"{self.pass_rate}"
+                    )
+                return
+            expected_rate = self.passed / scored
             if self.pass_rate is None:
                 raise ValueError(
                     f"Measured {self.regime.value} report must carry a "
@@ -734,7 +746,6 @@ def require_triple_regime(value: object) -> StabilityReport:
 def _evidence_parts(
     suite: EvalSuite,
     regime: Regime,
-    seed: int,
     perturbed_inputs: dict[str, str],
     verdicts: dict[str, bool],
 ) -> list[str]:
@@ -778,7 +789,7 @@ def _build_regime_report(
         suite.name,
         regime.value,
         str(seed),
-        *_evidence_parts(suite, regime, seed, perturbed_inputs, verdict_map),
+        *_evidence_parts(suite, regime, perturbed_inputs, verdict_map),
     )
     return RegimeReport(
         regime=regime,
@@ -788,7 +799,7 @@ def _build_regime_report(
         passed=passed,
         failed=failed,
         skipped=skipped,
-        pass_rate=passed / len(verdicts) if verdicts else 0.0,
+        pass_rate=passed / len(verdicts) if verdicts else None,
         verdicts=verdicts,
         fingerprint=fingerprint,
     )
@@ -1158,7 +1169,7 @@ def verify_stability_report(
             suite.name,
             regime.value,
             str(seed),
-            *_evidence_parts(suite, regime, seed, perturbed, verdict_map),
+            *_evidence_parts(suite, regime, perturbed, verdict_map),
         )
         if expected != sub.fingerprint:
             problems.append(
@@ -1193,19 +1204,39 @@ def emit_triple_inputs(
     This is the generation step for the replay workflow
     (``perturb --emit-inputs``); a suite emitted this way grades
     UNMEASURED until the recordings are added.
+
+    A recording answers one exact input: when the emitted input for
+    a case differs from the input the recording was made for, the
+    recording is dropped (output set to None). Re-emitting with the
+    same seed keeps recordings (inputs identical); re-emitting with
+    a different seed drops them, so a stale recording can never
+    grade STABLE on evidence that never answered the graded inputs.
+    A recording with no recorded input is dropped too: it answers
+    an unknown input.
     """
-    return dataclasses.replace(
-        suite,
-        cases=[
+    cases: list[EvalCase] = []
+    for case in suite.cases:
+        new_light = perturb_input(
+            case.input, Regime.LIGHT, seed, case.id
+        ).input
+        new_adversarial = perturb_input(
+            case.input, Regime.ADVERSARIAL, seed, case.id
+        ).input
+        cases.append(
             dataclasses.replace(
                 case,
-                input_light=perturb_input(
-                    case.input, Regime.LIGHT, seed, case.id
-                ).input,
-                input_adversarial=perturb_input(
-                    case.input, Regime.ADVERSARIAL, seed, case.id
-                ).input,
+                input_light=new_light,
+                input_adversarial=new_adversarial,
+                output_light=(
+                    case.output_light
+                    if case.input_light == new_light
+                    else None
+                ),
+                output_adversarial=(
+                    case.output_adversarial
+                    if case.input_adversarial == new_adversarial
+                    else None
+                ),
             )
-            for case in suite.cases
-        ],
-    )
+        )
+    return dataclasses.replace(suite, cases=cases)

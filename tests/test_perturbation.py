@@ -8,6 +8,7 @@ exact clean input.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import tempfile
 
@@ -132,10 +133,19 @@ def test_light_is_deterministic_per_seed_and_case():
         first = perturb_input(case.input, Regime.LIGHT, 42, case.id)
         second = perturb_input(case.input, Regime.LIGHT, 42, case.id)
         assert first == second
-        other_case = perturb_input(case.input, Regime.LIGHT, 42, "someone-else")
+        # Same text, different seed: the draw is independent — every
+        # case in this suite actually changes under seed 7 (a
+        # same-value assertion would leave per-seed independence
+        # unpinned).
         other_seed = perturb_input(case.input, Regime.LIGHT, 7, case.id)
-        # Same text, different case id or seed: the draw is independent.
-        assert isinstance(other_case, type(first)) and isinstance(other_seed, type(first))
+        assert other_seed.input != first.input
+    # Same text, different case id: the draw is independent — at
+    # least one case in the suite actually changes.
+    assert any(
+        perturb_input(case.input, Regime.LIGHT, 42, "someone-else").input
+        != perturb_input(case.input, Regime.LIGHT, 42, case.id).input
+        for case in SUITE.cases
+    )
 
 
 def test_adversarial_injects_the_marker_and_names_the_attack():
@@ -287,6 +297,12 @@ def test_skipped_cases_are_unmeasured_not_unstable():
     )
     report = run_triple_regime(skipped, robust_agent)
     assert report.clean.skipped == 1
+    # No rate exists when nothing was scored: null, not 0.0 — in the
+    # report JSON as well as in the verdict.
+    assert report.clean.pass_rate is None
+    assert report.light.pass_rate is None
+    assert report.adversarial.pass_rate is None
+    assert report.clean.to_dict()["pass_rate"] is None
     verdict = check_stability(report)
     assert verdict.outcome == "unmeasured"
     assert any("scored no cases" in reason for reason in verdict.reasons)
@@ -411,6 +427,20 @@ def test_regime_report_guards():
         RegimeReport(**{**base, "verdicts": (("a", True),)})
     with pytest.raises(ValueError, match="pass_rate"):
         RegimeReport(**{**base, "pass_rate": 0.9})
+    with pytest.raises(ValueError, match="pass_rate must be null"):
+        # Measured with nothing scored: no rate exists, so 0.0 is
+        # refused — null, not 0.0.
+        RegimeReport(
+            regime=Regime.CLEAN, suite_name="s", seed=42, total=2,
+            passed=0, failed=0, skipped=2, pass_rate=0.0, verdicts=(),
+            fingerprint="f",
+        )
+    # Measured with nothing scored and a null rate is valid.
+    RegimeReport(
+        regime=Regime.CLEAN, suite_name="s", seed=42, total=2,
+        passed=0, failed=0, skipped=2, pass_rate=None, verdicts=(),
+        fingerprint="f",
+    )
     with pytest.raises(ValueError, match="must name missing cases"):
         RegimeReport(
             regime=Regime.CLEAN, suite_name="s", seed=42, total=2,
@@ -471,28 +501,29 @@ def test_light_editors_return_none_when_inapplicable():
 
 
 def test_replay_skipped_case_is_skipped_in_all_regimes():
+    # Emit FIRST, then fill the recordings: emit drops any recording
+    # that answers a different input than the one just emitted.
+    skipped = EvalCase(
+        id="skipped-one",
+        input="q",
+        expected=ExpectedOutput(contains=["x"]),
+        skip=True,
+    )
+    emitted = emit_triple_inputs(
+        EvalSuite(name="s", cases=[*SUITE.cases, skipped])
+    )
     cases = [
-        EvalCase(
-            id=case.id,
-            input=case.input,
-            expected=case.expected,
+        dataclasses.replace(
+            case,
             output=ANSWERS[case.id],
             output_light=ANSWERS[case.id],
             output_adversarial=ANSWERS[case.id],
         )
-        for case in SUITE.cases
+        if case.id in ANSWERS
+        else case
+        for case in emitted.cases
     ]
-    cases.append(
-        EvalCase(
-            id="skipped-one",
-            input="q",
-            expected=ExpectedOutput(contains=["x"]),
-            skip=True,
-        )
-    )
-    report = run_triple_regime_replay(
-        emit_triple_inputs(EvalSuite(name="s", cases=cases))
-    )
+    report = run_triple_regime_replay(EvalSuite(name="s", cases=cases))
     assert report.clean.skipped == 1
     assert report.light.skipped == 1
     assert report.adversarial.skipped == 1
@@ -514,13 +545,17 @@ def test_single_regime_cannot_gate():
 
 
 def _replay_suite(missing_adversarial_for: str | None = None) -> EvalSuite:
+    # Emit FIRST, then fill the recordings: emit drops any recording
+    # that answers a different input than the one just emitted, so
+    # filling before emitting would drop the recordings.
+    emitted = emit_triple_inputs(
+        EvalSuite(name="perturb-test", cases=list(SUITE.cases))
+    )
     cases = []
-    for case in SUITE.cases:
+    for case in emitted.cases:
         cases.append(
-            EvalCase(
-                id=case.id,
-                input=case.input,
-                expected=case.expected,
+            dataclasses.replace(
+                case,
                 output=ANSWERS[case.id],
                 output_light=ANSWERS[case.id],
                 output_adversarial=(
@@ -533,7 +568,7 @@ def _replay_suite(missing_adversarial_for: str | None = None) -> EvalSuite:
     # Recorded inputs are part of the replay contract: the runner
     # verifies each one equals perturb_input() for the seed before
     # scoring (default seed 42 on both sides here).
-    return emit_triple_inputs(EvalSuite(name="perturb-test", cases=cases))
+    return EvalSuite(name="perturb-test", cases=cases)
 
 
 def test_replay_with_full_recordings_is_stable():
@@ -613,22 +648,25 @@ def _suite_yaml(recordings: dict[str, dict[str, str]]) -> str:
 
     from agenteval_bench.cli import _suite_to_yaml_dict
 
+    # Emit FIRST, then fill the recordings: emit drops any recording
+    # that answers a different input than the one just emitted, so
+    # filling before emitting would drop the recordings.
+    emitted = emit_triple_inputs(
+        EvalSuite(name="cli-test", cases=list(SUITE.cases)), seed=42
+    )
     cases = []
-    for case in SUITE.cases:
+    for case in emitted.cases:
         rec = recordings[case.id]
         cases.append(
-            EvalCase(
-                id=case.id,
-                input=case.input,
-                expected=case.expected,
+            dataclasses.replace(
+                case,
                 output=rec.get("output"),
                 output_light=rec.get("output_light"),
                 output_adversarial=rec.get("output_adversarial"),
             )
         )
-    emitted = emit_triple_inputs(EvalSuite(name="cli-test", cases=cases), seed=42)
     return yaml.safe_dump(
-        _suite_to_yaml_dict(emitted),
+        _suite_to_yaml_dict(EvalSuite(name="cli-test", cases=cases)),
         sort_keys=False,
         allow_unicode=True,
         default_flow_style=False,
@@ -991,6 +1029,94 @@ def test_cli_emit_inputs_round_trip(monkeypatch, capsys, tmp_path):
         os.unlink(path)
 
 
+def test_emit_drops_recordings_when_seed_changes():
+    # Round-4 impl BLOCKER (arena#53): emit used to keep stale
+    # recordings across a seed change, so a re-emitted suite graded
+    # STABLE on evidence that never answered the graded inputs.
+    emitted = emit_triple_inputs(SUITE, seed=42)
+    filled = EvalSuite(
+        name="emit-test",
+        cases=[
+            dataclasses.replace(
+                case,
+                output=ANSWERS[case.id],
+                output_light=ANSWERS[case.id],
+                output_adversarial=ANSWERS[case.id],
+            )
+            for case in emitted.cases
+        ],
+    )
+    # Re-emit under a different seed: every light input changes, so
+    # every light recording is dropped; adversarial inputs change
+    # for some cases only, and only those recordings are dropped.
+    re_emitted = emit_triple_inputs(filled, seed=7)
+    assert all(c.output_light is None for c in re_emitted.cases)
+    assert all(
+        (c.output_adversarial is None)
+        == (c.input_adversarial != old.input_adversarial)
+        for c, old in zip(re_emitted.cases, filled.cases)
+    )
+    assert any(c.output_adversarial is None for c in re_emitted.cases)
+    assert any(c.output_adversarial is not None for c in re_emitted.cases)
+    # End to end: the re-emitted suite grades UNMEASURED, not STABLE
+    # on the stale evidence.
+    verdict = check_stability(run_triple_regime_replay(re_emitted, seed=7))
+    assert verdict.outcome == "unmeasured"
+    # Same-seed re-emit keeps every recording: the inputs are identical.
+    same_seed = emit_triple_inputs(filled, seed=42)
+    assert all(
+        c.output_light is not None and c.output_adversarial is not None
+        for c in same_seed.cases
+    )
+    # A recording with no recorded input is dropped too: it answers
+    # an unknown input.
+    orphan = dataclasses.replace(
+        SUITE.cases[0], output_light=ANSWERS["refund"]
+    )
+    dropped = emit_triple_inputs(
+        EvalSuite(name="emit-test", cases=[orphan]), seed=42
+    )
+    assert dropped.cases[0].input_light is not None
+    assert dropped.cases[0].output_light is None
+
+
+def test_cli_all_skipped_suite_is_unmeasured_not_zero(monkeypatch, capsys):
+    # All-skipped regimes carry pass_rate null, not 0.0 — in the text
+    # report as well as the JSON: a 0.0% line would read as a measured
+    # 0% to a reader that does not check the verdict first.
+    import json
+
+    import yaml
+
+    data = {
+        "name": "all-skipped-cli",
+        "cases": [
+            {
+                "id": "a",
+                "input": "q",
+                "expected": {"contains": ["x"]},
+                "skip": True,
+            }
+        ],
+    }
+    path = _write(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+    try:
+        code, out, _ = _run(["perturb", "--suite", path], monkeypatch, capsys)
+        assert code == 2
+        assert "verdict: UNMEASURED" in out
+        assert "scored no cases" in out
+        assert "pass rate 0.0%" not in out
+        code, out, _ = _run(
+            ["perturb", "--suite", path, "--json"], monkeypatch, capsys
+        )
+        assert code == 2
+        payload = json.loads(out)
+        for regime in ("clean", "light", "adversarial"):
+            assert payload["report"]["regimes"][regime]["pass_rate"] is None
+    finally:
+        os.unlink(path)
+
+
 def test_cli_run_ci_refuses_triple_suite(monkeypatch, capsys):
     recordings = {cid: {"output": a, "output_light": a, "output_adversarial": a}
                   for cid, a in ANSWERS.items()}
@@ -1189,25 +1315,41 @@ def _floor_suite(adversarial_passes: int) -> EvalSuite:
     passes the first ``adversarial_passes`` cases and obeys the
     injection (marker output) on the rest.
     """
+    # Emit FIRST, then fill the recordings: emit drops any recording
+    # that answers a different input than the one just emitted.
+    emitted = emit_triple_inputs(
+        EvalSuite(
+            name="floor-test",
+            cases=[
+                EvalCase(
+                    id=cid,
+                    input=f"question {cid}",
+                    expected=ExpectedOutput(contains=[f"answer-{cid}"]),
+                )
+                for cid in ("a", "b", "c", "d")
+            ],
+        ),
+        seed=42,
+    )
     cases = []
-    for i, cid in enumerate(("a", "b", "c", "d")):
+    for i, case in enumerate(emitted.cases):
         good = i < 2
         adv_good = i < adversarial_passes
         cases.append(
-            EvalCase(
-                id=cid,
-                input=f"question {cid}",
-                expected=ExpectedOutput(contains=[f"answer-{cid}"]),
-                output=f"answer-{cid}" if good else "nothing relevant",
-                output_light=f"answer-{cid}" if good else "nothing relevant",
+            dataclasses.replace(
+                case,
+                output=f"answer-{case.id}" if good else "nothing relevant",
+                output_light=(
+                    f"answer-{case.id}" if good else "nothing relevant"
+                ),
                 output_adversarial=(
-                    f"answer-{cid}" if adv_good else ADVERSARIAL_MARKER
+                    f"answer-{case.id}"
+                    if adv_good
+                    else ADVERSARIAL_MARKER
                 ),
             )
         )
-    return emit_triple_inputs(
-        EvalSuite(name="floor-test", cases=cases), seed=42
-    )
+    return EvalSuite(name="floor-test", cases=cases)
 
 
 def test_floor_policy_cannot_certify_total_adversarial_collapse():
@@ -1402,7 +1544,9 @@ def test_cli_invalid_regex_exits_three(monkeypatch, capsys):
 
     from agenteval_bench.cli import _suite_to_yaml_dict
 
-    suite = emit_triple_inputs(
+    # Emit FIRST, then fill the recordings: emit drops any recording
+    # that answers a different input than the one just emitted.
+    emitted = emit_triple_inputs(
         EvalSuite(
             name="bad-regex",
             cases=[
@@ -1410,13 +1554,22 @@ def test_cli_invalid_regex_exits_three(monkeypatch, capsys):
                     id="a",
                     input="q",
                     expected=ExpectedOutput(regex="[invalid"),
-                    output="x",
-                    output_light="x",
-                    output_adversarial="x",
                 )
             ],
         ),
         seed=42,
+    )
+    suite = dataclasses.replace(
+        emitted,
+        cases=[
+            dataclasses.replace(
+                case,
+                output="x",
+                output_light="x",
+                output_adversarial="x",
+            )
+            for case in emitted.cases
+        ],
     )
     path = _write(
         yaml.safe_dump(
