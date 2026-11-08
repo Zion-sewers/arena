@@ -175,7 +175,18 @@ def main() -> int:
         )
         _expect(code == 0, "CLI exits 0 for a calibrated judge")
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        _expect(report["status"] == "calibrated", "CLI report JSON carries the status")
+        # Round-5 (arena#56): the CLI qualifies `status` when the ledger
+        # flags the calibration gap — the bin-check grade lives in
+        # `grade`, so a machine consumer gating on `status` cannot
+        # certify a flagged report by accident.
+        _expect(
+            report["status"] == "calibrated (flagged: calibration_gap unbacked)",
+            "CLI report JSON qualifies the status when the gap is flagged",
+        )
+        _expect(
+            report["grade"] == "calibrated",
+            "CLI report JSON carries the bin-check grade in `grade`",
+        )
         bad_path = root / "bad.json"
         bad_path.write_text(
             json.dumps(
