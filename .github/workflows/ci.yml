@@ -20,13 +20,24 @@ jobs:
       - name: Lint
         run: ruff check src/ tests/
       - name: Tiered pipeline (gate -> smoke -> expanded)
-        run: agenteval-bench tiered --phase expanded --out tiered-expanded-report.json
+        run: agenteval-bench tiered --phase expanded --strict-ledger --out tiered-expanded-report.json
       - name: Upload expanded report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tiered-expanded-report
           path: tiered-expanded-report.json
+      - name: Ledger gate (run --strict-ledger; a flagged metric fails the build)
+        run: agenteval-bench run --suite examples/support-agent.yaml --strict-ledger
+      - name: Ledger gate (flagging strict path; perturb downgrades, calibrate refuses, ship downgrades)
+        run: |
+          set +e
+          agenteval-bench perturb --suite examples/perturbation-triple.yaml --strict-ledger
+          test $? -eq 1 || { echo "perturb --strict-ledger must exit 1 (STABLE downgraded to UNSTABLE)" >&2; exit 1; }
+          agenteval-bench calibrate --observations examples/calibration-observations.json --strict-ledger
+          test $? -eq 2 || { echo "calibrate --strict-ledger must exit 2 (refused: unbacked gap)" >&2; exit 1; }
+          agenteval-bench ship --design examples/ship-design.json --evidence examples/ship-evidence.json --registry examples/ship-registry.jsonl --strict-ledger
+          test $? -eq 1 || { echo "ship --strict-ledger must exit 1 (SHIP downgraded to NEEDS_REPLICATION)" >&2; exit 1; }
       - name: Experiment-discipline demo (violations must fail)
         run: PYTHONPATH=src python -m experiment.demo
       - name: Simpson-safe aggregation demo (reversal must be refused)
@@ -57,3 +68,5 @@ jobs:
         run: PYTHONPATH=src python -m agenteval_bench.diverge_demo
       - name: Perturbation-stability demo (clean / light / adversarial; robust STABLE, naive UNSTABLE on the drop, fragile UNSTABLE on light)
         run: PYTHONPATH=src python -m agenteval_bench.perturbation_demo
+      - name: Metric-ledger demo (every metric lists assumptions; soft needs hard backup; assumption-free refused)
+        run: PYTHONPATH=src python -m agenteval_bench.metric_ledger_demo

@@ -1212,9 +1212,23 @@ def test_cli_ship_json_and_out(
         capsys,
     )
     assert code == 0
-    assert json.loads(out)["status"] == "ship"
+    # Round 7 (arena#56): the ship test statistics are SOFT/UNBACKED,
+    # so the JSON status carries the flag at the point of the verdict
+    # — the same contract change calibrate got in round 5. A consumer
+    # reading the bare field must not be able to quote the verdict as
+    # verified; the unflagged decision is in ship_note's absence.
+    assert json.loads(out)["status"] == (
+        "ship (flagged: aa_z unbacked, guardrail_lower_bound unbacked, "
+        "oec_z unbacked, srm_chi2 unbacked)"
+    )
+    assert "Do not quote the verdict as verified" in json.loads(out)["ship_note"]
     with open(out_path, encoding="utf-8") as f:
-        assert json.load(f)["status"] == "ship"
+        written = json.load(f)
+    assert written["status"] == (
+        "ship (flagged: aa_z unbacked, guardrail_lower_bound unbacked, "
+        "oec_z unbacked, srm_chi2 unbacked)"
+    )
+    assert written["ship_note"] == json.loads(out)["ship_note"]
 
 
 def test_cli_ship_no_ship_and_needs_replication(
