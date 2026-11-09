@@ -360,6 +360,22 @@ def test_calibrate_strict_ledger_refuses(monkeypatch, capsys, tmp_path):
     assert payload["status"] == "refused (ledger gate)"
     assert payload["grade"] == "calibrated"
     assert payload["metric_ledger"]["all_ok"] is False
+    # Round 7 (product N3): the refusal is visible in stdout too —
+    # a stdout-only consumer must not read a calibrated headline
+    # for a refused report.
+    code, out, _ = _run(
+        [
+            "calibrate",
+            "--observations",
+            _examples("calibration-observations.json"),
+            "--strict-ledger",
+        ],
+        monkeypatch,
+        capsys,
+    )
+    assert code == 2
+    assert "refused (ledger gate)" in out
+    assert "calibrated (400 observations" not in out
 
 
 def test_perturb_flags_unbacked_stability(monkeypatch, capsys):
@@ -556,6 +572,16 @@ def test_ship_json_carries_ledger(monkeypatch, capsys, tmp_path):
     )
     assert code in (0, 1)
     assert "Metric ledger (ship):" in out
+    # Round 7: the test statistics are SOFT/UNBACKED and the
+    # guardrail lower bound is its own SOFT/UNBACKED entry, so the
+    # example ship report flags by design — 1/5 clean — and the
+    # verdict line carries the flag, the way calibrate/perturb do.
+    assert "Metric ledger (ship): 1/5 metrics clean" in out
+    assert (
+        "verdict: SHIP (aa_z, guardrail_lower_bound, oec_z, srm_chi2 "
+        "unbacked — see ledger): do not quote the verdict as "
+        "verified" in out
+    )
     _assert_stdout_covered(
         out,
         "ship",
@@ -568,6 +594,11 @@ def test_ship_json_carries_ledger(monkeypatch, capsys, tmp_path):
                 "guardrail_delta",
                 "ship guardrail line",
             ),
+            (
+                r"^  guardrail \S+: .*lower bound ",
+                "guardrail_lower_bound",
+                "ship guardrail lower-bound line",
+            ),
             (r"^  ~ SRM clean: chi2=", "srm_chi2", "ship SRM note"),
             (r"^  ~ A/A clean:.*z=", "aa_z", "ship A/A note"),
             (r"^  ~ OEC .*final z=", "oec_z", "ship OEC note"),
@@ -576,10 +607,62 @@ def test_ship_json_carries_ledger(monkeypatch, capsys, tmp_path):
     with open(report, encoding="utf-8") as f:
         payload = json.load(f)
     ledger = payload["metric_ledger"]
-    assert ledger["all_ok"] is True
-    assert {"oec_z", "srm_chi2", "aa_z", "guardrail_delta"} <= set(
-        ledger["metrics"]
+    assert ledger["all_ok"] is False
+    assert ledger["flagged"] == [
+        "aa_z",
+        "guardrail_lower_bound",
+        "oec_z",
+        "srm_chi2",
+    ]
+    assert {
+        "oec_z",
+        "srm_chi2",
+        "aa_z",
+        "guardrail_delta",
+        "guardrail_lower_bound",
+    } <= set(ledger["metrics"])
+    assert payload["status"] == (
+        "ship (flagged: aa_z unbacked, guardrail_lower_bound unbacked, "
+        "oec_z unbacked, srm_chi2 unbacked)"
     )
+    assert "ship_note" in payload
+    assert "Do not quote the verdict as verified" in payload["ship_note"]
+
+
+def test_ship_strict_ledger_downgrades_ship(monkeypatch, capsys, tmp_path):
+    # Round 7: under --strict-ledger a SHIP resting on flagged
+    # metrics is downgraded to NEEDS_REPLICATION (exit 1): the gate
+    # cannot ship on numbers it cannot verify. The evidence is
+    # unverified, not refuted, so it is never downgraded to NO_SHIP.
+    report = str(tmp_path / "ship-strict.json")
+    code, out, err = _run(
+        [
+            "ship",
+            "--design",
+            _examples("ship-design.json"),
+            "--evidence",
+            _examples("ship-evidence.json"),
+            "--registry",
+            _examples("ship-registry.jsonl"),
+            "--strict-ledger",
+            "--out",
+            report,
+        ],
+        monkeypatch,
+        capsys,
+    )
+    assert code == 1
+    assert (
+        "verdict: NEEDS_REPLICATION (ledger gate: SHIP downgraded — "
+        "unbacked test statistics, see ledger)" in out
+    )
+    assert "verdict: SHIP" not in out
+    assert "Ledger gate (strict)" in err
+    with open(report, encoding="utf-8") as f:
+        payload = json.load(f)
+    assert payload["status"] == "needs_replication (ledger gate)"
+    assert "NEEDS_REPLICATION" in payload["ship_note"]
+    assert payload["metric_ledger"]["all_ok"] is False
 
 
 def test_alt_test_json_carries_ledger(monkeypatch, capsys):
@@ -687,15 +770,17 @@ def test_alt_test_refusal_audits_only_the_printed_board(monkeypatch, capsys):
         )
         assert code == 1, stdout
         # Round 6: the masked diagnostic is the same Wilson-bound
-        # score, so the refused board flags it too — 1/2 clean — and
-        # the ranking flag line prints with the refusal.
+        # score, so the refused board flags it too — 1/2 clean.
+        # Round 7: the flag line no longer presupposes a ranking
+        # that was refused — it names the masked board instead.
         assert "Metric ledger (alt-test): 1/2 metrics clean" in stdout
         assert "alt_conservative_score" in stdout
         assert (
-            "Ranking ordered by alt_conservative_score, which is "
-            "unbacked (see ledger): do not quote the ranking as "
-            "verified." in stdout
+            "No ranking was published (board refused): the masked "
+            "board shows alt_conservative_score, which is unbacked "
+            "(see ledger): do not quote it as verified." in stdout
         )
+        assert "Ranking ordered by alt_conservative_score" not in stdout
         assert "alt_win_rate" not in stdout
         assert "alt_annotator_rho" not in stdout
         # Growth scan: the refused board prints only the masked

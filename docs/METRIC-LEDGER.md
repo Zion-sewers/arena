@@ -25,6 +25,21 @@ The Wilson interval is the uncertainty carried WITH a hard
 proportion, not a separate soft metric — unless a number is computed
 from the bound itself, as the calibration gap is.
 
+A test statistic is SOFT even when its null is pre-registered and
+its inputs are recorded. A z-score or chi-square is computed through
+a standard error estimated from the recorded data — an inferred
+quantity about the unobserved sampling distribution — and read
+through a normal or chi-square approximation the entry's own
+assumptions admit. The stipulated null does not save it: the null
+is stipulated, the standard error is estimated. No carve-out: a
+z-score has no HARD entry that could back it (its check would be
+the p-value, the same inference), so the ship test statistics
+(`oec_z`, `srm_chi2`, `aa_z`) are filed SOFT/UNBACKED and flag by
+design in every ship report. The same line splits the guardrail
+entry: the delta is a plain difference of recorded observations
+(HARD); the lower bound the budget is checked against is a Newcombe
+interval bound (SOFT, its own entry, `guardrail_lower_bound`).
+
 ## Components are not metrics
 
 A report prints numbers that are not metrics: case totals, seeds,
@@ -53,8 +68,8 @@ before relying on it for a new rendering shape.
 
 A soft metric's `hard_backup` names a HARD metric in the same ledger
 that is independently measured from it — different observations,
-never an input to the soft number's own computation and never the
-soft number's own output. The check itself is the reader (or
+never solely the soft number's own output; always checked against
+independent observations. The check itself is the reader (or
 tooling) comparing the two numbers; the ledger guarantees the
 reference resolves to a HARD entry measured in the same report, it
 does not perform the numeric comparison. The two backups that are
@@ -68,9 +83,15 @@ Where no independent measurement exists, the honest filing is
 UNBACKED, not a circular backup: `calibration_gap` (the gap is
 computed from the agreement rate itself),
 `perturbation_stability` (the drops are differences of the pass
-rates themselves), and `alt_conservative_score` (the score is a mean
+rates themselves), `alt_conservative_score` (the score is a mean
 of Wilson bounds computed from the same wins the win rate is
-computed from, so the win rate cannot independently check it) carry
+computed from, so the win rate cannot independently check it),
+`oec_z`, `srm_chi2`, and `aa_z` (test statistics computed through
+an estimated standard error and read through a normal/chi-square
+approximation — no HARD entry could back a z-score), and
+`guardrail_lower_bound` (the Newcombe lower bound the budget is
+checked against; its own point delta is the quantity the bound is
+built from, so it cannot check it) carry
 `hard_backup=None`, and the audit flags them `FLAGGED_NO_BACKUP` in
 every report that prints them. A circular
 reference is not a backup, and a flagged soft metric is still a
@@ -105,10 +126,11 @@ tables print together in `run` and `decide` for this reason.
 | `simpson_pooled_delta` | hard | — | Difference of the pooled treated/control rates (descriptive only) |
 | `pairwise_diversity` | hard | — | Minimum pairwise (token-level) diversity in a candidate set |
 | `conventional_share` | hard | — | Measured share of the conventional answer's cluster |
-| `oec_z` | hard | — | Final z-score of the overall evaluation criterion |
-| `srm_chi2` | hard | — | Chi-square for sample-ratio mismatch vs the design |
-| `aa_z` | hard | — | Z-score of the A/A split |
+| `oec_z` | soft | UNBACKED (flagged) | Final z-score of the overall evaluation criterion — a test statistic through an estimated standard error, not a recorded value |
+| `srm_chi2` | soft | UNBACKED (flagged) | Chi-square for sample-ratio mismatch vs the design — a test statistic, not a count |
+| `aa_z` | soft | UNBACKED (flagged) | Z-score of the A/A split — a test statistic through an estimated standard error |
 | `guardrail_delta` | hard | — | Treated-vs-control guardrail difference |
+| `guardrail_lower_bound` | soft | UNBACKED (flagged) | Newcombe lower bound on the guardrail delta — the bound the budget is checked against |
 | `alt_win_rate` | hard | — | A judge's winning rate (rho/omega) on recorded comparisons |
 | `alt_annotator_rho` | hard | — | Per-annotator mean win probability rho_f (mean of n recorded binary wins) |
 | `alt_coverage` | hard | — | Fraction of (judge, annotator) cells meeting the floor |
@@ -138,9 +160,10 @@ the report never shows.
 
 ## How the audit works
 
-The audit is derived from the live report object at each print site
-— never from a static table of what the command is supposed to
-print. Each command builds the `measured` mapping (metric name ->
+The audit is derived from the values each command rendered — from
+the live report object where the command has one, from the literal
+values printed at literal sites (pinned by the per-command scan
+test). Each command builds the `measured` mapping (metric name ->
 whether this report measured it) from the values it rendered, and
 `audit_measured` audits exactly that set:
 
@@ -166,8 +189,10 @@ whether this report measured it) from the values it rendered, and
 - `simpson` audits `simpson_stratum_rate`, `treated_share`, and
   `simpson_pooled_delta`; `diverge` audits `pairwise_diversity`,
   `conventional_share`, and `p_conventional`; `ship` audits `oec_z`,
-  `srm_chi2`, `aa_z`, and `guardrail_delta`, each only when the
-  verdict carries it; `alt-test` audits all four — `alt_win_rate`,
+  `srm_chi2`, `aa_z`, `guardrail_delta`, and `guardrail_lower_bound`
+  (the lower bound the budget is checked against), each only when the
+  verdict carries it — a ship report flags by design (1/5 clean on
+  the example: only the delta is HARD); `alt-test` audits all four — `alt_win_rate`,
   `alt_annotator_rho`, `alt_conservative_score`, `alt_coverage` —
   on a ranked board, and only `alt_conservative_score` and
   `alt_coverage` on a refused ranking; `snapshot` (show / publish /
@@ -208,19 +233,31 @@ headline carries the flag next to the grade (`calibrate` appends
 appends "(stability label unbacked — see ledger)" to the verdict
 line; `alt-test` prints "Ranking ordered by
 alt_conservative_score, which is unbacked (see ledger): do not quote
-the ranking as verified" with the ranking itself), the gating sentence scopes gating to the measured grade
+the ranking as verified" directly under the ranking table itself —
+and, on a refused board, "No ranking was published (board
+refused): the masked board shows alt_conservative_score, which is
+unbacked (see ledger): do not quote it as verified"; `ship` appends
+"(aa_z, guardrail_lower_bound, oec_z, srm_chi2 unbacked — see
+ledger): do not quote the verdict as verified" to the verdict line),
+the gating sentence scopes gating to the measured grade
 (the bin-check grade for calibrate), never to the flagged number,
-and the JSON carries a `status_note` / `verdict_note` / `ranking_note` next to the
+and the JSON carries a `status_note` / `verdict_note` / `ranking_note` / `ship_note` next to the
 grade. `calibrate` JSON qualifies `status` itself when flagged
 (`"calibrated (flagged: calibration_gap unbacked)"`) and, under
 `--strict-ledger`, writes `status` as `"refused (ledger gate)"`
-with the bin-check grade preserved in `grade`. The grade itself stays: the bin-check grade and the
+with the bin-check grade preserved in `grade` — and the stdout
+headline reads "refused (ledger gate)" too, so a stdout-only
+consumer never reads a calibrated headline for a refused report.
+`ship` JSON qualifies `status` itself when flagged
+(`"ship (flagged: oec_z unbacked, ...)"`). The grade itself stays: the bin-check grade and the
 drop-threshold verdict are measured facts, and the live gate
 (`require_calibrated` / `check_stability`) is the Python API, not
 the CLI text. Under `--strict-ledger` the artifact itself is
 downgraded (`perturb` STABLE becomes UNSTABLE in stdout, JSON, and
 exit code; `calibrate` refuses with exit 2 and its written file
-says refused, not calibrated).
+says refused, not calibrated; `ship` SHIP becomes NEEDS_REPLICATION
+in stdout, JSON, and exit code — the evidence is unverified, not
+refuted, so it is never downgraded to NO_SHIP).
 
 The validity table is graded, not audited: `run` and `decide` print
 a scope line in their own text stating the headline covers the
@@ -252,7 +289,8 @@ are covered by the audit it prints.
   re-checked to be a `MetricAssumption`): a hand-built spec
   with a duck-typed shape raises TypeError, a garbage kind raises
   ValueError, a bypass-built spec with junk assumption items raises
-  TypeError, and a bypassed-but-valid kind is coerced and audited
+  TypeError, a bypass-built spec with a non-string hard_backup
+  raises TypeError, and a bypassed-but-valid kind is coerced and audited
   normally — the audit can never certify a spec it never validated.
 - The growth-scan test (`_assert_stdout_covered` in
   `tests/test_metric_ledger_cli.py`) parses each command's stdout:
@@ -276,9 +314,10 @@ are covered by the audit it prints.
   inside assumption mappings) and duplicate assumptions, and use
   ValueError for invalid values, TypeError for wrong types.
 - `--strict-ledger` exists on `run`, `decide`, `calibrate`,
-  `perturb`, and `tiered`: a flagged audit refuses the report
+  `perturb`, `tiered`, and `ship`: a flagged audit refuses the report
   (run/tiered exit 2, calibrate exit 2, perturb downgrades STABLE to
-  UNSTABLE, decide downgrades GATE to INVESTIGATE), mirroring
+  UNSTABLE, decide downgrades GATE to INVESTIGATE, ship downgrades
+  SHIP to NEEDS_REPLICATION with exit 1), mirroring
   `--strict-validity`. Default off. Note `calibrate --strict-ledger`
   always refuses: the gap is flagged by design (unbacked).
 - A flagged audit prints its remediation: do not quote or gate on
@@ -291,8 +330,9 @@ are covered by the audit it prints.
   step runs the support-agent suite, so a flagged metric fails the
   build, not just a local run. A second CI step exercises the
   flagging strict path itself — it asserts `perturb --strict-ledger`
-  exits 1 (STABLE downgraded to UNSTABLE) and `calibrate
-  --strict-ledger` exits 2 (refused) — so the gate is a live gate,
+  exits 1 (STABLE downgraded to UNSTABLE), `calibrate
+  --strict-ledger` exits 2 (refused), and `ship --strict-ledger`
+  exits 1 (SHIP downgraded to NEEDS_REPLICATION) — so the gate is a live gate,
   not only a tripwire for future misfiling.
 
 ## Worked example (the cash test, with real numbers)

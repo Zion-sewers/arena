@@ -4,10 +4,11 @@ Runs the full ledger pipeline offline on the shipped registry. Exit 0
 only if every acceptance expectation holds:
 - every shipped metric lists at least one assumption, each with a
   falsifier;
-- the shipped ledger audit flags exactly the three honestly-unbacked
-  soft metrics (alt_conservative_score, calibration_gap,
-  perturbation_stability) and nothing else: every other soft metric
-  is backed by a HARD metric that is independently measured;
+- the shipped ledger audit flags exactly the seven honestly-unbacked
+  soft metrics (aa_z, alt_conservative_score, calibration_gap,
+  guardrail_lower_bound, oec_z, perturbation_stability, srm_chi2)
+  and nothing else: every other soft metric is backed by a HARD
+  metric that is independently measured;
 - kind is coerced and validated at construction: a plain "soft"
   string becomes SOFT, a garbage kind raises, and a hand-built spec
   can never slip a non-Enum kind past the audit as clean;
@@ -82,12 +83,16 @@ def main() -> int:
     _expect(
         audit.flagged
         == [
+            "aa_z",
             "alt_conservative_score",
             "calibration_gap",
+            "guardrail_lower_bound",
+            "oec_z",
             "perturbation_stability",
+            "srm_chi2",
         ],
-        "shipped ledger flags exactly the three honestly-unbacked soft "
-        "metrics, nothing else",
+        "shipped ledger flags exactly the seven honestly-unbacked "
+        "soft metrics, nothing else",
     )
     kinds = {spec.kind for spec in METRIC_LEDGER.values()}
     _expect(
@@ -116,6 +121,26 @@ def main() -> int:
         METRIC_LEDGER["perturbation_stability"].hard_backup is None,
         "perturbation_stability is filed UNBACKED: the drops are "
         "differences of the pass rates themselves",
+    )
+    _expect(
+        METRIC_LEDGER["oec_z"].kind is MetricKind.SOFT
+        and METRIC_LEDGER["oec_z"].hard_backup is None
+        and METRIC_LEDGER["srm_chi2"].kind is MetricKind.SOFT
+        and METRIC_LEDGER["srm_chi2"].hard_backup is None
+        and METRIC_LEDGER["aa_z"].kind is MetricKind.SOFT
+        and METRIC_LEDGER["aa_z"].hard_backup is None,
+        "the ship test statistics are filed SOFT/UNBACKED: a z-score "
+        "is computed through an estimated standard error and read "
+        "through a normal/chi-square approximation, not a recorded "
+        "value",
+    )
+    _expect(
+        METRIC_LEDGER["guardrail_delta"].kind is MetricKind.HARD
+        and METRIC_LEDGER["guardrail_lower_bound"].kind is MetricKind.SOFT
+        and METRIC_LEDGER["guardrail_lower_bound"].hard_backup is None,
+        "the guardrail delta stays HARD (a difference of recorded "
+        "observations); the lower bound the budget is checked "
+        "against is its own SOFT/UNBACKED entry",
     )
     _expect(
         METRIC_LEDGER["contains"].hard_backup == "label_agreement"
@@ -368,9 +393,13 @@ def main() -> int:
     _expect(
         audit_ledger(rebuilt).flagged
         == [
+            "aa_z",
             "alt_conservative_score",
             "calibration_gap",
+            "guardrail_lower_bound",
+            "oec_z",
             "perturbation_stability",
+            "srm_chi2",
         ],
         "fail-closed parser rebuilds the shipped ledger bit-for-bit",
     )

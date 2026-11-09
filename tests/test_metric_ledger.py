@@ -338,6 +338,25 @@ class TestSoftNeedsHardBackup:
         with pytest.raises(TypeError, match="MetricAssumption"):
             audit_measured({"mixed": True}, ledger={"mixed": sneaky})
 
+    def test_audit_raises_on_bypassed_non_string_backup(self) -> None:
+        # Round-7 (impl N1): a MetricSpec built by bypassing
+        # __post_init__ with a non-string hard_backup must raise
+        # loudly at audit time. An int backup flags
+        # FLAGGED_BAD_BACKUP and then crashes the summary's string
+        # render; a list backup raises unhashable inside the audit
+        # itself. Neither is reachable through the constructor or
+        # parser (both refuse non-string backups) — only via
+        # object.__new__ bypass.
+        for bad_backup in (5, ["pass_rate"]):
+            sneaky = object.__new__(MetricSpec)
+            object.__setattr__(sneaky, "name", "sneaky")
+            object.__setattr__(sneaky, "kind", MetricKind.SOFT)
+            object.__setattr__(sneaky, "phenomenon", "a soft number")
+            object.__setattr__(sneaky, "assumptions", (_assumption(),))
+            object.__setattr__(sneaky, "hard_backup", bad_backup)
+            with pytest.raises(TypeError, match="hard_backup"):
+                audit_measured({"sneaky": True}, ledger={"sneaky": sneaky})
+
     def test_validated_share_is_hard_and_audits_clean(self) -> None:
         # Round-5 (arch B2): bugsmith's validated share is a reported
         # proportion over recorded candidate reports — HARD, no backup.
@@ -418,12 +437,20 @@ class TestShippedLedger:
         # exactly as in the reports that print them. Round 6 adds
         # alt_conservative_score: a mean of Wilson bounds is SOFT
         # under the ledger rule, and the win rate cannot back it
-        # (same wins), so it is filed UNBACKED too.
+        # (same wins), so it is filed UNBACKED too. Round 7 adds
+        # the ship test statistics (oec_z, srm_chi2, aa_z — test
+        # statistics computed through an estimated standard error)
+        # and the guardrail lower bound (the bound the budget is
+        # checked against): seven unbacked filings in total.
         audit = audit_ledger()
         assert audit.flagged == [
+            "aa_z",
             "alt_conservative_score",
             "calibration_gap",
+            "guardrail_lower_bound",
+            "oec_z",
             "perturbation_stability",
+            "srm_chi2",
         ]
         assert not audit.all_ok
         with pytest.raises(ValueError, match="flagged metrics"):
@@ -471,6 +498,59 @@ class TestShippedLedger:
         audit = audit_measured({"alt_conservative_score": True})
         assert audit.flagged == ["alt_conservative_score"]
         assert not audit.all_ok
+
+    def test_ship_test_statistics_are_soft_and_unbacked(self) -> None:
+        # Round-7 B1 (arch): a z-score is none of the rule's HARD
+        # forms (count/sum/proportion/weighted mean) and takes an
+        # inferential step — a pooled standard error estimated from
+        # the recorded proportions, read through a normal/chi-square
+        # approximation the entries' own assumptions admit. The
+        # stipulated null does not save it: the null is stipulated,
+        # the standard error is estimated. No HARD entry could back
+        # a z-score (its check would be the p-value — the same
+        # inference), so the filings are SOFT/UNBACKED and every
+        # ship report flags them.
+        for name in ("oec_z", "srm_chi2", "aa_z"):
+            spec = METRIC_LEDGER[name]
+            assert spec.kind is MetricKind.SOFT
+            assert spec.hard_backup is None
+            assert spec.assumptions
+        audit = audit_measured(
+            {
+                "oec_z": True,
+                "srm_chi2": True,
+                "aa_z": True,
+                "guardrail_delta": True,
+                "guardrail_lower_bound": True,
+            }
+        )
+        assert audit.flagged == [
+            "aa_z",
+            "guardrail_lower_bound",
+            "oec_z",
+            "srm_chi2",
+        ]
+        assert not audit.all_ok
+
+    def test_guardrail_lower_bound_is_its_own_soft_entry(self) -> None:
+        # Round-7 B2 (arch): the gate rests on the interval lower
+        # bound (oec.py: "grade rests on interval BOUNDS, never point
+        # estimates"), so the bound is its own SOFT/UNBACKED entry —
+        # the point delta is the quantity the bound is built from
+        # and cannot check it. The delta itself stays HARD: a plain
+        # difference of recorded observations.
+        delta = METRIC_LEDGER["guardrail_delta"]
+        assert delta.kind is MetricKind.HARD
+        assert delta.hard_backup is None
+        assert "lower bound" not in delta.phenomenon
+        bound = METRIC_LEDGER["guardrail_lower_bound"]
+        assert bound.kind is MetricKind.SOFT
+        assert bound.hard_backup is None
+        assert "Newcombe" in bound.phenomenon
+        audit = audit_measured(
+            {"guardrail_delta": True, "guardrail_lower_bound": True}
+        )
+        assert audit.flagged == ["guardrail_lower_bound"]
 
     def test_ece_is_not_the_calibration_gap(self) -> None:
         # Round-4 B1 (arch): the per-bin gap (confidence minus the
@@ -545,9 +625,13 @@ class TestShippedLedger:
         data = audit_ledger().to_dict()
         assert data["all_ok"] is False
         assert data["flagged"] == [
+            "aa_z",
             "alt_conservative_score",
             "calibration_gap",
+            "guardrail_lower_bound",
+            "oec_z",
             "perturbation_stability",
+            "srm_chi2",
         ]
         assert len(data["findings"]) == len(METRIC_LEDGER)
         metrics = data["metrics"]
@@ -758,7 +842,11 @@ class TestFailClosedParsing:
         built = ledger_from_dicts(payloads)
         assert set(built) == set(METRIC_LEDGER)
         assert audit_ledger(built).flagged == [
+            "aa_z",
             "alt_conservative_score",
             "calibration_gap",
+            "guardrail_lower_bound",
+            "oec_z",
             "perturbation_stability",
+            "srm_chi2",
         ]

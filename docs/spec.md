@@ -319,7 +319,7 @@ print(result.summary())
 |------------------------|-------------|----------------|
 | Deterministic scoring  | ✅ shipped  | v0.1.0         |
 | Measurement-validity column (decide + scorer) | ✅ shipped | v0.1.0  |
-| Metric-assumption ledger (every reported metric lists its assumptions; audit derived from the live report; unbacked soft metrics flagged) | ✅ shipped (35 entries; all report commands incl. bugsmith and tracebench regress; tracebench mine/baseline carry an in-report notice; dispatch test classifies every command; growth-scan test pins every printed rendering to an audited metric) | v0.1.0  |
+| Metric-assumption ledger (every reported metric lists its assumptions; audit derived from the live report; unbacked soft metrics flagged) | ✅ shipped (36 entries; all report commands incl. bugsmith and tracebench regress; tracebench mine/baseline carry an in-report notice; dispatch test classifies every command; growth-scan test pins every printed rendering to an audited metric) | v0.1.0  |
 | Judge decorrelation (HOST != FAMILY) | ✅ shipped | v0.1.0  |
 | Judge calibration (confidence is not evidence) | ✅ shipped (protocol only; no live consumer yet) | v0.1.0  |
 | Coverage requirements before learning or ranking (mask sparse cells) | ✅ shipped (alt-test ranking live; generic learning gate protocol only) | v0.1.0  |

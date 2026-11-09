@@ -846,16 +846,16 @@ def cmd_alt_test(args: list[str]) -> int:
         # board is still printed, so the masked judges and the fix are
         # visible in the refusal itself.
         print(render_ranked(board))
-        print(ledger_audit.summary("alt-test"))
         if "alt_conservative_score" in ledger_audit.flagged:
-            # The ranking is ordered by the conservative score, which
-            # is unbacked (see ledger): the flag rides with the
-            # ranking itself, not only in the audit block below it.
+            # No ranking was published on this path (the board is
+            # MASKED, "NOT A RANKING"): the flag names the masked
+            # diagnostic the board still shows, never a ranking.
             print(
-                "Ranking ordered by alt_conservative_score, which is "
-                "unbacked (see ledger): do not quote the ranking as "
-                "verified."
+                "No ranking was published (board refused): the masked "
+                "board shows alt_conservative_score, which is unbacked "
+                "(see ledger): do not quote it as verified."
             )
+        print(ledger_audit.summary("alt-test"))
         print(f"Refused: {e}", file=sys.stderr)
         return 1
     ledger_audit = audit_measured(
@@ -868,16 +868,17 @@ def cmd_alt_test(args: list[str]) -> int:
     )
     print(render_text(report))
     print(render_ranked(board))
-    print(ledger_audit.summary("alt-test"))
     if "alt_conservative_score" in ledger_audit.flagged:
-        # The ranking is ordered by the conservative score, which is
-        # unbacked (see ledger): the flag rides with the ranking
-        # itself, not only in the audit block below it.
+        # The ranking is ordered by the conservative score, which
+        # is unbacked (see ledger): the flag rides directly under
+        # the ranking table, not only in the audit block below it,
+        # so the quotable table is never unflagged in isolation.
         print(
             "Ranking ordered by alt_conservative_score, which is "
             "unbacked (see ledger): do not quote the ranking as "
             "verified."
         )
+    print(ledger_audit.summary("alt-test"))
     if out:
         doc = report.to_dict()
         doc["coverage"] = board.to_dict()
@@ -1217,6 +1218,15 @@ def cmd_calibrate(args: list[str]) -> int:
             f"judge {record.judge}: {record.status} "
             f"({record.n_total} observations, ECE {ece})"
         )
+        if refused:
+            # Round 7 (product N3): the strict refusal is visible
+            # in stdout too — a stdout-only consumer must not read
+            # a calibrated headline for a refused report. The
+            # bin-check grade is preserved in the JSON grade field.
+            headline = (
+                f"judge {record.judge}: refused (ledger gate) "
+                f"({record.n_total} observations, ECE {ece})"
+            )
         if flagged:
             headline += (
                 " — calibration gap unbacked (see ledger): "
@@ -1723,7 +1733,10 @@ def cmd_ship(args: list[str]) -> int:
     experiment through the hash-chained plan registry (--registry,
     default plans/experiments.jsonl), and rules. Exit 0 = SHIP;
     exit 1 = NO_SHIP or NEEDS_REPLICATION (reasons printed);
-    exit 2 = unusable design/evidence/registry.
+    exit 2 = unusable design/evidence/registry. --strict-ledger
+    downgrades a SHIP resting on flagged metrics to
+    NEEDS_REPLICATION (exit 1): the ship test statistics are
+    unbacked by design (arena#56).
     """
     from experiment.oec import design_from_json, evidence_from_json, ship_decision
 
@@ -1732,6 +1745,7 @@ def cmd_ship(args: list[str]) -> int:
     args, registry_path = _flag(args, "--registry", "plans/experiments.jsonl")
     args, out = _flag(args, "--out")
     args, as_json = _has(args, "--json")
+    args, strict_ledger = _has(args, "--strict-ledger")
     if not design_path or not evidence_path:
         print(
             "Error: ship needs --design <file.json> --evidence <file.json>",
@@ -1759,9 +1773,20 @@ def cmd_ship(args: list[str]) -> int:
         print(f"Error: unusable registry or design: {e}", file=sys.stderr)
         return 2
     # Every metric this report prints lists its assumptions (arena#56):
-    # OEC z, SRM chi2, A/A z, and the guardrail deltas — each only
-    # when the verdict object actually carries it — derived from the
-    # verdict, with the audit carried in the JSON report.
+    # OEC z, SRM chi2, A/A z, and the guardrail delta + lower bound —
+    # each only when the verdict object actually carries it — derived
+    # from the verdict, with the audit carried in the JSON report.
+    # The test statistics are SOFT and unbacked by design (a z-score
+    # is computed through an estimated standard error and read
+    # through a normal/chi-square approximation — no HARD entry could
+    # back one), and the lower bound the budget is checked against
+    # is its own SOFT entry: a ship report flags by design, like
+    # calibrate/perturb, and the verdict line carries the flag.
+    # Under --strict-ledger a SHIP resting on flagged metrics is
+    # downgraded to NEEDS_REPLICATION (exit 1): the gate cannot ship
+    # on numbers it cannot verify. The evidence is unverified, not
+    # refuted, so it is never downgraded to NO_SHIP; NO_SHIP and
+    # NEEDS_REPLICATION verdicts are unchanged (already not shipping).
     reported: dict[str, bool] = {}
     if verdict.oec_z is not None:
         reported["oec_z"] = True
@@ -1771,13 +1796,52 @@ def cmd_ship(args: list[str]) -> int:
         reported["aa_z"] = True
     if verdict.guardrails:
         reported["guardrail_delta"] = True
+        reported["guardrail_lower_bound"] = True
     ledger_audit = audit_measured(reported)
+    flagged = bool(ledger_audit.flagged)
+    downgraded = bool(
+        strict_ledger and not ledger_audit.all_ok and verdict.status == "ship"
+    )
     payload = verdict.to_dict()
     payload["metric_ledger"] = ledger_audit.to_dict()
+    if downgraded:
+        payload["status"] = "needs_replication (ledger gate)"
+        payload["ship_note"] = (
+            "Under --strict-ledger the verdict was downgraded to "
+            "NEEDS_REPLICATION: the ship decision rests on unbacked "
+            "test statistics ("
+            + ", ".join(ledger_audit.flagged)
+            + "). Do not quote the verdict as verified."
+        )
+    elif flagged:
+        payload["status"] = (
+            f"{verdict.status} (flagged: "
+            + ", ".join(
+                f"{name} unbacked" for name in ledger_audit.flagged
+            )
+            + ")"
+        )
+        payload["ship_note"] = (
+            "Ship decision rests on unbacked test statistics ("
+            + ", ".join(ledger_audit.flagged)
+            + "): no independent hard measurement exists for them. "
+            "Do not quote the verdict as verified."
+        )
     if as_json:
         print(json.dumps(payload, indent=2))
     else:
-        print(f"verdict: {verdict.status.upper().replace('_', ' ')}")
+        headline = f"verdict: {verdict.status.upper().replace('_', ' ')}"
+        if downgraded:
+            headline = (
+                "verdict: NEEDS_REPLICATION (ledger gate: SHIP "
+                "downgraded — unbacked test statistics, see ledger)"
+            )
+        elif flagged:
+            headline += (
+                " (" + ", ".join(ledger_audit.flagged) + " unbacked — "
+                "see ledger): do not quote the verdict as verified"
+            )
+        print(headline)
         if verdict.oec_z is not None:
             print(f"  OEC final z={verdict.oec_z:.2f} (surprising: {verdict.surprising})")
         if verdict.srm is not None:
@@ -1805,7 +1869,13 @@ def cmd_ship(args: list[str]) -> int:
             print(f"Error: cannot write report: {e}", file=sys.stderr)
             return 2
         print(f"Report: {out}", file=sys.stderr if as_json else sys.stdout)
-    return 0 if verdict.status == "ship" else 1
+    if downgraded:
+        print(
+            "Ledger gate (strict): SHIP downgraded to NEEDS_REPLICATION "
+            "— flagged metrics: " + ", ".join(ledger_audit.flagged),
+            file=sys.stderr,
+        )
+    return 0 if verdict.status == "ship" and not downgraded else 1
 
 
 def cmd_register_design(args: list[str]) -> int:
@@ -3086,6 +3156,7 @@ def main() -> None:
         print("                                [--registry plans/experiments.jsonl]")
         print("                                [--json] [--out report.json]")
         print("                                (exit 0 SHIP, 1 NO_SHIP/NEEDS_REPLICATION, 2 bad input)")
+        print("                                (--strict-ledger downgrades SHIP to NEEDS_REPLICATION: test statistics unbacked by design)")
         print("       agenteval-bench register-design --design <file.json>")
         print("                                [--registry plans/experiments.jsonl]")
         print("                                (exit 0 registered, 2 bad input)")

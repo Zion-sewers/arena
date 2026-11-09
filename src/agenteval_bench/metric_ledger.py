@@ -25,12 +25,30 @@ The Wilson interval is the uncertainty carried WITH a hard
 proportion, not a separate soft metric — unless a number is computed
 from the bound itself, as the gap is.
 
+A test statistic is SOFT even when its null is pre-registered and
+its inputs are recorded. A z-score or chi-square is computed through
+a standard error estimated from the recorded data — an inferred
+quantity about the unobserved sampling distribution — and read
+through a normal or chi-square approximation the entry's own
+assumptions admit. The stipulated null does not save it: the null
+is stipulated, the standard error is estimated, and the
+approximation is an inferential step the rule's HARD enumeration
+(count, sum, proportion, weighted mean) does not cover. No
+carve-out: a z-score has no HARD entry that could back it — its
+check would be the p-value, the same inference — so the ship test
+statistics (``oec_z``, ``srm_chi2``, ``aa_z``) are filed
+SOFT/UNBACKED and flag by design in every ship report, like the
+calibration gap in calibrate. The same line splits the guardrail
+entry: the delta is a plain difference of recorded observations
+(HARD); the lower bound the budget is checked against is a Newcombe
+interval bound (SOFT, its own entry, ``guardrail_lower_bound``).
+
 What "backed by" means, operationally
 -------------------------------------
 A soft metric's ``hard_backup`` names a HARD metric in the same ledger
 that is independently measured from it — different observations, never
-an input to the soft number's own computation and never the soft
-number's own output. The check itself is the reader (or tooling)
+solely the soft number's own output; always checked against
+independent observations. The check itself is the reader (or tooling)
 comparing the two numbers; the ledger guarantees the reference
 resolves to a HARD entry measured in the same report, it does not
 perform the numeric comparison. ``label_agreement`` is counted
@@ -41,13 +59,19 @@ candidate cluster, so it can check the declared ``p_conventional``.
 Where no such independent measurement exists, the honest filing is
 UNBACKED, not a circular backup: a SOFT metric may carry
 ``hard_backup=None``, and the audit flags it ``FLAGGED_NO_BACKUP``
-in every report that prints it. Three entries are filed that way on
+in every report that prints it. Seven entries are filed that way on
 purpose — ``calibration_gap`` (the gap is computed from the
 agreement rate itself), ``perturbation_stability`` (the drop is a
-difference of the pass rates it would be checked against), and
+difference of the pass rates it would be checked against),
 ``alt_conservative_score`` (the score is a mean of Wilson bounds
 computed from the same wins the win rate is computed from, so the
-win rate cannot independently check it). A
+win rate cannot independently check it), ``oec_z``, ``srm_chi2``,
+and ``aa_z`` (test statistics computed through an estimated
+standard error and read through a normal/chi-square approximation —
+no HARD entry could back a z-score), and ``guardrail_lower_bound``
+(the Newcombe lower bound the budget is checked against; its own
+point delta is the quantity the bound is built from, so it cannot
+check it). A
 circular reference is not a backup, and a flagged soft metric is
 still a printed metric: the flag, not silence, is what the issue
 requires ("a soft metric without hard backup is flagged").
@@ -63,17 +87,18 @@ tables print together in ``run`` and ``decide`` for this reason.
 
 How the audit works
 -------------------
-The audit is fed the metrics a report actually printed, derived from
-the live report object at the print site — never from a static table
-of what the command is supposed to print. Each command builds the
-``measured`` mapping (metric name -> whether this report measured
-it) from the values it rendered, and ``audit_measured`` audits
-exactly that set: a printed metric with no ledger entry is flagged
-``FLAGGED_NOT_IN_LEDGER``; a soft metric whose backup was not
-measured in THIS report is flagged ``FLAGGED_NO_BACKUP`` even when
-the registry names one; a metric the report did not print is never
-audited, so the "N/N clean" headline is a true statement about the
-report in front of the reader. ``audit_ledger`` audits a whole
+The audit is fed the metrics a report actually printed. Each command
+builds the ``measured`` mapping (metric name -> whether this report
+measured it) from the values it rendered — from the live report
+object where the command has one, from the literal values printed
+at literal sites (pinned by the per-command scan test) — and
+``audit_measured`` audits exactly that set: a printed metric with no
+ledger entry is flagged ``FLAGGED_NOT_IN_LEDGER``; a soft metric
+whose backup was not measured in THIS report is flagged
+``FLAGGED_NO_BACKUP`` even when the registry names one; a metric
+the report did not print is never audited, so the "N/N clean"
+headline is a true statement about the report in front of the
+reader. ``audit_ledger`` audits a whole
 mapping (the registry against itself, for the demo and the parser
 round-trip); ``audit_report`` is the names-only wrapper for callers
 that already know every named metric was measured.
@@ -107,9 +132,12 @@ hand-built spec that bypassed ``__post_init__`` with a plain-string
 kind is audited as the kind it names, and a garbage kind raises
 instead of auditing clean; every assumption item is re-checked to
 be a ``MetricAssumption``, so a bypass-built spec with junk items
-raises instead of auditing clean and crashing at render time. The
-audit stores the re-validated specs, so the summary can never
-crash on a hand-built kind or a hand-built assumption item.
+raises instead of auditing clean and crashing at render time; a
+non-string ``hard_backup`` raises TypeError the same way, so a
+bypass-built int/list backup cannot reach the summary's string
+render. The audit stores the re-validated specs, so the summary can
+never crash on a hand-built kind, a hand-built assumption item, or
+a hand-built backup.
 
 Acceptance (arena#56), enforced here, not in prose:
 - every reported metric lists its assumptions — ``MetricSpec`` refuses
@@ -164,6 +192,11 @@ calibrate JSON qualifies ``status`` itself when flagged and, under
 preserved in ``grade``. The ``perturb`` verdict line carries the
 unbacked-stability flag next to STABLE, and under
 ``--strict-ledger`` the artifact itself is downgraded to UNSTABLE.
+The ``ship`` verdict line carries the unbacked-test-statistic flag
+next to SHIP, and under ``--strict-ledger`` a SHIP resting on
+flagged metrics is downgraded to NEEDS_REPLICATION (exit 1): the
+gate cannot ship on numbers it cannot verify, and the evidence is
+unverified, not refuted, so it is never downgraded to NO_SHIP.
 The grade (bin checks passed, drops within policy) is a measured
 fact and stays; what the report must not do is present the flagged
 number as verified. The validity tables in ``run`` and ``decide``
@@ -813,16 +846,18 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
         ),
         "oec_z": MetricSpec(
             name="oec_z",
-            kind=MetricKind.HARD,
+            kind=MetricKind.SOFT,
             phenomenon="final z-score of the overall evaluation criterion "
             "against its pre-registered null",
             assumptions=(
                 _a(
-                    "The z-score is a deterministic function of the "
-                    "recorded OEC observations and the pre-registered "
-                    "design",
-                    "the OEC z is computed from observations the design "
-                    "never named",
+                    "The z is computed from the recorded OEC "
+                    "observations through a pooled standard error "
+                    "estimated from the recorded proportions — an "
+                    "inferred quantity about the sampling "
+                    "distribution, not a recorded value",
+                    "the OEC z is quoted as a directly recorded "
+                    "measurement with no sampling model behind it",
                 ),
                 _a(
                     "Allocation followed the design's expected allocation "
@@ -838,15 +873,16 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
         ),
         "srm_chi2": MetricSpec(
             name="srm_chi2",
-            kind=MetricKind.HARD,
+            kind=MetricKind.SOFT,
             phenomenon="chi-square statistic for sample-ratio mismatch "
             "between the recorded arm counts and the design allocation",
             assumptions=(
                 _a(
-                    "The statistic is computed from the recorded arm "
-                    "counts against the design's expected allocation",
-                    "the SRM check runs against an allocation the design "
-                    "never declared",
+                    "The statistic is a test statistic over the recorded "
+                    "arm counts against the design's expected allocation "
+                    "— a sum of squared standardized deviations, not a "
+                    "count of recorded values",
+                    "the SRM chi2 is quoted as a recorded count",
                 ),
                 _a(
                     "The p-value reading assumes the chi-square "
@@ -857,7 +893,7 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
         ),
         "aa_z": MetricSpec(
             name="aa_z",
-            kind=MetricKind.HARD,
+            kind=MetricKind.SOFT,
             phenomenon="z-score of the A/A split (two arms that should "
             "not differ) against its null of no difference",
             assumptions=(
@@ -865,6 +901,14 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
                     "The A/A arms are exchangeable draws: any difference "
                     "is noise, never a treatment effect",
                     "an A/A difference is quoted as a treatment effect",
+                ),
+                _a(
+                    "The z is computed through a pooled standard error "
+                    "estimated from the recorded splits — an inferred "
+                    "quantity about the sampling distribution, not a "
+                    "recorded value",
+                    "the A/A z is quoted as a directly recorded "
+                    "measurement with no sampling model behind it",
                 ),
                 _a(
                     "The z-to-decision reading uses the normal "
@@ -878,7 +922,7 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
             name="guardrail_delta",
             kind=MetricKind.HARD,
             phenomenon="difference between treated and control guardrail "
-            "observations, with its lower bound against the budget",
+            "observations",
             assumptions=(
                 _a(
                     "The delta is a difference of recorded guardrail "
@@ -886,11 +930,32 @@ METRIC_LEDGER: Mapping[str, MetricSpec] = MappingProxyType(
                     "a guardrail delta is quoted in different units than "
                     "its budget",
                 ),
+            ),
+        ),
+        "guardrail_lower_bound": MetricSpec(
+            name="guardrail_lower_bound",
+            kind=MetricKind.SOFT,
+            phenomenon="lower bound of the Newcombe (Wilson-based) "
+            "interval on the guardrail delta — the bound the budget "
+            "is checked against, never the point delta",
+            assumptions=(
+                _a(
+                    "The bound is the lower end of the Newcombe interval "
+                    "on the recorded guardrail observations, not a "
+                    "recorded value itself",
+                    "the lower bound is quoted as a recorded observation",
+                ),
                 _a(
                     "The lower bound, not the point delta, is what the "
                     "budget is checked against",
                     "a guardrail passes on its point delta while its "
                     "lower bound breaches the budget",
+                ),
+                _a(
+                    "The interval uses the Newcombe score method "
+                    "(Wilson-based), which fails closed on thin data",
+                    "the bound is computed with a Wald interval that "
+                    "collapses near p = 0/1",
                 ),
             ),
         ),
@@ -1241,13 +1306,18 @@ def _normalized_spec(name: str, spec: object) -> MetricSpec:
     any assumption item is not a ``MetricAssumption``: a bypass-built
     spec with junk assumption items raises TypeError here, loudly,
     instead of auditing clean and crashing at render time. A
+    non-string ``hard_backup`` raises TypeError the same way: the
+    summary renders the backup with a string format, so a
+    bypass-built int backup would flag cleanly and then crash the
+    render, and a list backup would raise unhashable inside the
+    audit itself. A
     well-typed but misconfigured spec (a HARD metric carrying a
     backup) is NOT rebuilt, so the audit flags it
     ``FLAGGED_BAD_BACKUP`` instead of raising: flagging is the
     audit's job for configuration defects, raising is for malformed
     values. The audit stores the re-validated specs, so the summary
-    can never crash on a hand-built kind or a hand-built assumption
-    item.
+    can never crash on a hand-built kind, a hand-built assumption
+    item, or a hand-built backup.
     """
     if not isinstance(spec, MetricSpec):
         raise TypeError(
@@ -1261,6 +1331,12 @@ def _normalized_spec(name: str, spec: object) -> MetricSpec:
             f"metric {name!r}: field 'kind' must be 'hard' or "
             f"'soft', got {spec.kind!r}"
         ) from None
+    backup = spec.hard_backup
+    if backup is not None and not isinstance(backup, str):
+        raise TypeError(
+            f"metric {name!r}: field 'hard_backup' must be a "
+            f"string or None, got {type(backup).__name__}"
+        )
     assumptions = spec.assumptions
     items_ok = isinstance(assumptions, tuple) and all(
         isinstance(item, MetricAssumption) for item in assumptions
